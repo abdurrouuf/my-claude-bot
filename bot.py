@@ -1,4 +1,5 @@
 import os
+import asyncio
 import anthropic
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
@@ -46,13 +47,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {str(e)}")
 
-def main():
+async def main():
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущен...")
-    app.run_polling()
+    await app.run_polling()
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
