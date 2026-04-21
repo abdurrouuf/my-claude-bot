@@ -219,9 +219,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "👋 Привет! Я бот компании *ВЕТОП* 🐄💊\n\n"
         "📌 *Команды:*\n"
-        "/накладная — создать накладную\n"
-        "/долги — все долги контрагентов\n"
-        "/оплата Имя Сумма — принять оплату\n"
+        "/invoice — создать накладную\n"
+        "/debts — все долги контрагентов\n"
+        "/payment Имя Сумма — принять оплату\n"
         "/price — полный прайс-лист\n"
         "/clear — очистить историю\n\n"
         "Или просто напишите что нужно!",
@@ -260,7 +260,7 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "Использование: `/оплата Имя Сумма`\nПример: `/оплата Асан 5000`",
+            "Использование: `/payment Name Sum`\nПример: `/payment Asan 5000`",
             parse_mode="Markdown"
         )
         return
@@ -269,7 +269,7 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         amount = float(amount_str)
     except ValueError:
-        await update.message.reply_text("❌ Неверная сумма. Пример: `/оплата Асан 5000`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Неверная сумма. Пример: `/payment Asan 5000`", parse_mode="Markdown")
         return
 
     matched = next((k for k in debts if k.lower() == name.lower()), None)
@@ -288,7 +288,7 @@ async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
             parse_mode="Markdown"
         )
 
-async def nakладная_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def invoice_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await check_access(update): return
     chat_id = update.effective_chat.id
     chat_histories[chat_id] = []
@@ -368,21 +368,21 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⛔ Только администратор может добавлять пользователей.")
         return
     if not context.args:
-        await update.message.reply_text("Использование: `/добавить 123456789`", parse_mode="Markdown")
+        await update.message.reply_text("Использование: `/add 123456789`", parse_mode="Markdown")
         return
     try:
         uid = int(context.args[0])
         allowed_users.add(uid)
         await update.message.reply_text(f"✅ Пользователь `{uid}` добавлен.", parse_mode="Markdown")
     except ValueError:
-        await update.message.reply_text("❌ Неверный ID. Пример: `/добавить 123456789`", parse_mode="Markdown")
+        await update.message.reply_text("❌ Неверный ID. Пример: `/add 123456789`", parse_mode="Markdown")
 
 async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.id != ADMIN_ID:
         await update.message.reply_text("⛔ Только администратор может удалять пользователей.")
         return
     if not context.args:
-        await update.message.reply_text("Использование: `/удалить 123456789`", parse_mode="Markdown")
+        await update.message.reply_text("Использование: `/remove 123456789`", parse_mode="Markdown")
         return
     try:
         uid = int(context.args[0])
@@ -409,12 +409,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("price", show_price))
-    app.add_handler(CommandHandler("долги", show_debts))
-    app.add_handler(CommandHandler("оплата", handle_payment))
-    app.add_handler(CommandHandler("накладная", nakладная_command))
-    app.add_handler(CommandHandler("добавить", add_user))
-    app.add_handler(CommandHandler("удалить", remove_user))
-    app.add_handler(CommandHandler("пользователи", list_users))
+    app.add_handler(CommandHandler("debts", show_debts))
+    app.add_handler(CommandHandler("payment", handle_payment))
+    app.add_handler(CommandHandler("invoice", invoice_command))
+    app.add_handler(CommandHandler("add", add_user))
+    app.add_handler(CommandHandler("remove", remove_user))
+    app.add_handler(CommandHandler("users", list_users))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущен...")
     app.run_polling(stop_signals=None)
