@@ -333,9 +333,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         chat_histories[chat_id].append({"role": "assistant", "content": reply})
 
         # Проверяем — накладная?
-        if reply.startswith("{") and '"action": "invoice"' in reply:
+        # Убираем ```json обёртку если есть
+        clean_reply = reply.strip()
+        if clean_reply.startswith("```"):
+            clean_reply = clean_reply.split("```")[1]
+            if clean_reply.startswith("json"):
+                clean_reply = clean_reply[4:]
+            clean_reply = clean_reply.strip()
+
+        if '"action": "invoice"' in clean_reply:
             try:
-                data = json.loads(reply)
+                data = json.loads(clean_reply)
                 client_name = data["client"]
                 items = data["items"]
                 prev_debt = debts.get(client_name, 0)
