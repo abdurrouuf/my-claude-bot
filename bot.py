@@ -1,5 +1,7 @@
 import os
+import json
 import anthropic
+from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -10,172 +12,305 @@ client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
 
 chat_histories = {}
 
-PRICE_LIST = """
-ПРАЙС ОсОО "ВЕТОП" от 22.04.2026 (оптовые цены в сомах за 1 шт.)
+# Долги контрагентов: {"Имя": сумма}
+debts = {}
 
-№  | НАИМЕНОВАНИЕ ТОВАРА                                        | Фасовка       | Цена (сом)
----|------------------------------------------------------------+---------------+-----------
-1  | АЛЬТОПЕН-ФОРТЕ (альбен, левамизоль суспензия)             | 100 мл        | 160
-2  | АЛЬТОПЕН-ФОРТЕ (альбен, левамизоль суспензия)             | 1 л           | 1060
-3  | АЛЬТОПЕН-ФОРТЕ ПЛЮС (альбен, оксиклозанид)                | 100 мл        | 125
-4  | АЛЬТОПЕН-ФОРТЕ ПЛЮС (альбен, оксиклозанид)                | 500 мл        | 480
-5  | АЛЬТОПЕН-ФОРТЕ ПЛЮС (альбен, оксиклозанид)                | 1 л           | 860
-6  | АЛЬТОПЕН (альбендазол 10%)                                 | 100 мл        | 90
-7  | АЛЬТОПЕН (альбендазол 10%)                                 | 500 мл        | 370
-8  | АЛЬТОПЕН (альбендазол 10%)                                 | 1 л           | 570
-9  | АЛЬТОПЕН 600 мг (альбен таблетки)                         | 55 таб        | 270
-10 | АЛЬТОПЕР (альбен, ивермек суспензия)                      | 100 мл        | 140
-11 | АЛЬТОПЕР (альбен, ивермек суспензия)                      | 200 мл        | 260
-12 | АЛЬТОПЕР (альбен, ивермек суспензия)                      | 500 мл        | 580
-13 | АЛЬТОПЕР (альбен, ивермек суспензия)                      | 1 л           | 950
-14 | БУТАТОП (бутафосфан, витамин B12)                         | 50 мл         | 180
-15 | БУТАТОП (бутафосфан, витамин B12)                         | 100 мл        | 290
-16 | ДЕКСАТОП (дексаметазон)                                   | 50 мл         | 180
-17 | ДЕКСАТОП (дексаметазон)                                   | 100 мл        | 280
-18 | КЛОЗАТОП (оксфендазол, оксиклозанид суспензия)            | 100 мл        | 140
-19 | КЛОЗАТОП (оксфендазол, оксиклозанид суспензия)            | 500 мл        | 580
-20 | КЛОЗАТОП (оксфендазол, оксиклозанид суспензия)            | 1 л           | 960
-21 | КЛОЗАТОП-ФОРТЕ (оксфендазол, оксиклозанид табл)           | 100 таб       | 790
-22 | МУЛЬТИ-ВИТАТОП (мультивитамин)                            | 50 мл         | 130
-23 | МУЛЬТИ-ВИТАТОП (мультивитамин)                            | 100 мл        | 230
-24 | ОКСИТОП (окситетрациклин 20%)                             | 10 мл (10 фл) | 230
-25 | ОКСИТОП (окситетрациклин 20%)                             | 50 мл         | 100
-26 | ОКСИТОП (окситетрациклин 20%)                             | 100 мл        | 160
-27 | ПЕНСТОП-G (пенстреп 20:25)                                | 50 мл         | 250
-28 | ПЕНСТОП-G (пенстреп 20:25)                                | 100 мл        | 440
-29 | ПРАЗИМЕКТОП (ивермек, празиквантел)                       | 100 мл        | 170
-30 | ПРАЗИМЕКТОП (ивермек, празиквантел)                       | 200 мл        | 320
-31 | ПРАЗИМЕКТОП (ивермек, празиквантел)                       | 500 мл        | 700
-32 | ПРАЗИМЕКТОП (ивермек, празиквантел)                       | 1 л           | 1350
-33 | ТИЛТОПЗИН-200 (тилозин 20%)                               | 50 мл         | 170
-34 | ТИЛТОПЗИН-200 (тилозин 20%)                               | 100 мл        | 270
-35 | ТОПМЕКТИН (ивермектин 1%)                                 | 10 мл (10 фл) | 200
-36 | ТОПМЕКТИН (ивермектин 1%)                                 | 50 мл         | 90
-37 | ТОПМЕКТИН (ивермектин 1%)                                 | 100 мл        | 130
-38 | ТОП-ГЕЛМИЦИД (альбен, оксиклозанид гранулы)              | 100 г         | 240
-39 | ТОП-ГЕЛМИЦИД (альбен, оксиклозанид гранулы)              | 500 г         | 980
-40 | ТОПЗАНТЕЛ (клозантел 5%)                                  | 50 мл         | 140
-41 | ТОПЗАНТЕЛ (клозантел 5%)                                  | 100 мл        | 240
-42 | ТОПЗАНТЕЛ (клозантел 5%)                                  | 250 мл        | 560
-43 | ТОПЛАМОКС (амоксициллин 15%)                              | 100 мл        | 270
-44 | ТОПМЕКТИН ГЕЛЬ (ивермек гель)                             | 30 мл         | 220
-45 | ТОП-СУПЕРВИТ (витаминный премикс)                         | 100 г         | 100
-46 | ТОП-СУПЕРВИТ (витаминный премикс)                         | 200 г         | 170
-47 | ТОП-СУПЕРВИТ (витаминный премикс)                         | 500 г         | 360
-48 | ТОП-СУПЕРВИТ (витаминный премикс)                         | 1 кг          | 650
-49 | ТОПФЛУНЕКС (флунексин меглюмин 5%)                        | 100 мл        | 550
-50 | ТРИВИТОП-AD3E (витамины AD3E)                             | 50 мл         | 120
-51 | ТРИВИТОП-AD3E (витамины AD3E)                             | 100 мл        | 190
-52 | ФЛУМЕТОП (акарвил, флюметрин 2%)                          | 100 мл        | 330
-53 | ЭНРОТОП (энрофлоксацин 10%)                               | 10 мл (10 фл) | 250
-54 | ЭНРОТОП (энрофлоксацин 10%)                               | 50 мл         | 110
-55 | ЭНРОТОП (энрофлоксацин 10%)                               | 100 мл        | 190
-56 | ЭНРОТОП ФОРТЕ (энрофлоксацин 10%) оральный                | 1 л           | 1250
-57 | БУТАСТИМ (бутафосфан, витамин B12)                        | 100 мл        | 450
-58 | ЭЛЕОВИТ (витамин)                                         | 100 мл        | 450
-59 | ТЕТРАВИТАМ (витамины AD3E)                                | 100 мл        | 340
-60 | МУЛЬТИВИТ + МИНЕРАЛЫ (мультивитамин + минералы)           | 100 мл        | 460
-61 | КЕТОПРОФ (кетопрофен)                                     | 100 мл        | 680
-62 | МУЛЬТИТОНИК (витаминно-тонизирующий комплекс)             | 1 л           | 1800
-63 | КИЛЛЕР ФЛАЙ (инсектицид)                                  | 400 г         | 1200
-64 | ТОНОКАРД (биостимулятор, кардиотоник)                     | 100 мл        | 780
-65 | АВЕРТОП (авермектин 5%)                                   | 100 мл        | 250
-66 | АВЕРТОП (авермектин 5%)                                   | 200 мл        | 450
-67 | АВЕРТОП (авермектин 5%)                                   | 500 мл        | 950
-68 | АЛЬБЕН ПЛЮС 100 (альбендазол 10%)                         | 100 мл        | 90
-69 | АЛЬБЕН ПЛЮС 100 (альбендазол 10%)                         | 200 мл        | 170
-70 | АЛЬБЕН ПЛЮС 100 (альбендазол 10%)                         | 500 мл        | 370
-71 | АЛЬБЕН ПЛЮС 100 (альбендазол 10%)                         | 1 л           | 570
-72 | АЛБЕНИВЕР (альбен, ивермек суспензия)                     | 100 мл        | 140
-73 | АЛБЕНИВЕР (альбен, ивермек суспензия)                     | 200 мл        | 260
-74 | АЛБЕНИВЕР (альбен, ивермек суспензия)                     | 500 мл        | 580
-75 | АЛБЕНИВЕР (альбен, ивермек суспензия)                     | 1 л           | 950
-76 | ДОКЦИЛИН 200 (доксициклин 20%)                            | 100 мл        | 450
-77 | ДОРАМЕК ПЛЮС 315 (дорамектин 3.15%)                       | 50 мл         | 490
-78 | ИВЕР ПЛЮС 2 (ивермектин 2%)                               | 50 мл         | 110
-79 | ИВЕР ПЛЮС 2 (ивермектин 2%)                               | 100 мл        | 190
-80 | ИВЕРВИТ-Е (ивермектин 1% + витамин Е 4%)                  | 10 мл (10 фл) | 260
-81 | ИВЕРВИТ-Е (ивермектин 1% + витамин Е 4%)                  | 50 мл         | 110
-82 | ИВЕРВИТ-Е (ивермектин 1% + витамин Е 4%)                  | 100 мл        | 180
-83 | ИВЕРКЛОЗ (ивермектин 1% + клозантел 10%)                  | 50 мл         | 150
-84 | ИВЕРКЛОЗ (ивермектин 1% + клозантел 10%)                  | 100 мл        | 280
-85 | КЛОЗАН ПЛЮС 100 (клозантел 10%)                           | 100 мл        | 330
-86 | КЛОЗАН ПЛЮС 100 (клозантел 10%)                           | 250 мл        | 760
-87 | ОКСИЛИН 300 LA (окситетрациклин 30%)                      | 10 мл (10 фл) | 290
-88 | ОКСИЛИН 300 LA (окситетрациклин 30%)                      | 50 мл         | 130
-89 | ОКСИЛИН 300 LA (окситетрациклин 30%)                      | 100 мл        | 230
-90 | ПЕНСТРЕП ПЛЮС LA (пенстреп 20:25)                         | 10 мл (10 фл) | 550
-91 | ПЕНСТРЕП ПЛЮС LA (пенстреп 20:25)                         | 50 мл         | 250
-92 | ПЕНСТРЕП ПЛЮС LA (пенстреп 20:25)                         | 100 мл        | 440
-93 | ФЕНБЕНЗОЛ 100 (фенбендазол 10%)                           | 100 мл        | 165
-94 | ФЕНБЕНЗОЛ 100 (фенбендазол 10%)                           | 200 мл        | 310
-95 | ФЕНБЕНЗОЛ 100 (фенбендазол 10%)                           | 500 мл        | 680
-96 | ФЕНБЕНЗОЛ 100 (фенбендазол 10%)                           | 1 л           | 1240
-97 | ФЛОРФЕН ПЛЮС 300 (флорфеникол 30%)                        | 100 мл        | 480
-98 | ЦЕФНОМ 25 (цефкинома 2.5%)                                | 50 мл         | 530
-99 | ЦЕФНОМ LC (шприц / 75 мг цефкинома)                       | 8 г           | 135
-100| ЦЕФТИ DC (шприц / 500 мг гидрохлорид цефтиофура)          | 10 мл         | 165
+# Доступ
+ADMIN_ID = 632294583
+allowed_users = set([ADMIN_ID])
 
-Контакты: +996 700 99 88 11 / +996 555 62 78 32
-Instagram: @vetop.kg
+def is_allowed(user_id: int) -> bool:
+    return user_id in allowed_users
+
+async def check_access(update) -> bool:
+    if not is_allowed(update.effective_user.id):
+        await update.message.reply_text("⛔ У вас нет доступа к этому боту.")
+        return False
+    return True
+
+PRICE_LIST_DATA = [
+    {"id": 1,  "name": "АЛЬТОПЕН-ФОРТЕ (альбен, левамизоль суспензия)",          "volume": "100 мл",        "box": 80,  "price": 160},
+    {"id": 2,  "name": "АЛЬТОПЕН-ФОРТЕ (альбен, левамизоль суспензия)",          "volume": "1 л",           "box": 12,  "price": 1060},
+    {"id": 3,  "name": "АЛЬТОПЕН-ФОРТЕ ПЛЮС (альбен, оксиклозанид)",             "volume": "100 мл",        "box": 80,  "price": 125},
+    {"id": 4,  "name": "АЛЬТОПЕН-ФОРТЕ ПЛЮС (альбен, оксиклозанид)",             "volume": "500 мл",        "box": 20,  "price": 480},
+    {"id": 5,  "name": "АЛЬТОПЕН-ФОРТЕ ПЛЮС (альбен, оксиклозанид)",             "volume": "1 л",           "box": 12,  "price": 860},
+    {"id": 6,  "name": "АЛЬТОПЕН (альбендазол 10%)",                             "volume": "100 мл",        "box": 80,  "price": 90},
+    {"id": 7,  "name": "АЛЬТОПЕН (альбендазол 10%)",                             "volume": "500 мл",        "box": 20,  "price": 370},
+    {"id": 8,  "name": "АЛЬТОПЕН (альбендазол 10%)",                             "volume": "1 л",           "box": 12,  "price": 570},
+    {"id": 9,  "name": "АЛЬТОПЕН 600 мг (альбен таблетки)",                      "volume": "55 таб",        "box": 40,  "price": 270},
+    {"id": 10, "name": "АЛЬТОПЕР (альбен, ивермек суспензия)",                   "volume": "100 мл",        "box": 80,  "price": 140},
+    {"id": 11, "name": "АЛЬТОПЕР (альбен, ивермек суспензия)",                   "volume": "200 мл",        "box": 50,  "price": 260},
+    {"id": 12, "name": "АЛЬТОПЕР (альбен, ивермек суспензия)",                   "volume": "500 мл",        "box": 20,  "price": 580},
+    {"id": 13, "name": "АЛЬТОПЕР (альбен, ивермек суспензия)",                   "volume": "1 л",           "box": 12,  "price": 950},
+    {"id": 14, "name": "БУТАТОП (бутафосфан, витамин B12)",                      "volume": "50 мл",         "box": 100, "price": 180},
+    {"id": 15, "name": "БУТАТОП (бутафосфан, витамин B12)",                      "volume": "100 мл",        "box": 80,  "price": 290},
+    {"id": 16, "name": "ДЕКСАТОП (дексаметазон)",                                "volume": "50 мл",         "box": 100, "price": 180},
+    {"id": 17, "name": "ДЕКСАТОП (дексаметазон)",                                "volume": "100 мл",        "box": 80,  "price": 280},
+    {"id": 18, "name": "КЛОЗАТОП (оксфендазол, оксиклозанид суспензия)",         "volume": "100 мл",        "box": 80,  "price": 140},
+    {"id": 19, "name": "КЛОЗАТОП (оксфендазол, оксиклозанид суспензия)",         "volume": "500 мл",        "box": 20,  "price": 580},
+    {"id": 20, "name": "КЛОЗАТОП (оксфендазол, оксиклозанид суспензия)",         "volume": "1 л",           "box": 12,  "price": 960},
+    {"id": 21, "name": "КЛОЗАТОП-ФОРТЕ (оксфендазол, оксиклозанид табл)",        "volume": "100 таб",       "box": 50,  "price": 790},
+    {"id": 22, "name": "МУЛЬТИ-ВИТАТОП (мультивитамин)",                         "volume": "50 мл",         "box": 100, "price": 130},
+    {"id": 23, "name": "МУЛЬТИ-ВИТАТОП (мультивитамин)",                         "volume": "100 мл",        "box": 80,  "price": 230},
+    {"id": 24, "name": "ОКСИТОП (окситетрациклин 20%)",                          "volume": "10 мл (10 фл)", "box": 40,  "price": 230},
+    {"id": 25, "name": "ОКСИТОП (окситетрациклин 20%)",                          "volume": "50 мл",         "box": 100, "price": 100},
+    {"id": 26, "name": "ОКСИТОП (окситетрациклин 20%)",                          "volume": "100 мл",        "box": 80,  "price": 160},
+    {"id": 27, "name": "ПЕНСТОП-G (пенстреп 20:25)",                             "volume": "50 мл",         "box": 100, "price": 250},
+    {"id": 28, "name": "ПЕНСТОП-G (пенстреп 20:25)",                             "volume": "100 мл",        "box": 80,  "price": 440},
+    {"id": 29, "name": "ПРАЗИМЕКТОП (ивермек, празиквантел)",                    "volume": "100 мл",        "box": 80,  "price": 170},
+    {"id": 30, "name": "ПРАЗИМЕКТОП (ивермек, празиквантел)",                    "volume": "200 мл",        "box": 50,  "price": 320},
+    {"id": 31, "name": "ПРАЗИМЕКТОП (ивермек, празиквантел)",                    "volume": "500 мл",        "box": 20,  "price": 700},
+    {"id": 32, "name": "ПРАЗИМЕКТОП (ивермек, празиквантел)",                    "volume": "1 л",           "box": 12,  "price": 1350},
+    {"id": 33, "name": "ТИЛТОПЗИН-200 (тилозин 20%)",                            "volume": "50 мл",         "box": 100, "price": 170},
+    {"id": 34, "name": "ТИЛТОПЗИН-200 (тилозин 20%)",                            "volume": "100 мл",        "box": 80,  "price": 270},
+    {"id": 35, "name": "ТОПМЕКТИН (ивермектин 1%)",                              "volume": "10 мл (10 фл)", "box": 40,  "price": 200},
+    {"id": 36, "name": "ТОПМЕКТИН (ивермектин 1%)",                              "volume": "50 мл",         "box": 100, "price": 90},
+    {"id": 37, "name": "ТОПМЕКТИН (ивермектин 1%)",                              "volume": "100 мл",        "box": 80,  "price": 130},
+    {"id": 38, "name": "ТОП-ГЕЛМИЦИД (альбен, оксиклозанид гранулы)",           "volume": "100 г",         "box": 60,  "price": 240},
+    {"id": 39, "name": "ТОП-ГЕЛМИЦИД (альбен, оксиклозанид гранулы)",           "volume": "500 г",         "box": 20,  "price": 980},
+    {"id": 40, "name": "ТОПЗАНТЕЛ (клозантел 5%)",                               "volume": "50 мл",         "box": 100, "price": 140},
+    {"id": 41, "name": "ТОПЗАНТЕЛ (клозантел 5%)",                               "volume": "100 мл",        "box": 80,  "price": 240},
+    {"id": 42, "name": "ТОПЗАНТЕЛ (клозантел 5%)",                               "volume": "250 мл",        "box": 40,  "price": 560},
+    {"id": 43, "name": "ТОПЛАМОКС (амоксициллин 15%)",                           "volume": "100 мл",        "box": 80,  "price": 270},
+    {"id": 44, "name": "ТОПМЕКТИН ГЕЛЬ (ивермек гель)",                          "volume": "30 мл",         "box": 100, "price": 220},
+    {"id": 45, "name": "ТОП-СУПЕРВИТ (витаминный премикс)",                      "volume": "100 г",         "box": 60,  "price": 100},
+    {"id": 46, "name": "ТОП-СУПЕРВИТ (витаминный премикс)",                      "volume": "200 г",         "box": 50,  "price": 170},
+    {"id": 47, "name": "ТОП-СУПЕРВИТ (витаминный премикс)",                      "volume": "500 г",         "box": 20,  "price": 360},
+    {"id": 48, "name": "ТОП-СУПЕРВИТ (витаминный премикс)",                      "volume": "1 кг",          "box": 10,  "price": 650},
+    {"id": 49, "name": "ТОПФЛУНЕКС (флунексин меглюмин 5%)",                    "volume": "100 мл",        "box": 80,  "price": 550},
+    {"id": 50, "name": "ТРИВИТОП-AD3E (витамины AD3E)",                          "volume": "50 мл",         "box": 100, "price": 120},
+    {"id": 51, "name": "ТРИВИТОП-AD3E (витамины AD3E)",                          "volume": "100 мл",        "box": 80,  "price": 190},
+    {"id": 52, "name": "ФЛУМЕТОП (акарвил, флюметрин 2%)",                      "volume": "100 мл",        "box": 100, "price": 330},
+    {"id": 53, "name": "ЭНРОТОП (энрофлоксацин 10%)",                            "volume": "10 мл (10 фл)", "box": 40,  "price": 250},
+    {"id": 54, "name": "ЭНРОТОП (энрофлоксацин 10%)",                            "volume": "50 мл",         "box": 100, "price": 110},
+    {"id": 55, "name": "ЭНРОТОП (энрофлоксацин 10%)",                            "volume": "100 мл",        "box": 80,  "price": 190},
+    {"id": 56, "name": "ЭНРОТОП ФОРТЕ (энрофлоксацин 10%) оральный",             "volume": "1 л",           "box": 12,  "price": 1250},
+    {"id": 57, "name": "БУТАСТИМ (бутафосфан, витамин B12)",                     "volume": "100 мл",        "box": 50,  "price": 450},
+    {"id": 58, "name": "ЭЛЕОВИТ (витамин)",                                      "volume": "100 мл",        "box": 50,  "price": 450},
+    {"id": 59, "name": "ТЕТРАВИТАМ (витамины AD3E)",                             "volume": "100 мл",        "box": 50,  "price": 340},
+    {"id": 60, "name": "МУЛЬТИВИТ + МИНЕРАЛЫ (мультивитамин + минералы)",        "volume": "100 мл",        "box": 50,  "price": 460},
+    {"id": 61, "name": "КЕТОПРОФ (кетопрофен)",                                  "volume": "100 мл",        "box": 50,  "price": 680},
+    {"id": 62, "name": "МУЛЬТИТОНИК (витаминно-тонизирующий комплекс)",          "volume": "1 л",           "box": 12,  "price": 1800},
+    {"id": 63, "name": "КИЛЛЕР ФЛАЙ (инсектицид)",                              "volume": "400 г",         "box": 24,  "price": 1200},
+    {"id": 64, "name": "ТОНОКАРД (биостимулятор, кардиотоник)",                  "volume": "100 мл",        "box": 50,  "price": 780},
+    {"id": 65, "name": "АВЕРТОП (авермектин 5%)",                                "volume": "100 мл",        "box": 80,  "price": 250},
+    {"id": 66, "name": "АВЕРТОП (авермектин 5%)",                                "volume": "200 мл",        "box": 50,  "price": 450},
+    {"id": 67, "name": "АВЕРТОП (авермектин 5%)",                                "volume": "500 мл",        "box": 20,  "price": 950},
+    {"id": 68, "name": "АЛЬБЕН ПЛЮС 100 (альбендазол 10%)",                     "volume": "100 мл",        "box": 80,  "price": 90},
+    {"id": 69, "name": "АЛЬБЕН ПЛЮС 100 (альбендазол 10%)",                     "volume": "200 мл",        "box": 50,  "price": 170},
+    {"id": 70, "name": "АЛЬБЕН ПЛЮС 100 (альбендазол 10%)",                     "volume": "500 мл",        "box": 20,  "price": 370},
+    {"id": 71, "name": "АЛЬБЕН ПЛЮС 100 (альбендазол 10%)",                     "volume": "1 л",           "box": 12,  "price": 570},
+    {"id": 72, "name": "АЛБЕНИВЕР (альбен, ивермек суспензия)",                  "volume": "100 мл",        "box": 80,  "price": 140},
+    {"id": 73, "name": "АЛБЕНИВЕР (альбен, ивермек суспензия)",                  "volume": "200 мл",        "box": 50,  "price": 260},
+    {"id": 74, "name": "АЛБЕНИВЕР (альбен, ивермек суспензия)",                  "volume": "500 мл",        "box": 20,  "price": 580},
+    {"id": 75, "name": "АЛБЕНИВЕР (альбен, ивермек суспензия)",                  "volume": "1 л",           "box": 12,  "price": 950},
+    {"id": 76, "name": "ДОКЦИЛИН 200 (доксициклин 20%)",                         "volume": "100 мл",        "box": 80,  "price": 450},
+    {"id": 77, "name": "ДОРАМЕК ПЛЮС 315 (дорамектин 3.15%)",                   "volume": "50 мл",         "box": 150, "price": 490},
+    {"id": 78, "name": "ИВЕР ПЛЮС 2 (ивермектин 2%)",                           "volume": "50 мл",         "box": 150, "price": 110},
+    {"id": 79, "name": "ИВЕР ПЛЮС 2 (ивермектин 2%)",                           "volume": "100 мл",        "box": 80,  "price": 190},
+    {"id": 80, "name": "ИВЕРВИТ-Е (ивермектин 1% + витамин Е 4%)",              "volume": "10 мл (10 фл)", "box": 40,  "price": 260},
+    {"id": 81, "name": "ИВЕРВИТ-Е (ивермектин 1% + витамин Е 4%)",              "volume": "50 мл",         "box": 150, "price": 110},
+    {"id": 82, "name": "ИВЕРВИТ-Е (ивермектин 1% + витамин Е 4%)",              "volume": "100 мл",        "box": 80,  "price": 180},
+    {"id": 83, "name": "ИВЕРКЛОЗ (ивермектин 1% + клозантел 10%)",              "volume": "50 мл",         "box": 150, "price": 150},
+    {"id": 84, "name": "ИВЕРКЛОЗ (ивермектин 1% + клозантел 10%)",              "volume": "100 мл",        "box": 80,  "price": 280},
+    {"id": 85, "name": "КЛОЗАН ПЛЮС 100 (клозантел 10%)",                       "volume": "100 мл",        "box": 80,  "price": 330},
+    {"id": 86, "name": "КЛОЗАН ПЛЮС 100 (клозантел 10%)",                       "volume": "250 мл",        "box": 40,  "price": 760},
+    {"id": 87, "name": "ОКСИЛИН 300 LA (окситетрациклин 30%)",                  "volume": "10 мл (10 фл)", "box": 40,  "price": 290},
+    {"id": 88, "name": "ОКСИЛИН 300 LA (окситетрациклин 30%)",                  "volume": "50 мл",         "box": 150, "price": 130},
+    {"id": 89, "name": "ОКСИЛИН 300 LA (окситетрациклин 30%)",                  "volume": "100 мл",        "box": 80,  "price": 230},
+    {"id": 90, "name": "ПЕНСТРЕП ПЛЮС LA (пенстреп 20:25)",                     "volume": "10 мл (10 фл)", "box": 40,  "price": 550},
+    {"id": 91, "name": "ПЕНСТРЕП ПЛЮС LA (пенстреп 20:25)",                     "volume": "50 мл",         "box": 150, "price": 250},
+    {"id": 92, "name": "ПЕНСТРЕП ПЛЮС LA (пенстреп 20:25)",                     "volume": "100 мл",        "box": 80,  "price": 440},
+    {"id": 93, "name": "ФЕНБЕНЗОЛ 100 (фенбендазол 10%)",                       "volume": "100 мл",        "box": 80,  "price": 165},
+    {"id": 94, "name": "ФЕНБЕНЗОЛ 100 (фенбендазол 10%)",                       "volume": "200 мл",        "box": 50,  "price": 310},
+    {"id": 95, "name": "ФЕНБЕНЗОЛ 100 (фенбендазол 10%)",                       "volume": "500 мл",        "box": 20,  "price": 680},
+    {"id": 96, "name": "ФЕНБЕНЗОЛ 100 (фенбендазол 10%)",                       "volume": "1 л",           "box": 12,  "price": 1240},
+    {"id": 97, "name": "ФЛОРФЕН ПЛЮС 300 (флорфеникол 30%)",                    "volume": "100 мл",        "box": 80,  "price": 480},
+    {"id": 98, "name": "ЦЕФНОМ 25 (цефкинома 2.5%)",                            "volume": "50 мл",         "box": 150, "price": 530},
+    {"id": 99, "name": "ЦЕФНОМ LC (шприц / 75 мг цефкинома)",                   "volume": "8 г",           "box": 24,  "price": 135},
+    {"id": 100,"name": "ЦЕФТИ DC (шприц / 500 мг гидрохлорид цефтиофура)",      "volume": "10 мл",         "box": 24,  "price": 165},
+]
+
+PRICE_LIST_TEXT = "\n".join(
+    f"{p['id']}. {p['name']} | {p['volume']} | {p['box']} шт/кор | {p['price']} сом"
+    for p in PRICE_LIST_DATA
+)
+
+def format_invoice(client_name: str, items: list, prev_debt: float = 0) -> str:
+    date_str = datetime.now().strftime("%d.%m.%Y")
+    total = sum(it["qty"] * it["price"] for it in items)
+    grand_total = total + prev_debt
+
+    lines = []
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📋 *НАКЛАДНАЯ — ВЕТОП*")
+    lines.append(f"📅 {date_str}")
+    lines.append(f"👤 Контрагент: *{client_name}*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    for i, it in enumerate(items, 1):
+        subtotal = it["qty"] * it["price"]
+        box_qty = it.get("box_qty")
+        qty_str = f"{it['qty']} шт"
+        if box_qty:
+            qty_str += f" ({box_qty} кор)"
+        lines.append(f"*{i}. {it['name']}*")
+        lines.append(f"   📦 {it['volume']} × {qty_str} = *{subtotal:,} сом*")
+        lines.append(f"   _(цена: {it['price']} сом/шт)_")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"💰 Сумма: *{total:,} сом*")
+
+    if prev_debt > 0:
+        lines.append(f"⚠️ Старый долг: *{prev_debt:,} сом*")
+        lines.append(f"📌 ИТОГО к оплате: *{grand_total:,} сом*")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
+    return "\n".join(lines)
+
+SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП" — оптового поставщика ветеринарных препаратов.
+
+У тебя два режима:
+
+=== РЕЖИМ 1: ВОПРОСЫ О ПРАЙСЕ ===
+Отвечай на вопросы о ценах, фасовках, составе препаратов. Кратко и по делу.
+
+=== РЕЖИМ 2: СОЗДАНИЕ НАКЛАДНОЙ ===
+Когда сотрудник перечисляет товары для накладной — верни ТОЛЬКО JSON, без пояснений:
+
+{{
+  "action": "invoice",
+  "client": "Имя контрагента",
+  "items": [
+    {{"name": "точное название из прайса", "volume": "фасовка", "qty": количество_в_штуках, "box_qty": количество_коробок_или_null, "price": цена_из_прайса}}
+  ]
+}}
+
+=== ВАЖНО: КОРОБКИ ===
+Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.
+В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.
+Ты ОБЯЗАН перевести коробки в штуки: qty = количество_коробок × шт_в_коробке
+
+Примеры:
+- "Албенивер 200мл 1к" → 1 коробка × 50 шт/кор = qty: 50
+- "Альтопен 100мл 2к" → 2 коробки × 80 шт/кор = qty: 160
+- "Топмектин 1% 100мл 3к" → 3 коробки × 80 шт/кор = qty: 240
+- "Дексатоп 50мл 10 шт" → qty: 10 (просто штуки, без пересчёта)
+
+Другие обозначения коробок: "к", "кор", "коробка", "коробок", "box"
+
+=== ДРУГИЕ ПРАВИЛА ===
+- Цены бери СТРОГО из прайса
+- Если товар не найден — напиши текстом что не нашёл
+- Если неясно что-то — уточни у сотрудника
+- Имя контрагента обязательно
+
+ПРАЙС-ЛИСТ (формат: №. Название | Фасовка | шт/кор | цена):
+{PRICE_LIST_TEXT}
+
+Общайся на русском. Отвечай кратко.
 """
-
-SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП" — оптового поставщика ветеринарных препаратов в Кыргызстане.
-
-Тебе доступен актуальный прайс-лист компании. Отвечай на вопросы о ценах, наличии товаров, фасовках и составе препаратов.
-
-Правила:
-- Отвечай кратко и по делу
-- Если спрашивают цену конкретного препарата — сразу называй цену и все доступные фасовки
-- Если препарат не найден в прайсе — честно скажи об этом
-- Цены указаны в сомах (оптовые за 1 шт.)
-- Можешь помогать подбирать препараты по действующему веществу или назначению
-- Общайся на русском языке
-
-ПРАЙС-ЛИСТ:
-{PRICE_LIST}
-"""
-
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
     chat_id = update.effective_chat.id
     chat_histories[chat_id] = []
     await update.message.reply_text(
-        "Привет! Я бот компании ВЕТОП 🐄💊\n\n"
-        "Я знаю актуальный прайс-лист и помогу найти нужный препарат и цену.\n\n"
-        "Команды:\n"
-        "/price — показать весь прайс-лист\n"
-        "/clear — очистить историю чата\n\n"
-        "Просто напишите название препарата или задайте вопрос!"
+        "👋 Привет! Я бот компании *ВЕТОП* 🐄💊\n\n"
+        "📌 *Команды:*\n"
+        "/накладная — создать накладную\n"
+        "/долги — все долги контрагентов\n"
+        "/оплата Имя Сумма — принять оплату\n"
+        "/price — полный прайс-лист\n"
+        "/clear — очистить историю\n\n"
+        "Или просто напишите что нужно!",
+        parse_mode="Markdown"
     )
 
-
-async def price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    lines = []
-    for line in PRICE_LIST.strip().split("\n"):
-        if line.strip():
-            lines.append(line)
-
-    # Telegram limit is 4096 chars per message, split if needed
-    chunk = ""
-    for line in lines:
-        if len(chunk) + len(line) + 1 > 4000:
-            await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+async def show_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
+    chunk = "📋 *Прайс ВЕТОП от 22.04.2026*\n\n"
+    for p in PRICE_LIST_DATA:
+        line = f"{p['id']}. {p['name']} | {p['volume']} | {p['box']} шт/кор | *{p['price']} сом*\n"
+        if len(chunk) + len(line) > 4000:
+            await update.message.reply_text(chunk, parse_mode="Markdown")
             chunk = line
         else:
-            chunk += "\n" + line
-
+            chunk += line
     if chunk:
-        await update.message.reply_text(f"```\n{chunk}\n```", parse_mode="Markdown")
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
+async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
+    if not debts:
+        await update.message.reply_text("✅ Долгов нет!")
+        return
+    lines = ["━━━━━━━━━━━━━━━━━━━━━━━━", "📊 *ДОЛГИ КОНТРАГЕНТОВ*", "━━━━━━━━━━━━━━━━━━━━━━━━"]
+    total = 0
+    for name, amount in sorted(debts.items()):
+        lines.append(f"👤 {name}: *{amount:,} сом*")
+        total += amount
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"💰 Всего: *{total:,} сом*")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def handle_payment(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Использование: `/оплата Имя Сумма`\nПример: `/оплата Асан 5000`",
+            parse_mode="Markdown"
+        )
+        return
+    amount_str = args[-1]
+    name = " ".join(args[:-1])
+    try:
+        amount = float(amount_str)
+    except ValueError:
+        await update.message.reply_text("❌ Неверная сумма. Пример: `/оплата Асан 5000`", parse_mode="Markdown")
+        return
+
+    matched = next((k for k in debts if k.lower() == name.lower()), None)
+    if matched is None:
+        await update.message.reply_text(f"❌ Контрагент *{name}* не найден в долгах.", parse_mode="Markdown")
+        return
+
+    debts[matched] -= amount
+    if debts[matched] <= 0:
+        del debts[matched]
+        await update.message.reply_text(f"✅ *{matched}* полностью погасил долг!", parse_mode="Markdown")
+    else:
+        await update.message.reply_text(
+            f"✅ Оплата *{amount:,.0f} сом* от *{matched}* принята\n"
+            f"📌 Остаток долга: *{debts[matched]:,.0f} сом*",
+            parse_mode="Markdown"
+        )
+
+async def nakладная_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
+    chat_id = update.effective_chat.id
+    chat_histories[chat_id] = []
+    await update.message.reply_text(
+        "📋 *Создание накладной*\n\n"
+        "Напишите в свободной форме:\n\n"
+        "*Штуками:*\n"
+        "_Асан, Альтопен 100мл 10 шт, Дексатоп 50мл 5 шт_\n\n"
+        "*Коробками (к = коробка):*\n"
+        "_Асан, Албенивер 200мл 1к, Топмектин 100мл 2к_\n\n"
+        "💡 Бот сам переведёт коробки в штуки по прайсу.",
+        parse_mode="Markdown"
+    )
 
 async def clear(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
     chat_id = update.effective_chat.id
     chat_histories[chat_id] = []
     await update.message.reply_text("История очищена ✅")
 
-
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_access(update): return
     chat_id = update.effective_chat.id
     user_text = update.message.text
 
@@ -194,18 +329,92 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             system=SYSTEM_PROMPT,
             messages=history
         )
-        reply = response.content[0].text
+        reply = response.content[0].text.strip()
         chat_histories[chat_id].append({"role": "assistant", "content": reply})
+
+        # Проверяем — накладная?
+        if reply.startswith("{") and '"action": "invoice"' in reply:
+            try:
+                data = json.loads(reply)
+                client_name = data["client"]
+                items = data["items"]
+                prev_debt = debts.get(client_name, 0)
+                invoice_total = sum(it["qty"] * it["price"] for it in items)
+
+                # Обновляем долг
+                debts[client_name] = prev_debt + invoice_total
+
+                invoice_text = format_invoice(client_name, items, prev_debt)
+                await update.message.reply_text(invoice_text, parse_mode="Markdown")
+
+                new_total = debts[client_name]
+                await update.message.reply_text(
+                    f"📌 Долг *{client_name}* теперь: *{new_total:,} сом*",
+                    parse_mode="Markdown"
+                )
+                return
+            except (json.JSONDecodeError, KeyError) as e:
+                await update.message.reply_text(f"⚠️ Ошибка при создании накладной: {e}")
+                return
+
         await update.message.reply_text(reply)
+
     except Exception as e:
         await update.message.reply_text(f"Ошибка: {str(e)}")
 
+
+async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только администратор может добавлять пользователей.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: `/добавить 123456789`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(context.args[0])
+        allowed_users.add(uid)
+        await update.message.reply_text(f"✅ Пользователь `{uid}` добавлен.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID. Пример: `/добавить 123456789`", parse_mode="Markdown")
+
+async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только администратор может удалять пользователей.")
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: `/удалить 123456789`", parse_mode="Markdown")
+        return
+    try:
+        uid = int(context.args[0])
+        if uid == ADMIN_ID:
+            await update.message.reply_text("❌ Нельзя удалить администратора.")
+            return
+        allowed_users.discard(uid)
+        await update.message.reply_text(f"✅ Пользователь `{uid}` удалён.", parse_mode="Markdown")
+    except ValueError:
+        await update.message.reply_text("❌ Неверный ID.", parse_mode="Markdown")
+
+async def list_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    lines = ["👥 *Пользователи с доступом:*"]
+    for uid in allowed_users:
+        label = " _(админ)_" if uid == ADMIN_ID else ""
+        lines.append(f"• `{uid}`{label}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
 
 if __name__ == "__main__":
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
-    app.add_handler(CommandHandler("price", price))
+    app.add_handler(CommandHandler("price", show_price))
+    app.add_handler(CommandHandler("долги", show_debts))
+    app.add_handler(CommandHandler("оплата", handle_payment))
+    app.add_handler(CommandHandler("накладная", nakладная_command))
+    app.add_handler(CommandHandler("добавить", add_user))
+    app.add_handler(CommandHandler("удалить", remove_user))
+    app.add_handler(CommandHandler("пользователи", list_users))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     print("Бот запущен...")
     app.run_polling(stop_signals=None)
