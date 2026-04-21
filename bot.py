@@ -138,8 +138,8 @@ PRICE_LIST_TEXT = "\n".join(
 
 def format_invoice(client_name: str, items: list, prev_debt: float = 0) -> str:
     date_str = datetime.now().strftime("%d.%m.%Y")
-    total = sum(it["qty"] * it["price"] for it in items)
-    grand_total = total + prev_debt
+    invoice_total = sum(it["qty"] * it["price"] for it in items)
+    grand_total = invoice_total + prev_debt
 
     lines = []
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -151,20 +151,15 @@ def format_invoice(client_name: str, items: list, prev_debt: float = 0) -> str:
     for i, it in enumerate(items, 1):
         subtotal = it["qty"] * it["price"]
         box_qty = it.get("box_qty")
-        qty_str = f"{it['qty']} шт"
-        if box_qty:
-            qty_str += f" ({box_qty} кор)"
-        lines.append(f"*{i}. {it['name']}*")
-        lines.append(f"   📦 {it['volume']} × {qty_str} = *{subtotal:,} сом*")
-        lines.append(f"   _(цена: {it['price']} сом/шт)_")
+        box_str = f"({box_qty} кор) " if box_qty else ""
+        lines.append(f"*{i}. {it['name']} - {it['volume']}*")
+        lines.append(f"   📦 {box_str}{it['qty']} шт × {it['price']} сом = *{subtotal:,} сом*")
 
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append(f"💰 Сумма: *{total:,} сом*")
-
+    lines.append(f"🧾 Сумма накладной: *{invoice_total:,} сом*")
     if prev_debt > 0:
-        lines.append(f"⚠️ Старый долг: *{prev_debt:,} сом*")
-        lines.append(f"📌 ИТОГО к оплате: *{grand_total:,} сом*")
-
+        lines.append(f"⚠️ Остаток долга: *{prev_debt:,} сом*")
+        lines.append(f"📌 Общий итоговый долг: *{grand_total:,} сом*")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
     lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
     return "\n".join(lines)
@@ -182,6 +177,7 @@ SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП"
 {{
   "action": "invoice",
   "client": "Имя контрагента",
+  "debt": старый_долг_или_0,
   "items": [
     {{"name": "точное название из прайса", "volume": "фасовка", "qty": количество_в_штуках, "box_qty": количество_коробок_или_null, "price": цена_из_прайса}}
   ]
@@ -199,6 +195,10 @@ SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП"
 - "Дексатоп 50мл 10 шт" → qty: 10 (просто штуки, без пересчёта)
 
 Другие обозначения коробок: "к", "кор", "коробка", "коробок", "box"
+
+=== ДОЛГ ===
+Если сотрудник упоминает долг контрагента (например "долг 10670" или "остаток 5000"), 
+занеси его в поле "debt". Если долг не указан — debt: 0.
 
 === ДРУГИЕ ПРАВИЛА ===
 - Цены бери СТРОГО из прайса
@@ -346,20 +346,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 data = json.loads(clean_reply)
                 client_name = data["client"]
                 items = data["items"]
-                prev_debt = debts.get(client_name, 0)
-                invoice_total = sum(it["qty"] * it["price"] for it in items)
-
-                # Обновляем долг
-                debts[client_name] = prev_debt + invoice_total
+                prev_debt = float(data.get("debt", 0) or 0)
 
                 invoice_text = format_invoice(client_name, items, prev_debt)
                 await update.message.reply_text(invoice_text, parse_mode="Markdown")
-
-                new_total = debts[client_name]
-                await update.message.reply_text(
-                    f"📌 Долг *{client_name}* теперь: *{new_total:,} сом*",
-                    parse_mode="Markdown"
-                )
                 return
             except (json.JSONDecodeError, KeyError) as e:
                 await update.message.reply_text(f"⚠️ Ошибка при создании накладной: {e}")
