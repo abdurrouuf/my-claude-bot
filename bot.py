@@ -170,7 +170,7 @@ def format_invoice(client_name: str, items: list, prev_debt: float = 0) -> str:
         lines.append(f"⚠️ Остаток долга: *{prev_debt:,} сом*")
         lines.append(f"📌 Общий итоговый долг: *{grand_total:,} сом*")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
+    lines.append("☎️ +996 700 99 88 11 | +996 700 887 666")
     return "\n".join(lines)
 
 def format_invoice_with_payment(client_name: str, items: list, prev_debt: float, payment: float) -> str:
@@ -205,7 +205,7 @@ def format_invoice_with_payment(client_name: str, items: list, prev_debt: float,
     else:
         lines.append(f"📌 Остаток долга: *{remainder:,} сом*")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
+    lines.append("☎️ +996 700 99 88 11 | +996 700 887 666")
     return "\n".join(lines)
 
 
@@ -226,7 +226,7 @@ def format_payment(client_name: str, debt: float, payment: float) -> str:
     else:
         lines.append(f"📌 Остаток долга: *{remainder:,.0f} сом*")
     lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
-    lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
+    lines.append("☎️ +996 700 99 88 11 | +996 700 887 666")
     return "\n".join(lines)
 
 
