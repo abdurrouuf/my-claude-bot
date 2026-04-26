@@ -231,7 +231,30 @@ def format_payment(client_name: str, debt: float, payment: float) -> str:
 
 
 def generate_pdf(text: str) -> io.BytesIO:
-    """Генерирует PDF из текста накладной."""
+    """Генерирует PDF из текста накладной с поддержкой кириллицы."""
+    # Ищем шрифт DejaVu в системе (есть на большинстве Linux серверов)
+    font_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    ]
+    bold_paths = [
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
+        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
+    ]
+    font_path = next((p for p in font_paths if os.path.exists(p)), None)
+    font_bold_path = next((p for p in bold_paths if os.path.exists(p)), None)
+
+    if font_path and font_bold_path:
+        pdfmetrics.registerFont(TTFont("DejaVu", font_path))
+        pdfmetrics.registerFont(TTFont("DejaVu-Bold", font_bold_path))
+        font_name = "DejaVu"
+        font_bold_name = "DejaVu-Bold"
+    else:
+        font_name = "Helvetica"
+        font_bold_name = "Helvetica-Bold"
+
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -242,47 +265,32 @@ def generate_pdf(text: str) -> io.BytesIO:
         bottomMargin=10*mm
     )
 
-    styles = getSampleStyleSheet()
-    normal = ParagraphStyle(
-        'normal',
-        fontName='Helvetica',
-        fontSize=9,
-        leading=14,
-        spaceAfter=2,
-    )
-    bold = ParagraphStyle(
-        'bold',
-        fontName='Helvetica-Bold',
-        fontSize=10,
-        leading=14,
-        spaceAfter=2,
-    )
-    title_style = ParagraphStyle(
-        'title',
-        fontName='Helvetica-Bold',
-        fontSize=12,
-        leading=16,
-        alignment=1,
-        spaceAfter=4,
-    )
+    normal = ParagraphStyle('normal', fontName=font_name, fontSize=9, leading=14, spaceAfter=2)
+    bold = ParagraphStyle('bold', fontName=font_bold_name, fontSize=10, leading=14, spaceAfter=2)
+    title_style = ParagraphStyle('title', fontName=font_bold_name, fontSize=12, leading=16, alignment=1, spaceAfter=4)
+
+    # Убираем эмодзи (они не поддерживаются в шрифте)
+    import re
+    def remove_emoji(s):
+        return re.sub(r'[^-Ѐ-ӿ -⁯\s0-9.,:()*%+=/%-]', '', s)
 
     story = []
-    # Clean markdown and build PDF content
     lines = text.split("\n")
     for line in lines:
         line = line.strip()
-        if not line or line.startswith("━"):
-            if line.startswith("━"):
-                story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
-                story.append(Spacer(1, 2*mm))
+        if not line:
+            story.append(Spacer(1, 2*mm))
             continue
-        # Remove markdown bold markers
-        clean = line.replace("*", "").replace("_", "")
-        if any(x in line for x in ["НАКЛАДНАЯ", "ПРИХОД"]):
+        if line.startswith("━"):
+            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
+            story.append(Spacer(1, 2*mm))
+            continue
+        clean = remove_emoji(line).replace("*", "").replace("_", "").strip()
+        if not clean:
+            continue
+        if any(x in line for x in ["НАКЛАДНАЯ", "ПРИХОД", "ВЕТОП"]):
             story.append(Paragraph(clean, title_style))
-        elif line.startswith("📋") or line.startswith("💵"):
-            story.append(Paragraph(clean, title_style))
-        elif "**" in line or line.startswith("1.") or line.startswith("2.") or line.startswith("3."):
+        elif line.startswith("*") and line.endswith("*"):
             story.append(Paragraph(clean, bold))
         else:
             story.append(Paragraph(clean, normal))
