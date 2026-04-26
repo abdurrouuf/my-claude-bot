@@ -164,6 +164,62 @@ def format_invoice(client_name: str, items: list, prev_debt: float = 0) -> str:
     lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
     return "\n".join(lines)
 
+def format_invoice_with_payment(client_name: str, items: list, prev_debt: float, payment: float) -> str:
+    date_str = datetime.now().strftime("%d.%m.%Y")
+    invoice_total = sum(it["qty"] * it["price"] for it in items)
+    total_debt = invoice_total + prev_debt
+    remainder = total_debt - payment
+
+    lines = []
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"📋 *НАКЛАДНАЯ — ВЕТОП*")
+    lines.append(f"📅 {date_str}")
+    lines.append(f"👤 Контрагент: *{client_name}*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+
+    for i, it in enumerate(items, 1):
+        subtotal = it["qty"] * it["price"]
+        box_qty = it.get("box_qty")
+        box_str = f"({box_qty} кор) " if box_qty else ""
+        lines.append(f"*{i}. {it['name']} - {it['volume']}*")
+        lines.append(f"   📦 {box_str}{it['qty']} шт × {it['price']} сом = *{subtotal:,} сом*")
+
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"🧾 Сумма накладной: *{invoice_total:,} сом*")
+    if prev_debt > 0:
+        lines.append(f"⚠️ Старый долг: *{prev_debt:,} сом*")
+    lines.append(f"📊 Итого долг: *{total_debt:,} сом*")
+    lines.append(f"💵 Приход: *{payment:,} сом*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    if remainder <= 0:
+        lines.append(f"🎉 Долг полностью погашен!")
+    else:
+        lines.append(f"📌 Остаток долга: *{remainder:,} сом*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
+    return "\n".join(lines)
+
+
+def format_payment(client_name: str, debt: float, payment: float) -> str:
+    remainder = debt - payment
+    date_str = datetime.now().strftime("%d.%m.%Y")
+    lines = []
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"💵 *ПРИХОД — ВЕТОП*")
+    lines.append(f"📅 {date_str}")
+    lines.append(f"👤 Контрагент: *{client_name}*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append(f"⚠️ Долг: *{debt:,.0f} сом*")
+    lines.append(f"✅ Оплата: *{payment:,.0f} сом*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    if remainder <= 0:
+        lines.append(f"🎉 Долг полностью погашен!")
+    else:
+        lines.append(f"📌 Остаток долга: *{remainder:,.0f} сом*")
+    lines.append("━━━━━━━━━━━━━━━━━━━━━━━━")
+    lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
+    return "\n".join(lines)
+
 SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП" — оптового поставщика ветеринарных препаратов.
 
 У тебя два режима:
@@ -171,17 +227,23 @@ SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП"
 === РЕЖИМ 1: ВОПРОСЫ О ПРАЙСЕ ===
 Отвечай на вопросы о ценах, фасовках, составе препаратов. Кратко и по делу.
 
-=== РЕЖИМ 2: СОЗДАНИЕ НАКЛАДНОЙ ===
-Когда сотрудник перечисляет товары для накладной — верни ТОЛЬКО JSON, без пояснений:
+=== РЕЖИМ 2: НАКЛАДНАЯ (с долгом и/или приходом) ===
+Когда сотрудник перечисляет товары — верни ТОЛЬКО JSON, без пояснений:
 
 {{
   "action": "invoice",
   "client": "Имя контрагента",
   "debt": старый_долг_или_0,
+  "payment": приход_или_0,
   "items": [
     {{"name": "точное название из прайса", "volume": "фасовка", "qty": количество_в_штуках, "box_qty": количество_коробок_или_null, "price": цена_из_прайса}}
   ]
 }}
+
+Примеры заполнения полей:
+- "долг 31470" → debt: 31470
+- "приход 5000" → payment: 5000
+- Если не указано → 0
 
 === ВАЖНО: КОРОБКИ ===
 Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.
@@ -341,14 +403,31 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 clean_reply = clean_reply[4:]
             clean_reply = clean_reply.strip()
 
+        if '"action": "payment"' in clean_reply:
+            try:
+                data = json.loads(clean_reply)
+                client_name = data["client"]
+                debt = float(data.get("debt", 0) or 0)
+                payment = float(data.get("payment", 0) or 0)
+                payment_text = format_payment(client_name, debt, payment)
+                await update.message.reply_text(payment_text, parse_mode="Markdown")
+                return
+            except (json.JSONDecodeError, KeyError) as e:
+                await update.message.reply_text(f"⚠️ Ошибка при обработке прихода: {e}")
+                return
+
         if '"action": "invoice"' in clean_reply:
             try:
                 data = json.loads(clean_reply)
                 client_name = data["client"]
                 items = data["items"]
                 prev_debt = float(data.get("debt", 0) or 0)
+                payment = float(data.get("payment", 0) or 0)
 
-                invoice_text = format_invoice(client_name, items, prev_debt)
+                if payment > 0:
+                    invoice_text = format_invoice_with_payment(client_name, items, prev_debt, payment)
+                else:
+                    invoice_text = format_invoice(client_name, items, prev_debt)
                 await update.message.reply_text(invoice_text, parse_mode="Markdown")
                 return
             except (json.JSONDecodeError, KeyError) as e:
