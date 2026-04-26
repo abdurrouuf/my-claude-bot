@@ -232,19 +232,25 @@ def format_payment(client_name: str, debt: float, payment: float) -> str:
 
 def generate_pdf(text: str) -> io.BytesIO:
     """Генерирует PDF из текста накладной с поддержкой кириллицы."""
-    # Ищем шрифт DejaVu в системе (есть на большинстве Linux серверов)
-    font_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans.ttf",
-    ]
-    bold_paths = [
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/dejavu/DejaVuSans-Bold.ttf",
-        "/usr/share/fonts/TTF/DejaVuSans-Bold.ttf",
-    ]
-    font_path = next((p for p in font_paths if os.path.exists(p)), None)
-    font_bold_path = next((p for p in bold_paths if os.path.exists(p)), None)
+    # Ищем шрифт DejaVu (система или pip пакет)
+    import glob
+    search_paths = glob.glob("/usr/share/fonts/**/DejaVuSans.ttf", recursive=True) +                    glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans.ttf", recursive=True) +                    glob.glob("/app/fonts/DejaVuSans.ttf") +                    glob.glob("/tmp/DejaVuSans.ttf")
+    bold_search = glob.glob("/usr/share/fonts/**/DejaVuSans-Bold.ttf", recursive=True) +                   glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans-Bold.ttf", recursive=True) +                   glob.glob("/app/fonts/DejaVuSans-Bold.ttf") +                   glob.glob("/tmp/DejaVuSans-Bold.ttf")
+
+    # Если не нашли — скачиваем через pip dejavu-fonts-ttf
+    font_path = search_paths[0] if search_paths else None
+    font_bold_path = bold_search[0] if bold_search else None
+
+    if not font_path:
+        try:
+            import subprocess, site
+            subprocess.run(["pip", "install", "dejavu-fonts-ttf", "-q", "--break-system-packages"], capture_output=True)
+            search_paths = glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans.ttf", recursive=True)
+            bold_search = glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans-Bold.ttf", recursive=True)
+            font_path = search_paths[0] if search_paths else None
+            font_bold_path = bold_search[0] if bold_search else None
+        except:
+            pass
 
     if font_path and font_bold_path:
         pdfmetrics.registerFont(TTFont("DejaVu", font_path))
