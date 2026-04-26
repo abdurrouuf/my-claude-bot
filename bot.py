@@ -1,7 +1,16 @@
 import os
 import json
+import io
 import anthropic
 from datetime import datetime
+from reportlab.lib.pagesizes import A5
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, HRFlowable
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.units import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from telegram import InputFile
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, CommandHandler, filters, ContextTypes
 
@@ -220,6 +229,69 @@ def format_payment(client_name: str, debt: float, payment: float) -> str:
     lines.append("☎️ +996 700 99 88 11 | +996 555 62 78 32")
     return "\n".join(lines)
 
+
+def generate_pdf(text: str) -> io.BytesIO:
+    """Генерирует PDF из текста накладной."""
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(
+        buffer,
+        pagesize=A5,
+        rightMargin=10*mm,
+        leftMargin=10*mm,
+        topMargin=10*mm,
+        bottomMargin=10*mm
+    )
+
+    styles = getSampleStyleSheet()
+    normal = ParagraphStyle(
+        'normal',
+        fontName='Helvetica',
+        fontSize=9,
+        leading=14,
+        spaceAfter=2,
+    )
+    bold = ParagraphStyle(
+        'bold',
+        fontName='Helvetica-Bold',
+        fontSize=10,
+        leading=14,
+        spaceAfter=2,
+    )
+    title_style = ParagraphStyle(
+        'title',
+        fontName='Helvetica-Bold',
+        fontSize=12,
+        leading=16,
+        alignment=1,
+        spaceAfter=4,
+    )
+
+    story = []
+    # Clean markdown and build PDF content
+    lines = text.split("\n")
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith("━"):
+            if line.startswith("━"):
+                story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
+                story.append(Spacer(1, 2*mm))
+            continue
+        # Remove markdown bold markers
+        clean = line.replace("*", "").replace("_", "")
+        if any(x in line for x in ["НАКЛАДНАЯ", "ПРИХОД"]):
+            story.append(Paragraph(clean, title_style))
+        elif line.startswith("📋") or line.startswith("💵"):
+            story.append(Paragraph(clean, title_style))
+        elif "**" in line or line.startswith("1.") or line.startswith("2.") or line.startswith("3."):
+            story.append(Paragraph(clean, bold))
+        else:
+            story.append(Paragraph(clean, normal))
+        story.append(Spacer(1, 1*mm))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
 SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП" — оптового поставщика ветеринарных препаратов.
 
 У тебя два режима:
@@ -235,6 +307,7 @@ SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП"
   "client": "Имя контрагента",
   "debt": старый_долг_или_0,
   "payment": приход_или_0,
+  "pdf": true_или_false,
   "items": [
     {{"name": "точное название из прайса", "volume": "фасовка", "qty": количество_в_штуках, "box_qty": количество_коробок_или_null, "price": цена_из_прайса}}
   ]
@@ -261,6 +334,10 @@ SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП"
 === ДОЛГ ===
 Если сотрудник упоминает долг контрагента (например "долг 10670" или "остаток 5000"), 
 занеси его в поле "debt". Если долг не указан — debt: 0.
+
+=== PDF ===
+Если сотрудник пишет "pdf" в конце сообщения — добавь в JSON поле "pdf": true.
+Иначе "pdf": false.
 
 === ДРУГИЕ ПРАВИЛА ===
 - Цены бери СТРОГО из прайса
@@ -428,7 +505,21 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     invoice_text = format_invoice_with_payment(client_name, items, prev_debt, payment)
                 else:
                     invoice_text = format_invoice(client_name, items, prev_debt)
+
                 await update.message.reply_text(invoice_text, parse_mode="Markdown")
+
+                # Если запросили PDF
+                if data.get("pdf"):
+                    try:
+                        pdf_buffer = generate_pdf(invoice_text)
+                        date_str = datetime.now().strftime("%d%m%Y")
+                        filename = f"nakладная_{client_name}_{date_str}.pdf"
+                        await update.message.reply_document(
+                            document=InputFile(pdf_buffer, filename=filename),
+                            caption=f"📄 Накладная для {client_name}"
+                        )
+                    except Exception as pdf_err:
+                        await update.message.reply_text(f"⚠️ Не удалось создать PDF: {pdf_err}")
                 return
             except (json.JSONDecodeError, KeyError) as e:
                 await update.message.reply_text(f"⚠️ Ошибка при создании накладной: {e}")
