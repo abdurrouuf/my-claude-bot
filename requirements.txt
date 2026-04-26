@@ -1,5 +1,3 @@
 python-telegram-bot==20.3
 anthropic==0.40.0
-httpx==0.24.1
 reportlab==4.1.0
-dejavu-fonts-ttf
