@@ -232,44 +232,34 @@ def format_payment(client_name: str, debt: float, payment: float) -> str:
 
 def generate_pdf(text: str) -> io.BytesIO:
     """Генерирует PDF из текста накладной с поддержкой кириллицы."""
-    # Шрифт с поддержкой кириллицы
-    import glob, urllib.request
-    font_path = "/tmp/DejaVuSans.ttf"
-    font_bold_path = "/tmp/DejaVuSans-Bold.ttf"
+    # Ищем шрифты во всех возможных местах
+    possible = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans.ttf"),
+        "/app/DejaVuSans.ttf",
+        "/app/fonts/DejaVuSans.ttf",
+    ]
+    possible_bold = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans-Bold.ttf"),
+        "/app/DejaVuSans-Bold.ttf",
+        "/app/fonts/DejaVuSans-Bold.ttf",
+    ]
+    font_path = next((p for p in possible if os.path.exists(p)), None)
+    font_bold_path = next((p for p in possible_bold if os.path.exists(p)), None)
 
-    # Ищем в системе
-    sys_normal = glob.glob("/usr/share/fonts/**/DejaVuSans.ttf", recursive=True)
-    sys_bold = glob.glob("/usr/share/fonts/**/DejaVuSans-Bold.ttf", recursive=True)
-    if sys_normal:
-        font_path = sys_normal[0]
-    if sys_bold:
-        font_bold_path = sys_bold[0]
+    # Логируем что нашли
+    import logging
+    logging.info(f"Font path: {font_path}")
+    logging.info(f"Font bold path: {font_bold_path}")
+    logging.info(f"Files in /app: {os.listdir('/app') if os.path.exists('/app') else 'no /app'}")
 
-    # Если нет — скачиваем в /tmp
-    if not os.path.exists(font_path):
-        try:
-            urllib.request.urlretrieve(
-                "https://cdn.jsdelivr.net/npm/@fontsource/dejavu-sans@4.5.0/files/dejavu-sans-latin-400-normal.woff2",
-                font_path
-            )
-        except:
-            font_path = None
-    if not os.path.exists(font_bold_path):
-        try:
-            urllib.request.urlretrieve(
-                "https://cdn.jsdelivr.net/npm/@fontsource/dejavu-sans@4.5.0/files/dejavu-sans-latin-700-normal.woff2",
-                font_bold_path
-            )
-        except:
-            font_bold_path = None
-
-    if font_path and font_bold_path and os.path.exists(font_path) and os.path.exists(font_bold_path):
+    if font_path and font_bold_path:
         try:
             pdfmetrics.registerFont(TTFont("DejaVu", font_path))
             pdfmetrics.registerFont(TTFont("DejaVu-Bold", font_bold_path))
             font_name = "DejaVu"
             font_bold_name = "DejaVu-Bold"
-        except:
+        except Exception as e:
+            logging.error(f"Font load error: {e}")
             font_name = "Helvetica"
             font_bold_name = "Helvetica-Bold"
     else:
