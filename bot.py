@@ -232,31 +232,46 @@ def format_payment(client_name: str, debt: float, payment: float) -> str:
 
 def generate_pdf(text: str) -> io.BytesIO:
     """Генерирует PDF из текста накладной с поддержкой кириллицы."""
-    # Ищем шрифт DejaVu (система или pip пакет)
-    import glob
-    search_paths = glob.glob("/usr/share/fonts/**/DejaVuSans.ttf", recursive=True) +                    glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans.ttf", recursive=True) +                    glob.glob("/app/fonts/DejaVuSans.ttf") +                    glob.glob("/tmp/DejaVuSans.ttf")
-    bold_search = glob.glob("/usr/share/fonts/**/DejaVuSans-Bold.ttf", recursive=True) +                   glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans-Bold.ttf", recursive=True) +                   glob.glob("/app/fonts/DejaVuSans-Bold.ttf") +                   glob.glob("/tmp/DejaVuSans-Bold.ttf")
+    # Шрифт с поддержкой кириллицы
+    import glob, urllib.request
+    font_path = "/tmp/DejaVuSans.ttf"
+    font_bold_path = "/tmp/DejaVuSans-Bold.ttf"
 
-    # Если не нашли — скачиваем через pip dejavu-fonts-ttf
-    font_path = search_paths[0] if search_paths else None
-    font_bold_path = bold_search[0] if bold_search else None
+    # Ищем в системе
+    sys_normal = glob.glob("/usr/share/fonts/**/DejaVuSans.ttf", recursive=True)
+    sys_bold = glob.glob("/usr/share/fonts/**/DejaVuSans-Bold.ttf", recursive=True)
+    if sys_normal:
+        font_path = sys_normal[0]
+    if sys_bold:
+        font_bold_path = sys_bold[0]
 
-    if not font_path:
+    # Если нет — скачиваем в /tmp
+    if not os.path.exists(font_path):
         try:
-            import subprocess, site
-            subprocess.run(["pip", "install", "dejavu-fonts-ttf", "-q", "--break-system-packages"], capture_output=True)
-            search_paths = glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans.ttf", recursive=True)
-            bold_search = glob.glob("/usr/local/lib/**/dejavu*/DejaVuSans-Bold.ttf", recursive=True)
-            font_path = search_paths[0] if search_paths else None
-            font_bold_path = bold_search[0] if bold_search else None
+            urllib.request.urlretrieve(
+                "https://cdn.jsdelivr.net/npm/@fontsource/dejavu-sans@4.5.0/files/dejavu-sans-latin-400-normal.woff2",
+                font_path
+            )
         except:
-            pass
+            font_path = None
+    if not os.path.exists(font_bold_path):
+        try:
+            urllib.request.urlretrieve(
+                "https://cdn.jsdelivr.net/npm/@fontsource/dejavu-sans@4.5.0/files/dejavu-sans-latin-700-normal.woff2",
+                font_bold_path
+            )
+        except:
+            font_bold_path = None
 
-    if font_path and font_bold_path:
-        pdfmetrics.registerFont(TTFont("DejaVu", font_path))
-        pdfmetrics.registerFont(TTFont("DejaVu-Bold", font_bold_path))
-        font_name = "DejaVu"
-        font_bold_name = "DejaVu-Bold"
+    if font_path and font_bold_path and os.path.exists(font_path) and os.path.exists(font_bold_path):
+        try:
+            pdfmetrics.registerFont(TTFont("DejaVu", font_path))
+            pdfmetrics.registerFont(TTFont("DejaVu-Bold", font_bold_path))
+            font_name = "DejaVu"
+            font_bold_name = "DejaVu-Bold"
+        except:
+            font_name = "Helvetica"
+            font_bold_name = "Helvetica-Bold"
     else:
         font_name = "Helvetica"
         font_bold_name = "Helvetica-Bold"
