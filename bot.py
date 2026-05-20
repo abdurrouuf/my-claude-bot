@@ -326,7 +326,6 @@ SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП"
   "client": "Имя контрагента",
   "debt": старый_долг_или_0,
   "payment": приход_или_0,
-  "pdf": true_или_false,
   "items": [
     {{"name": "точное название из прайса", "volume": "фасовка", "qty": количество_в_штуках, "box_qty": количество_коробок_или_null, "price": цена_из_прайса}}
   ]
@@ -354,9 +353,7 @@ SYSTEM_PROMPT = f"""Ты помощник компании ОсОО "ВЕТОП"
 Если сотрудник упоминает долг контрагента (например "долг 10670" или "остаток 5000"), 
 занеси его в поле "debt". Если долг не указан — debt: 0.
 
-=== PDF ===
-Если сотрудник пишет "pdf" в конце сообщения — добавь в JSON поле "pdf": true.
-Иначе "pdf": false.
+
 
 === ДРУГИЕ ПРАВИЛА ===
 - Цены бери СТРОГО из прайса
@@ -525,20 +522,17 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     invoice_text = format_invoice(client_name, items, prev_debt)
 
-                await update.message.reply_text(invoice_text, parse_mode="Markdown")
-
-                # Если запросили PDF
-                if data.get("pdf"):
-                    try:
-                        pdf_buffer = generate_pdf(invoice_text)
-                        date_str = datetime.now().strftime("%d%m%Y")
-                        filename = f"nakладная_{client_name}_{date_str}.pdf"
-                        await update.message.reply_document(
-                            document=InputFile(pdf_buffer, filename=filename),
-                            caption=f"📄 Накладная для {client_name}"
-                        )
-                    except Exception as pdf_err:
-                        await update.message.reply_text(f"⚠️ Не удалось создать PDF: {pdf_err}")
+                # Только PDF, без текстового сообщения
+                try:
+                    pdf_buffer = generate_pdf(invoice_text)
+                    date_str = datetime.now().strftime("%d%m%Y")
+                    filename = f"nakладная_{client_name}_{date_str}.pdf"
+                    await update.message.reply_document(
+                        document=InputFile(pdf_buffer, filename=filename),
+                        caption=f"📄 Накладная для {client_name}"
+                    )
+                except Exception as pdf_err:
+                    await update.message.reply_text(f"⚠️ Не удалось создать PDF: {pdf_err}")
                 return
             except (json.JSONDecodeError, KeyError) as e:
                 await update.message.reply_text(f"⚠️ Ошибка при создании накладной: {e}")
