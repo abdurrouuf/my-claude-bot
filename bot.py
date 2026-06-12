@@ -258,82 +258,179 @@ def format_payment(client_name: str, debt: float, payment: float) -> str:
     return "\n".join(lines)
 
 
-def generate_pdf(text: str) -> io.BytesIO:
-    """Генерирует PDF из текста накладной с поддержкой кириллицы."""
-    # Ищем шрифты во всех возможных местах
-    possible = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans.ttf"),
+def fmt_num(n) -> str:
+    """Форматирует число с апострофом: 7800 -> 7'800"""
+    try:
+        n = int(round(float(n)))
+    except (ValueError, TypeError):
+        return str(n)
+    return f"{n:,}".replace(",", "'")
+
+
+def _register_fonts():
+    """Находит и регистрирует шрифты DejaVu."""
+    import logging
+    base = os.path.dirname(os.path.abspath(__file__))
+    normal_candidates = [
+        os.path.join(base, "DejaVuSans.ttf"),
         "/app/DejaVuSans.ttf",
         "/app/fonts/DejaVuSans.ttf",
     ]
-    possible_bold = [
-        os.path.join(os.path.dirname(os.path.abspath(__file__)), "DejaVuSans-Bold.ttf"),
+    bold_candidates = [
+        os.path.join(base, "DejaVuSans-Bold.ttf"),
         "/app/DejaVuSans-Bold.ttf",
         "/app/fonts/DejaVuSans-Bold.ttf",
     ]
-    font_path = next((p for p in possible if os.path.exists(p)), None)
-    font_bold_path = next((p for p in possible_bold if os.path.exists(p)), None)
-
-    # Логируем что нашли
-    import logging
-    logging.info(f"Font path: {font_path}")
-    logging.info(f"Font bold path: {font_bold_path}")
-    logging.info(f"Files in /app: {os.listdir('/app') if os.path.exists('/app') else 'no /app'}")
-
+    font_path = next((p for p in normal_candidates if os.path.exists(p)), None)
+    font_bold_path = next((p for p in bold_candidates if os.path.exists(p)), None)
     if font_path and font_bold_path:
         try:
             pdfmetrics.registerFont(TTFont("DejaVu", font_path))
             pdfmetrics.registerFont(TTFont("DejaVu-Bold", font_bold_path))
-            font_name = "DejaVu"
-            font_bold_name = "DejaVu-Bold"
+            return "DejaVu", "DejaVu-Bold"
         except Exception as e:
             logging.error(f"Font load error: {e}")
-            font_name = "Helvetica"
-            font_bold_name = "Helvetica-Bold"
-    else:
-        font_name = "Helvetica"
-        font_bold_name = "Helvetica-Bold"
+    return "Helvetica", "Helvetica-Bold"
+
+
+def _find_logo():
+    """Находит файл логотипа в репозитории."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base, "IMG_3248.jpeg"),
+        os.path.join(base, "logo.jpg"),
+        os.path.join(base, "logo.jpeg"),
+        os.path.join(base, "logo.png"),
+        "/app/IMG_3248.jpeg",
+        "/app/logo.jpg",
+        "/app/logo.png",
+    ]
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
+def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
+                         payment=0, is_payment=False) -> io.BytesIO:
+    """Красивый PDF: логотип, таблица товаров, итоги."""
+    from reportlab.platypus import Table, TableStyle, Image
+    from reportlab.lib.enums import TA_CENTER, TA_LEFT
+
+    font_name, font_bold_name = _register_fonts()
 
     buffer = io.BytesIO()
     doc = SimpleDocTemplate(
-        buffer,
-        pagesize=A5,
-        rightMargin=10*mm,
-        leftMargin=10*mm,
-        topMargin=10*mm,
-        bottomMargin=10*mm
+        buffer, pagesize=A5,
+        rightMargin=8*mm, leftMargin=8*mm,
+        topMargin=8*mm, bottomMargin=8*mm
     )
 
-    normal = ParagraphStyle('normal', fontName=font_name, fontSize=9, leading=14, spaceAfter=2)
-    bold = ParagraphStyle('bold', fontName=font_bold_name, fontSize=10, leading=14, spaceAfter=2)
-    title_style = ParagraphStyle('title', fontName=font_bold_name, fontSize=12, leading=16, alignment=1, spaceAfter=4)
+    HEADER_GREEN = colors.HexColor("#1b5e20")
+    LIGHT_ROW = colors.HexColor("#f1f8e9")
 
-    # Убираем эмодзи (они не поддерживаются в шрифте)
-    import re
-    def remove_emoji(s):
-        return re.sub(r'[^-Ѐ-ӿ -⁯\s0-9.,:()*%+=/%-]', '', s)
+    title_style = ParagraphStyle('title', fontName=font_bold_name, fontSize=14,
+                                 leading=18, alignment=TA_CENTER, spaceAfter=2)
+    sub_style = ParagraphStyle('sub', fontName=font_name, fontSize=9,
+                               leading=13, alignment=TA_LEFT)
+    cell_style = ParagraphStyle('cell', fontName=font_name, fontSize=8, leading=10)
+    cell_bold = ParagraphStyle('cellb', fontName=font_bold_name, fontSize=8,
+                               leading=10, textColor=colors.white, alignment=TA_CENTER)
+    total_style = ParagraphStyle('total', fontName=font_bold_name, fontSize=10,
+                                 leading=14, alignment=TA_LEFT)
+    slogan_style = ParagraphStyle('slogan', fontName=font_name, fontSize=9,
+                                  leading=12, alignment=TA_CENTER,
+                                  textColor=HEADER_GREEN, spaceAfter=3)
 
     story = []
-    lines = text.split("\n")
-    for line in lines:
-        line = line.strip()
-        if not line:
-            story.append(Spacer(1, 2*mm))
-            continue
-        if line.startswith("━"):
-            story.append(HRFlowable(width="100%", thickness=0.5, color=colors.grey))
-            story.append(Spacer(1, 2*mm))
-            continue
-        clean = remove_emoji(line).replace("*", "").replace("_", "").strip()
-        if not clean:
-            continue
-        if any(x in line for x in ["НАКЛАДНАЯ", "ПРИХОД", "ВЕТОП"]):
-            story.append(Paragraph(clean, title_style))
-        elif line.startswith("*") and line.endswith("*"):
-            story.append(Paragraph(clean, bold))
+
+    # Слоган над логотипом
+    story.append(Paragraph("Здоровье ваших животных — наш приоритет", slogan_style))
+    story.append(Spacer(1, 2*mm))
+
+    logo = _find_logo()
+    if logo:
+        try:
+            img = Image(logo)
+            iw, ih = img.imageWidth, img.imageHeight
+            target_w = 45*mm
+            img.drawWidth = target_w
+            img.drawHeight = target_w * ih / iw
+            img.hAlign = "CENTER"
+            story.append(img)
+            story.append(Spacer(1, 3*mm))
+        except Exception:
+            pass
+
+    story.append(Paragraph("НАКЛАДНАЯ — ВЕТОП", title_style))
+    story.append(Paragraph(datetime.now().strftime("%d.%m.%Y"), sub_style))
+    story.append(Paragraph(f"Контрагент: <b>{client_name}</b>", sub_style))
+    story.append(Spacer(1, 3*mm))
+
+    header = [
+        Paragraph("№", cell_bold),
+        Paragraph("Название", cell_bold),
+        Paragraph("Фасовка", cell_bold),
+        Paragraph("Кол-во", cell_bold),
+        Paragraph("Цена", cell_bold),
+        Paragraph("Сумма", cell_bold),
+    ]
+    table_data = [header]
+    for i, it in enumerate(items, 1):
+        subtotal = it["qty"] * it["price"]
+        box_qty = it.get("box_qty")
+        qty_text = f"{it['qty']} шт"
+        if box_qty:
+            qty_text = f"{box_qty} кор<br/>({it['qty']} шт)"
+        table_data.append([
+            Paragraph(str(i), cell_style),
+            Paragraph(it["name"], cell_style),
+            Paragraph(it["volume"], cell_style),
+            Paragraph(qty_text, cell_style),
+            Paragraph(fmt_num(it["price"]), cell_style),
+            Paragraph(fmt_num(subtotal), cell_style),
+        ])
+
+    col_widths = [8*mm, 48*mm, 18*mm, 18*mm, 16*mm, 18*mm]
+    table = Table(table_data, colWidths=col_widths, repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), HEADER_GREEN),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 1), (0, -1), "CENTER"),
+        ("ALIGN", (3, 1), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+    for r in range(1, len(table_data)):
+        if r % 2 == 0:
+            style.append(("BACKGROUND", (0, r), (-1, r), LIGHT_ROW))
+    table.setStyle(TableStyle(style))
+    story.append(table)
+    story.append(Spacer(1, 4*mm))
+
+    story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(f"Сумма накладной: <b>{fmt_num(invoice_total)} сом</b>", total_style))
+
+    if is_payment:
+        total_debt = invoice_total + prev_debt
+        remainder = total_debt - payment
+        if prev_debt > 0:
+            story.append(Paragraph(f"Старый долг: <b>{fmt_num(prev_debt)} сом</b>", total_style))
+        story.append(Paragraph(f"Итого долг: <b>{fmt_num(total_debt)} сом</b>", total_style))
+        story.append(Paragraph(f"Приход: <b>{fmt_num(payment)} сом</b>", total_style))
+        if remainder <= 0:
+            story.append(Paragraph("Долг полностью погашен!", total_style))
         else:
-            story.append(Paragraph(clean, normal))
-        story.append(Spacer(1, 1*mm))
+            story.append(Paragraph(f"Остаток долга: <b>{fmt_num(remainder)} сом</b>", total_style))
+    elif prev_debt > 0:
+        grand_total = invoice_total + prev_debt
+        story.append(Paragraph(f"Остаток долга: <b>{fmt_num(prev_debt)} сом</b>", total_style))
+        story.append(Paragraph(f"Общий итоговый долг: <b>{fmt_num(grand_total)} сом</b>", total_style))
+
+    story.append(Spacer(1, 2*mm))
+    story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666", sub_style))
+    story.append(Paragraph("Instagram: @vetop.kg", sub_style))
 
     doc.build(story)
     buffer.seek(0)
@@ -544,15 +641,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 items = data["items"]
                 prev_debt = float(data.get("debt", 0) or 0)
                 payment = float(data.get("payment", 0) or 0)
-
-                if payment > 0:
-                    invoice_text = format_invoice_with_payment(client_name, items, prev_debt, payment)
-                else:
-                    invoice_text = format_invoice(client_name, items, prev_debt)
+                invoice_total = sum(it["qty"] * it["price"] for it in items)
 
                 # Только PDF, без текстового сообщения
                 try:
-                    pdf_buffer = generate_pdf(invoice_text)
+                    pdf_buffer = generate_pdf_invoice(
+                        client_name, items, invoice_total,
+                        prev_debt=prev_debt, payment=payment,
+                        is_payment=(payment > 0)
+                    )
                     date_str = datetime.now().strftime("%d%m%Y")
                     filename = f"nakладная_{client_name}_{date_str}.pdf"
                     await update.message.reply_document(
