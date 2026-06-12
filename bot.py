@@ -26,7 +26,31 @@ debts = {}
 
 # Доступ
 ADMIN_ID = 632294583
-allowed_users = set([ADMIN_ID])
+USERS_FILE = "/tmp/allowed_users.json"
+
+def load_users() -> set:
+    """Загружаем список пользователей из файла."""
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, "r") as f:
+                return set(json.load(f))
+        except:
+            pass
+    return set([ADMIN_ID])
+
+def save_users(users: set):
+    """Сохраняем список пользователей в файл."""
+    try:
+        with open(USERS_FILE, "w") as f:
+            json.dump(list(users), f)
+    except:
+        pass
+
+allowed_users = load_users()
+# Постоянные сотрудники — всегда имеют доступ
+PERMANENT_USERS = {632294583, 607647629, 6525019701, 5808155644, 1616348285}
+allowed_users.update(PERMANENT_USERS)
+save_users(allowed_users)
 
 def is_allowed(user_id: int) -> bool:
     return user_id in allowed_users
@@ -138,6 +162,10 @@ PRICE_LIST_DATA = [
     {"id": 98, "name": "ЦЕФНОМ 25 (цефкинома 2.5%)",                            "volume": "50 мл",         "box": 150, "price": 530},
     {"id": 99, "name": "ЦЕФНОМ LC (шприц / 75 мг цефкинома)",                   "volume": "8 г",           "box": 24,  "price": 135},
     {"id": 100,"name": "ЦЕФТИ DC (шприц / 500 мг гидрохлорид цефтиофура)",      "volume": "10 мл",         "box": 24,  "price": 165},
+    {"id": 101,"name": "ГАБИВИТ",                                               "volume": "100 мл",        "box": 50,  "price": 780},
+    {"id": 102,"name": "КАЛЬФОТОН",                                             "volume": "100 мл",        "box": 50,  "price": 980},
+    {"id": 103,"name": "СУРФАГОН УЛЬТРА 10 мкг",                                "volume": "50 мл",         "box": 50,  "price": 480},
+    {"id": 104,"name": "СУРФАГОН УЛЬТРА 50 мкг",                                "volume": "20 мл",         "box": 162, "price": 580},
 ]
 
 PRICE_LIST_TEXT = "\n".join(
@@ -283,7 +311,7 @@ def generate_pdf(text: str) -> io.BytesIO:
     # Убираем эмодзи (они не поддерживаются в шрифте)
     import re
     def remove_emoji(s):
-        return re.sub(r'[^-Ѐ-ӿ -⁯\s0-9.,:()*%+=/%-]', '', s)
+        return re.sub(r'[^-Ѐ-ӿ -⁯\s0-9.,:()*%+=/%-]', '', s)
 
     story = []
     lines = text.split("\n")
@@ -554,6 +582,7 @@ async def add_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         uid = int(context.args[0])
         allowed_users.add(uid)
+        save_users(allowed_users)
         await update.message.reply_text(f"✅ Пользователь `{uid}` добавлен.", parse_mode="Markdown")
     except ValueError:
         await update.message.reply_text("❌ Неверный ID. Пример: `/add 123456789`", parse_mode="Markdown")
@@ -571,6 +600,7 @@ async def remove_user(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("❌ Нельзя удалить администратора.")
             return
         allowed_users.discard(uid)
+        save_users(allowed_users)
         await update.message.reply_text(f"✅ Пользователь `{uid}` удалён.", parse_mode="Markdown")
     except ValueError:
         await update.message.reply_text("❌ Неверный ID.", parse_mode="Markdown")
