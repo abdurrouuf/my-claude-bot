@@ -450,7 +450,7 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
             qr_img.drawWidth = qr_size
             qr_img.drawHeight = qr_size
             contact_table = Table(
-                [[Paragraph("+996 700 99 88 11<br/>+996 700 887 666<br/>Instagram: @vetop.kg", contact_style), qr_img]],
+                [[Paragraph("+996 700 99 88 11<br/>+996 700 887 666<br/>Эл. почта: vettop@inbox.ru", contact_style), qr_img]],
                 colWidths=[None, 22*mm]
             )
             contact_table.setStyle(TableStyle([
@@ -460,10 +460,10 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
             story.append(contact_table)
         except Exception:
             story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666", sub_style))
-            story.append(Paragraph("Instagram: @vetop.kg", sub_style))
+            story.append(Paragraph("Эл. почта: vettop@inbox.ru", sub_style))
     else:
         story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666", sub_style))
-        story.append(Paragraph("Instagram: @vetop.kg", sub_style))
+        story.append(Paragraph("Эл. почта: vettop@inbox.ru", sub_style))
 
     doc.build(story)
     buffer.seek(0)
