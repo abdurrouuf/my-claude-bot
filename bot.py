@@ -308,6 +308,18 @@ def _find_logo():
     return next((p for p in candidates if os.path.exists(p)), None)
 
 
+def _find_qr():
+    """Находит QR-код Instagram."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(base, "qr_instagram.jpeg"),
+        os.path.join(base, "qr_instagram.png"),
+        "/app/qr_instagram.jpeg",
+        "/app/qr_instagram.png",
+    ]
+    return next((p for p in candidates if os.path.exists(p)), None)
+
+
 def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                          payment=0, is_payment=False) -> io.BytesIO:
     """Красивый PDF: логотип, таблица товаров, итоги."""
@@ -427,8 +439,31 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
     story.append(Spacer(1, 2*mm))
     story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))
     story.append(Spacer(1, 2*mm))
-    story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666", sub_style))
-    story.append(Paragraph("Instagram: @vetop.kg", sub_style))
+
+    qr_path = _find_qr()
+    if qr_path:
+        try:
+            contact_style = ParagraphStyle('contact', fontName=font_name, fontSize=9,
+                                           leading=13, alignment=TA_LEFT)
+            qr_img = Image(qr_path)
+            qr_size = 20*mm
+            qr_img.drawWidth = qr_size
+            qr_img.drawHeight = qr_size
+            contact_table = Table(
+                [[Paragraph("+996 700 99 88 11<br/>+996 700 887 666<br/>Instagram: @vetop.kg", contact_style), qr_img]],
+                colWidths=[None, 22*mm]
+            )
+            contact_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+            ]))
+            story.append(contact_table)
+        except Exception:
+            story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666", sub_style))
+            story.append(Paragraph("Instagram: @vetop.kg", sub_style))
+    else:
+        story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666", sub_style))
+        story.append(Paragraph("Instagram: @vetop.kg", sub_style))
 
     doc.build(story)
     buffer.seek(0)
