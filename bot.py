@@ -343,7 +343,6 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
 
     # Слоган над логотипом
     story.append(Paragraph("Здоровье ваших животных — наш приоритет", slogan_style))
-    story.append(Spacer(1, 2*mm))
 
     logo = _find_logo()
     if logo:
@@ -355,11 +354,10 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
             img.drawHeight = target_w * ih / iw
             img.hAlign = "CENTER"
             story.append(img)
-            story.append(Spacer(1, 3*mm))
         except Exception:
             pass
 
-    story.append(Paragraph("НАКЛАДНАЯ — ВЕТОП", title_style))
+    story.append(Paragraph("НАКЛАДНАЯ", title_style))
     story.append(Paragraph(datetime.now().strftime("%d.%m.%Y"), sub_style))
     story.append(Paragraph(f"Контрагент: <b>{client_name}</b>", sub_style))
     story.append(Spacer(1, 3*mm))
