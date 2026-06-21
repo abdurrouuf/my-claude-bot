@@ -49,7 +49,9 @@ def save_users(users: set):
 allowed_users = load_users()
 # Постоянные сотрудники — всегда имеют доступ
 PERMANENT_USERS = {632294583, 607647629, 6525019701, 5808155644}
+REMOVED_USERS = {1616348285}
 allowed_users.update(PERMANENT_USERS)
+allowed_users -= REMOVED_USERS
 save_users(allowed_users)
 
 def is_allowed(user_id: int) -> bool:
