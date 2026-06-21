@@ -48,7 +48,7 @@ def save_users(users: set):
 
 allowed_users = load_users()
 # Постоянные сотрудники — всегда имеют доступ
-PERMANENT_USERS = {632294583, 607647629, 6525019701, 5808155644, 1616348285}
+PERMANENT_USERS = {632294583, 607647629, 6525019701, 5808155644}
 allowed_users.update(PERMANENT_USERS)
 save_users(allowed_users)
 
