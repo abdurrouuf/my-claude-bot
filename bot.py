@@ -25,7 +25,7 @@ chat_histories = {}
 debts = {}
 
 # Доступ
-ADMIN_ID = 632294583
+ADMIN_ID = 632294583  # Абдурроууф
 USERS_FILE = "/tmp/allowed_users.json"
 
 def load_users() -> set:
@@ -48,7 +48,13 @@ def save_users(users: set):
 
 allowed_users = load_users()
 # Постоянные сотрудники — всегда имеют доступ
-PERMANENT_USERS = {632294583, 607647629, 6525019701, 5808155644, 8889218606}
+PERMANENT_USERS = {
+    632294583,   # Абдурроууф (админ)
+    607647629,   # Жуми
+    6525019701,  # Аза
+    5808155644,  # Бека
+    8889218606,  # Данияр
+}
 REMOVED_USERS = {1616348285}
 allowed_users.update(PERMANENT_USERS)
 allowed_users -= REMOVED_USERS
