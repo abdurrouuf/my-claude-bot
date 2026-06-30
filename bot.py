@@ -53,9 +53,9 @@ PERMANENT_USERS = {
     607647629,   # Жуми
     6525019701,  # Аза
     5808155644,  # Бека
-    8889218606,  # Данияр
+    1616348285,  # Данияр
 }
-REMOVED_USERS = {1616348285}
+REMOVED_USERS = {8889218606}
 allowed_users.update(PERMANENT_USERS)
 allowed_users -= REMOVED_USERS
 save_users(allowed_users)
