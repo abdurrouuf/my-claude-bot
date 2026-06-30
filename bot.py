@@ -55,9 +55,7 @@ PERMANENT_USERS = {
     5808155644,  # Бека
     1616348285,  # Данияр
 }
-REMOVED_USERS = {8889218606}
 allowed_users.update(PERMANENT_USERS)
-allowed_users -= REMOVED_USERS
 save_users(allowed_users)
 
 def is_allowed(user_id: int) -> bool:
