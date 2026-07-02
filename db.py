@@ -43,15 +43,17 @@ def connect() -> sqlite3.Connection:
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS users(
-    id      INTEGER PRIMARY KEY,
-    name    TEXT NOT NULL,
-    role    TEXT NOT NULL DEFAULT 'employee',  -- admin | senior | employee
-    active  INTEGER NOT NULL DEFAULT 1
+    id         INTEGER PRIMARY KEY,
+    name       TEXT NOT NULL,
+    role       TEXT NOT NULL DEFAULT 'employee',  -- admin | senior | employee
+    active     INTEGER NOT NULL DEFAULT 1,
+    default_wh INTEGER
 );
 CREATE TABLE IF NOT EXISTS warehouses(
-    id       INTEGER PRIMARY KEY AUTOINCREMENT,
-    name     TEXT NOT NULL COLLATE NOCASEU UNIQUE,
-    owner_id INTEGER NOT NULL UNIQUE REFERENCES users(id)
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    name            TEXT NOT NULL COLLATE NOCASEU UNIQUE,
+    feed_chat_id    INTEGER,
+    feed_chat_title TEXT
 );
 CREATE TABLE IF NOT EXISTS access(
     user_id      INTEGER NOT NULL,
@@ -85,34 +87,87 @@ CREATE TABLE IF NOT EXISTS operations(
 """
 
 
-def init(admin_id: int, permanent_users: dict):
-    """Создаёт схему и заводит постоянных сотрудников со складами."""
+def _columns(conn, table: str):
+    return [r["name"] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+
+
+def _migrate_owner_warehouses(conn):
+    """Старая схема: склад на сотрудника (owner_id). Новая: склады отдельно,
+    у сотрудника default_wh. Если данных ещё нет — старые склады выбрасываем."""
+    if "owner_id" not in _columns(conn, "warehouses"):
+        return
+    has_data = conn.execute(
+        "SELECT (SELECT COUNT(*) FROM stock) + (SELECT COUNT(*) FROM clients) "
+        "+ (SELECT COUNT(*) FROM operations)"
+    ).fetchone()[0]
+    if has_data:
+        conn.execute(
+            "CREATE TABLE warehouses_new("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "name TEXT NOT NULL COLLATE NOCASEU UNIQUE, "
+            "feed_chat_id INTEGER, feed_chat_title TEXT)")
+        for w in conn.execute("SELECT * FROM warehouses").fetchall():
+            conn.execute("INSERT INTO warehouses_new(id, name) VALUES(?,?)",
+                         (w["id"], w["name"]))
+            conn.execute("UPDATE users SET default_wh=? WHERE id=? AND default_wh IS NULL",
+                         (w["id"], w["owner_id"]))
+        conn.execute("DROP TABLE warehouses")
+        conn.execute("ALTER TABLE warehouses_new RENAME TO warehouses")
+        log.info("Миграция складов: owner-модель -> default_wh (данные сохранены)")
+    else:
+        conn.execute("DROP TABLE warehouses")
+        conn.execute("DELETE FROM access")
+        conn.execute("UPDATE users SET default_wh=NULL")
+        conn.execute(
+            "CREATE TABLE warehouses("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, "
+            "name TEXT NOT NULL COLLATE NOCASEU UNIQUE, "
+            "feed_chat_id INTEGER, feed_chat_title TEXT)")
+        log.info("Миграция складов: пустая база, склады пересозданы")
+
+
+def init(admin_id: int, warehouse_names: list, staff: dict):
+    """Создаёт схему, склады и постоянных сотрудников.
+
+    staff: {telegram_id: {"name": str, "role": опц., "warehouse": имя склада,
+                          "access": [имена складов]}}
+    """
     conn = connect()
     with _lock, conn:
         conn.executescript(SCHEMA)
-        for uid, name in permanent_users.items():
+        if "default_wh" not in _columns(conn, "users"):
+            conn.execute("ALTER TABLE users ADD COLUMN default_wh INTEGER")
+        if "feed_chat_id" not in _columns(conn, "warehouses") and \
+           "owner_id" not in _columns(conn, "warehouses"):
+            conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_id INTEGER")
+            conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_title TEXT")
+        _migrate_owner_warehouses(conn)
+
+        for wname in warehouse_names:
+            if conn.execute("SELECT 1 FROM warehouses WHERE name=?", (wname,)).fetchone() is None:
+                conn.execute("INSERT INTO warehouses(name) VALUES(?)", (wname,))
+
+        for uid, cfg in staff.items():
+            name = cfg["name"]
+            role = "admin" if uid == admin_id else cfg.get("role", "employee")
             row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
             if row is None:
-                role = "admin" if uid == admin_id else "employee"
-                conn.execute(
-                    "INSERT INTO users(id, name, role, active) VALUES(?,?,?,1)",
-                    (uid, name, role),
-                )
+                conn.execute("INSERT INTO users(id, name, role, active) VALUES(?,?,?,1)",
+                             (uid, name, role))
             else:
-                conn.execute("UPDATE users SET active=1 WHERE id=?", (uid,))
+                conn.execute("UPDATE users SET active=1, name=? WHERE id=?", (name, uid))
             if uid == admin_id:
                 conn.execute("UPDATE users SET role='admin' WHERE id=?", (uid,))
-            _ensure_warehouse(conn, uid, name)
-
-
-def _ensure_warehouse(conn, owner_id: int, base_name: str):
-    row = conn.execute("SELECT * FROM warehouses WHERE owner_id=?", (owner_id,)).fetchone()
-    if row:
-        return
-    name = base_name
-    if conn.execute("SELECT 1 FROM warehouses WHERE name=?", (name,)).fetchone():
-        name = f"{base_name}-{owner_id}"
-    conn.execute("INSERT INTO warehouses(name, owner_id) VALUES(?,?)", (name, owner_id))
+            wh = conn.execute("SELECT id FROM warehouses WHERE name=?",
+                              (cfg.get("warehouse", ""),)).fetchone()
+            if wh:
+                conn.execute("UPDATE users SET default_wh=? WHERE id=? AND default_wh IS NULL",
+                             (wh["id"], uid))
+            for aname in cfg.get("access", []):
+                aw = conn.execute("SELECT id FROM warehouses WHERE name=?", (aname,)).fetchone()
+                if aw:
+                    conn.execute("INSERT OR IGNORE INTO access(user_id, warehouse_id) VALUES(?,?)",
+                                 (uid, aw["id"]))
 
 
 # ---------- Пользователи ----------
@@ -139,10 +194,10 @@ def add_user(uid: int, name: str):
     with _lock, conn:
         row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
         if row is None:
-            conn.execute("INSERT INTO users(id, name, role, active) VALUES(?,?, 'employee', 1)", (uid, name))
+            conn.execute("INSERT INTO users(id, name, role, active) VALUES(?,?, 'employee', 1)",
+                         (uid, name))
         else:
             conn.execute("UPDATE users SET active=1, name=? WHERE id=?", (name, uid))
-        _ensure_warehouse(conn, uid, name)
 
 
 def deactivate_user(uid: int):
@@ -164,10 +219,20 @@ def set_role(uid: int, role: str):
         conn.execute("UPDATE users SET role=? WHERE id=?", (role, uid))
 
 
+def set_default_warehouse(uid: int, wh_id: int):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("UPDATE users SET default_wh=? WHERE id=?", (wh_id, uid))
+
+
 # ---------- Склады и доступ ----------
 
 def warehouse_of(uid: int):
-    return connect().execute("SELECT * FROM warehouses WHERE owner_id=?", (uid,)).fetchone()
+    """Склад по умолчанию сотрудника."""
+    return connect().execute(
+        "SELECT w.* FROM users u JOIN warehouses w ON w.id=u.default_wh WHERE u.id=?",
+        (uid,),
+    ).fetchone()
 
 
 def warehouse_by_id(wh_id: int):
@@ -184,6 +249,16 @@ def all_warehouses():
     return connect().execute("SELECT * FROM warehouses ORDER BY name").fetchall()
 
 
+def create_warehouse(name: str):
+    conn = connect()
+    with _lock, conn:
+        try:
+            cur = conn.execute("INSERT INTO warehouses(name) VALUES(?)", (name.strip(),))
+            return cur.lastrowid
+        except sqlite3.IntegrityError:
+            return None
+
+
 def rename_warehouse(wh_id: int, new_name: str) -> bool:
     conn = connect()
     with _lock, conn:
@@ -194,10 +269,35 @@ def rename_warehouse(wh_id: int, new_name: str) -> bool:
             return False
 
 
+def set_feed_chat(wh_id: int, chat_id, chat_title=None):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("UPDATE warehouses SET feed_chat_id=?, feed_chat_title=? WHERE id=?",
+                     (chat_id, chat_title, wh_id))
+
+
+def unlink_feed_chat(chat_id: int):
+    """Отвязывает все склады от данного чата. Возвращает имена отвязанных."""
+    conn = connect()
+    with _lock, conn:
+        rows = conn.execute("SELECT name FROM warehouses WHERE feed_chat_id=?",
+                            (chat_id,)).fetchall()
+        conn.execute("UPDATE warehouses SET feed_chat_id=NULL, feed_chat_title=NULL "
+                     "WHERE feed_chat_id=?", (chat_id,))
+        return [r["name"] for r in rows]
+
+
+def warehouses_of_feed(chat_id: int):
+    return connect().execute(
+        "SELECT * FROM warehouses WHERE feed_chat_id=? ORDER BY name", (chat_id,)
+    ).fetchall()
+
+
 def grant_access(uid: int, wh_id: int):
     conn = connect()
     with _lock, conn:
-        conn.execute("INSERT OR IGNORE INTO access(user_id, warehouse_id) VALUES(?,?)", (uid, wh_id))
+        conn.execute("INSERT OR IGNORE INTO access(user_id, warehouse_id) VALUES(?,?)",
+                     (uid, wh_id))
 
 
 def revoke_access(uid: int, wh_id: int):
@@ -244,7 +344,8 @@ def stock_qty(wh_id: int, product_id: int) -> int:
 
 
 def stock_map(wh_id: int) -> dict:
-    rows = connect().execute("SELECT product_id, qty FROM stock WHERE warehouse_id=?", (wh_id,)).fetchall()
+    rows = connect().execute("SELECT product_id, qty FROM stock WHERE warehouse_id=?",
+                             (wh_id,)).fetchall()
     return {r["product_id"]: r["qty"] for r in rows}
 
 
@@ -348,6 +449,20 @@ def recent_operations(limit: int = 10, user_id=None):
         "SELECT * FROM operations WHERE user_id=? ORDER BY id DESC LIMIT ?",
         (user_id, limit),
     ).fetchall()
+
+
+def operation_warehouses(op_row) -> list:
+    """Все склады, которых коснулась операция (для ленты)."""
+    ids = set()
+    if op_row["warehouse_id"]:
+        ids.add(op_row["warehouse_id"])
+    try:
+        data = json.loads(op_row["data"])
+        for wh, _pid, _d in data.get("stock_deltas", []):
+            ids.add(wh)
+    except (ValueError, TypeError):
+        pass
+    return sorted(ids)
 
 
 def cancel_operation(op_id: int):

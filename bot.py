@@ -28,12 +28,18 @@ ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-5")
 
 ADMIN_ID = 632294583  # Абдурроууф
-PERMANENT_USERS = {
-    632294583:  "Абдурроууф",
-    607647629:  "Жуми",
-    6525019701: "Аза",
-    5808155644: "Бека",
-    1616348285: "Данияр",
+
+# Рабочие склады компании
+WAREHOUSE_NAMES = ["Бишкек", "Кара-Балта", "Каракол", "Манас"]
+
+# Постоянные сотрудники: склад по умолчанию + доступ к другим складам.
+# Применяется только при первом создании записи — дальше рулят команды админа.
+STAFF = {
+    632294583:  {"name": "Абдурроууф", "warehouse": "Бишкек",  "access": []},
+    607647629:  {"name": "Жуми",       "warehouse": "Бишкек",  "access": ["Кара-Балта"]},
+    5808155644: {"name": "Бека",       "warehouse": "Бишкек",  "access": ["Кара-Балта"]},
+    1616348285: {"name": "Данияр",     "warehouse": "Каракол", "access": []},
+    6525019701: {"name": "Азамат",     "warehouse": "Манас",   "access": []},
 }
 
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
@@ -43,8 +49,9 @@ HISTORY_LIMIT = 20
 
 # Неподтверждённые заявки (накладные/приходы/перемещения) до нажатия кнопки.
 PENDING = {}
-PENDING_TTL = 15 * 60   # заявка живёт 15 минут
-UNDO_WINDOW = 15 * 60   # сотрудник может отменить свою операцию 15 минут
+PENDING_TTL = 15 * 60        # обычная заявка живёт 15 минут
+APPROVAL_TTL = 24 * 60 * 60  # заявка на перемещение ждёт админа сутки
+UNDO_WINDOW = 15 * 60        # сотрудник может отменить свою операцию 15 минут
 
 
 def esc(s) -> str:
@@ -90,12 +97,13 @@ async def send_long(message, text: str):
         await message.reply_text(chunk, parse_mode="HTML")
 
 
-def new_pending(payload: dict) -> str:
+def new_pending(payload: dict, ttl: int = PENDING_TTL) -> str:
     now = time.monotonic()
-    for k in [k for k, v in PENDING.items() if now - v["created"] > PENDING_TTL]:
+    for k in [k for k, v in PENDING.items() if now - v["created"] > v.get("ttl", PENDING_TTL)]:
         PENDING.pop(k, None)
     token = secrets.token_hex(6)
     payload["created"] = now
+    payload["ttl"] = ttl
     PENDING[token] = payload
     return token
 
@@ -104,7 +112,7 @@ def get_pending(token: str):
     p = PENDING.get(token)
     if p is None:
         return None
-    if time.monotonic() - p["created"] > PENDING_TTL:
+    if time.monotonic() - p["created"] > p.get("ttl", PENDING_TTL):
         PENDING.pop(token, None)
         return None
     return p
@@ -127,6 +135,30 @@ async def notify_admin(context, actor_row, text: str):
         )
     except Exception as e:
         log.warning("Не удалось уведомить админа: %s", e)
+
+
+async def post_feed(context, wh_ids, text: str):
+    """Постит сводку операции в чаты-ленты складов, которых она коснулась."""
+    chats = set()
+    for wh_id in wh_ids:
+        wh = db.warehouse_by_id(wh_id)
+        if wh and wh["feed_chat_id"]:
+            chats.add(wh["feed_chat_id"])
+    for chat_id in chats:
+        try:
+            await context.bot.send_message(chat_id, text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("Не удалось отправить в ленту %s: %s", chat_id, e)
+
+
+async def feed_operation(context, op_id: int, actor_name: str, prefix: str, note: str = ""):
+    op = db.get_operation(op_id)
+    if op is None:
+        return
+    text = f"{prefix} <b>{esc(actor_name)}</b> — {esc(op['summary'])}"
+    if note:
+        text += f"\n{esc(note)}"
+    await post_feed(context, db.operation_warehouses(op), text)
 
 
 # ---------- Системный промпт ----------
@@ -162,25 +194,29 @@ def build_system_prompt(actor) -> str:
     parts.append('Если сообщение — только оплата без товаров («Асан приход 5000», «Асан оплатил 3000»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "payment", "client": "Имя контрагента", "amount": сумма, "warehouse": null}')
     parts.append('- "warehouse": имя склада, если явно указан («со склада Ош»), иначе null.')
-    if transfer_allowed:
-        all_whs = db.all_warehouses()
-        emp_lines = []
-        for u in db.list_users():
-            w = db.warehouse_of(u["id"])
-            if w:
-                emp_lines.append(f"- {u['name']} → склад «{w['name']}»")
-        parts.append("")
-        parts.append("=== РЕЖИМ 4: ПРИХОД / ПЕРЕМЕЩЕНИЕ ТОВАРА (только для админа и старших) ===")
-        parts.append('Если сообщение — пополнение склада товаром или перемещение между складами '
-                     '(например «Беке: Альтопен 100мл 2к», «на склад Ош: ...», «с Ош на Каракол: ...»), верни ТОЛЬКО JSON:')
-        parts.append('{"action": "transfer", "from_warehouse": null_или_имя_склада, "to_warehouse": "имя склада", '
-                     '"items": [{"name": "...", "volume": "...", "qty": штук, "box_qty": коробок_или_null, "price": цена}]}')
-        parts.append('- Если назван сотрудник — подставь имя ЕГО склада в to_warehouse.')
-        parts.append('- "from_warehouse" заполняй только при явном перемещении «с X на Y»; обычный приход товара — null.')
-        parts.append("Сотрудники и их склады:")
-        parts.extend(emp_lines)
-        parts.append("Все склады: " + ", ".join(f"«{w['name']}»" for w in all_whs))
-        parts.append("ВАЖНО: если первое слово — имя сотрудника из списка выше, это перемещение (transfer), а не накладная.")
+    all_whs = db.all_warehouses()
+    emp_lines = []
+    for u in db.list_users():
+        w = db.warehouse_of(u["id"])
+        if w:
+            emp_lines.append(f"- {u['name']} → склад «{w['name']}»")
+    parts.append("")
+    parts.append("=== РЕЖИМ 4: ПРИХОД / ПЕРЕМЕЩЕНИЕ ТОВАРА ===")
+    parts.append('Если сообщение — пополнение склада товаром или перемещение между складами '
+                 '(например «Беке: Альтопен 100мл 2к», «на склад Манас: ...», '
+                 '«с Бишкека на Каракол: ...», «нужно на Каракол: ...»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "transfer", "from_warehouse": null_или_имя_склада, "to_warehouse": "имя склада", '
+                 '"items": [{"name": "...", "volume": "...", "qty": штук, "box_qty": коробок_или_null, "price": цена}]}')
+    parts.append('- Если назван сотрудник — подставь имя склада этого сотрудника в to_warehouse.')
+    parts.append('- "from_warehouse" заполняй только при явном перемещении «с X на Y»; '
+                 'приход товара извне (с завода/базы) — null.')
+    parts.append("Сотрудники и их склады по умолчанию:")
+    parts.extend(emp_lines)
+    parts.append("Все склады: " + ", ".join(f"«{w['name']}»" for w in all_whs))
+    parts.append("ВАЖНО: если первое слово — имя сотрудника из списка выше, это перемещение (transfer), а не накладная.")
+    if not transfer_allowed:
+        parts.append("Примечание: перемещение между складами проводит только админ — "
+                     "заявка сотрудника уйдёт ему на подтверждение, это нормально.")
     parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
@@ -546,6 +582,8 @@ async def start_payment(update, context, actor, data):
 def transfer_summary(p) -> str:
     header = "📦 <b>Приход товара</b>" if not p["from_wh_id"] else "📦 <b>Перемещение товара</b>"
     lines = [header]
+    if p.get("requester_name"):
+        lines.append(f"✍️ Заявка от: <b>{esc(p['requester_name'])}</b>")
     if p["from_wh_id"]:
         lines.append(f"🏬 Со склада: <b>{esc(p['from_wh_name'])}</b>")
     lines.append(f"🏬 На склад: <b>{esc(p['wh_name'])}</b>")
@@ -584,6 +622,8 @@ def commit_transfer(p):
     else:
         summary = f"Приход товара на склад {p['wh_name']} ({n} поз.)"
     extra = {"items": [{k: it[k] for k in ("name", "volume", "qty", "box_qty")} for it in p["items"]]}
+    if p.get("approver_id"):
+        extra["approved_by"] = p["approver_id"]
     op_id, _ = db.commit_operation(
         p["user_id"], "transfer", p["wh_id"], None, summary, stock_deltas, [], extra,
     )
@@ -591,9 +631,6 @@ def commit_transfer(p):
 
 
 async def start_transfer(update, context, actor, data):
-    if not can_transfer(actor):
-        await update.message.reply_text("⛔ Приход и перемещение товара может делать только админ или старший.")
-        return
     to_name = str(data.get("to_warehouse") or "").strip()
     to_wh = db.warehouse_by_name(to_name) if to_name else None
     if to_wh is None:
@@ -612,6 +649,13 @@ async def start_transfer(update, context, actor, data):
         if from_wh["id"] == to_wh["id"]:
             await update.message.reply_text("Склад-источник и склад-получатель совпадают.")
             return
+    # Приход извне (без склада-источника) — только админ или старший.
+    if from_wh is None and not can_transfer(actor):
+        await update.message.reply_text(
+            "⛔ Приход товара извне может внести только админ или старший.\n"
+            "Если вам нужен товар с другого склада — напишите перемещение: "
+            "«с Бишкека на Каракол: ...» — заявка уйдёт админу на подтверждение.")
+        return
     try:
         items, warnings = parse_items(data.get("items") or [])
     except ValueError as e:
@@ -629,6 +673,30 @@ async def start_transfer(update, context, actor, data):
         "from_wh_name": from_wh["name"] if from_wh else None,
         "items": items, "warnings": warnings,
     }
+
+    # Перемещение между складами подтверждает ТОЛЬКО админ.
+    if from_wh is not None and not is_admin(actor):
+        payload["approver_id"] = ADMIN_ID
+        payload["requester_name"] = actor["name"]
+        token = new_pending(payload, ttl=APPROVAL_TTL)
+        try:
+            await context.bot.send_message(
+                ADMIN_ID, transfer_summary(payload), parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+                ]]))
+        except Exception:
+            log.exception("Не удалось отправить заявку админу")
+            PENDING.pop(token, None)
+            await update.message.reply_text("⚠️ Не удалось отправить заявку админу. Попробуйте позже.")
+            return
+        await update.message.reply_text(
+            f"📨 Заявка на перемещение «{esc(payload['from_wh_name'])}» → "
+            f"«{esc(payload['wh_name'])}» отправлена админу на подтверждение.\n"
+            f"Я сообщу вам результат.", parse_mode="HTML")
+        return
+
     token = new_pending(payload)
     await update.message.reply_text(transfer_summary(payload), parse_mode="HTML",
                                     reply_markup=confirm_kb(token))
@@ -657,14 +725,29 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             pass
         return
-    if q.from_user.id != p["user_id"] and not is_admin(actor):
+    if p.get("approver_id"):
+        # Заявка на перемещение: решает только назначенный подтверждающий.
+        if q.from_user.id != p["approver_id"]:
+            await q.answer("Эту заявку подтверждает только админ", show_alert=True)
+            return
+    elif q.from_user.id != p["user_id"] and not is_admin(actor):
         await q.answer("Это не ваша операция", show_alert=True)
         return
 
     if kind == "no":
         PENDING.pop(token, None)
         await q.answer()
-        await q.edit_message_text("❌ Отменено. Ничего не изменено.")
+        if p.get("approver_id"):
+            await q.edit_message_text("❌ Заявка отклонена.")
+            try:
+                await context.bot.send_message(
+                    p["chat_id"],
+                    f"❌ Ваша заявка на перемещение «{esc(p['from_wh_name'])}» → "
+                    f"«{esc(p['wh_name'])}» отклонена админом.", parse_mode="HTML")
+            except Exception:
+                log.warning("Не удалось уведомить заявителя об отклонении")
+        else:
+            await q.edit_message_text("❌ Отменено. Ничего не изменено.")
         return
 
     if kind == "pk":  # выбран существующий клиент
@@ -689,6 +772,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
                 await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
                 await notify_admin(context, actor, summary)
+                await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "🧾")
             elif p["kind"] == "payment":
                 op_id, client_label, old_debt, summary = commit_payment(p)
                 await q.edit_message_text(
@@ -696,11 +780,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     + payment_receipt(client_label, old_debt, p["amount"]),
                     parse_mode="HTML")
                 await notify_admin(context, actor, summary)
+                await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "💵")
             elif p["kind"] == "transfer":
                 op_id, summary = commit_transfer(p)
                 await q.edit_message_text(f"✅ {esc(summary)} — проведено (операция №{op_id}).",
                                           parse_mode="HTML")
-                await notify_admin(context, actor, summary)
+                note = ""
+                if p.get("approver_id"):
+                    note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
+                    try:
+                        await context.bot.send_message(
+                            p["chat_id"],
+                            f"✅ Ваша заявка проведена (операция №{op_id}): {esc(summary)}",
+                            parse_mode="HTML")
+                    except Exception:
+                        log.warning("Не удалось уведомить заявителя")
+                else:
+                    await notify_admin(context, actor, summary)
+                actor_name = db.get_user(p["user_id"])["name"]
+                await feed_operation(context, op_id, actor_name, "📦", note)
         except Exception as e:
             log.exception("Ошибка проведения операции")
             await context.bot.send_message(p["chat_id"], f"⚠️ Ошибка при проведении: {e}")
@@ -752,6 +850,9 @@ DRAFT_RE = re.compile(r"^черновик[:,\s]*", re.IGNORECASE)
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or not update.message.text:
         return
+    # В группах бот только публикует ленту операций — сообщения не обрабатывает.
+    if update.effective_chat.type != "private":
+        return
     actor = await get_actor(update)
     if actor is None:
         return
@@ -795,22 +896,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/undo — отменить свою последнюю операцию (15 минут)",
         "/clear — очистить историю разговора",
     ]
+    lines += [
+        "",
+        "📦 <b>Перемещение товара</b> (заявка, подтверждает админ):",
+        "<i>с Бишкека на Каракол: Альтопен 100мл 2к</i>",
+    ]
     if can_transfer(actor):
         lines += [
-            "",
-            "📦 <b>Приход/перемещение товара</b> — напишите:",
-            "<i>Беке: Альтопен 100мл 2к</i> или <i>с Ош на Каракол: ...</i>",
+            "📦 <b>Приход товара извне</b>: <i>Беке: Альтопен 100мл 2к</i> "
+            "или <i>на склад Манас: ...</i>",
         ]
     if is_admin(actor):
         lines += [
             "",
             "👑 <b>Админ:</b>",
             "/users — сотрудники и склады",
+            "/warehouses — склады, сотрудники, ленты",
             "/add ID Имя — добавить сотрудника",
             "/remove ID — убрать сотрудника",
+            "/setwh Имя Склад — назначить сотруднику склад",
             "/grant Имя | /ungrant Имя — право прихода товара",
             "/access Имя Склад | /noaccess Имя Склад — доступ к складу",
-            "/whname Имя НовоеИмяСклада — переименовать склад",
+            "/whadd Имя | /whname Старое Новое — создать/переименовать склад",
+            "/feed Склад... (в групповом чате) — подключить ленту операций",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -967,6 +1075,14 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if not is_admin(actor):
             try:
+                approved_by = json.loads(op["data"]).get("approved_by")
+            except (ValueError, TypeError):
+                approved_by = None
+            if approved_by:
+                await update.message.reply_text(
+                    "⛔ Это перемещение подтверждал админ — отменить его может только он.")
+                return
+            try:
                 age = (datetime.now(BISHKEK) - datetime.fromisoformat(op["ts"])).total_seconds()
             except ValueError:
                 age = UNDO_WINDOW + 1
@@ -983,6 +1099,11 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"↩️ Операция №{op['id']} отменена: {esc(msg)}\n"
         f"Остатки и долги возвращены как было.", parse_mode="HTML")
     await notify_admin(context, actor, f"отменил операцию №{op['id']}: {msg}")
+    cancelled = db.get_operation(op["id"])
+    if cancelled:
+        await post_feed(context, db.operation_warehouses(cancelled),
+                        f"↩️ <b>{esc(actor['name'])}</b> отменил операцию №{op['id']}: "
+                        f"{esc(msg)}")
 
 
 # ---------- Админ-команды ----------
@@ -1007,10 +1128,9 @@ async def add_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     uid = int(args[0])
     name = " ".join(args[1:])
     db.add_user(uid, name)
-    wh = db.warehouse_of(uid)
     await update.message.reply_text(
         f"✅ Сотрудник <b>{esc(name)}</b> (<code>{uid}</code>) добавлен.\n"
-        f"Его склад: «{esc(wh['name'])}» (переименовать: /whname {esc(name)} НовоеИмя)",
+        f"Теперь назначьте ему склад: /setwh {esc(name)} Бишкек",
         parse_mode="HTML")
 
 
@@ -1038,7 +1158,7 @@ async def list_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         wh = db.warehouse_of(u["id"])
         extra_access = db.access_warehouses(u["id"])
         line = (f"{role_icons.get(u['role'], '👤')} <b>{esc(u['name'])}</b> "
-                f"(<code>{u['id']}</code>) — склад «{esc(wh['name']) if wh else '—'}»")
+                f"(<code>{u['id']}</code>) — склад «{esc(wh['name']) if wh else '⚠️ не назначен'}»")
         if extra_access:
             line += " + доступ: " + ", ".join(f"«{esc(w['name'])}»" for w in extra_access)
         lines.append(line)
@@ -1133,23 +1253,128 @@ async def whname_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     args = context.args
     if len(args) < 2:
         await update.message.reply_text(
-            "Использование: /whname Имя НовоеИмяСклада\nПример: /whname Бека Ош")
+            "Использование: /whname СтароеИмя НовоеИмя\nПример: /whname Манас Сокулук")
+        return
+    wh = db.warehouse_by_name(args[0])
+    if wh is None:
+        await update.message.reply_text(f"Склад «{esc(args[0])}» не найден.", parse_mode="HTML")
+        return
+    new_name = " ".join(args[1:])
+    if db.rename_warehouse(wh["id"], new_name):
+        await update.message.reply_text(f"✅ Склад теперь называется «{esc(new_name)}».",
+                                        parse_mode="HTML")
+    else:
+        await update.message.reply_text("❌ Такое имя склада уже занято.")
+
+
+async def setwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Использование: /setwh Имя Склад\nПример: /setwh Бека Бишкек")
         return
     u = db.user_by_ref(args[0])
     if u is None:
         await update.message.reply_text(f"Сотрудник «{esc(args[0])}» не найден.", parse_mode="HTML")
         return
-    wh = db.warehouse_of(u["id"])
+    wh = db.warehouse_by_name(" ".join(args[1:]))
     if wh is None:
-        await update.message.reply_text("У сотрудника нет склада.")
-        return
-    new_name = " ".join(args[1:])
-    if db.rename_warehouse(wh["id"], new_name):
         await update.message.reply_text(
-            f"✅ Склад сотрудника <b>{esc(u['name'])}</b> теперь называется «{esc(new_name)}».",
+            "Склад не найден. Склады: " + ", ".join(f"«{esc(w['name'])}»" for w in db.all_warehouses()),
+            parse_mode="HTML")
+        return
+    db.set_default_warehouse(u["id"], wh["id"])
+    await update.message.reply_text(
+        f"✅ Склад по умолчанию для <b>{esc(u['name'])}</b> — «{esc(wh['name'])}».",
+        parse_mode="HTML")
+
+
+async def whadd_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    if not context.args:
+        await update.message.reply_text("Использование: /whadd ИмяСклада")
+        return
+    name = " ".join(context.args)
+    if db.create_warehouse(name):
+        await update.message.reply_text(f"✅ Склад «{esc(name)}» создан.", parse_mode="HTML")
+    else:
+        await update.message.reply_text("❌ Склад с таким именем уже есть.")
+
+
+async def warehouses_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    lines = ["🏬 <b>Склады:</b>"]
+    for w in db.all_warehouses():
+        workers = [u["name"] for u in db.list_users()
+                   if (db.warehouse_of(u["id"]) or {"id": None})["id"] == w["id"]]
+        feed = f" · лента: {esc(w['feed_chat_title'])}" if w["feed_chat_id"] else " · лента не подключена"
+        who = (", ".join(esc(n) for n in workers)) if workers else "—"
+        lines.append(f"• <b>{esc(w['name'])}</b> — сотрудники: {who}{feed}")
+    lines.append("")
+    lines.append("Подключить ленту: добавьте бота в чат и напишите там /feed ИмяСклада")
+    await send_long(update.message, "\n".join(lines))
+
+
+async def feed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    chat = update.effective_chat
+    if chat.type == "private":
+        await update.message.reply_text(
+            "Эту команду нужно писать в групповом чате, куда бот будет слать ленту операций.\n"
+            "Добавьте бота в чат и напишите там: /feed Бишкек Кара-Балта")
+        return
+    if not context.args:
+        linked = db.warehouses_of_feed(chat.id)
+        if linked:
+            await update.message.reply_text(
+                "К этому чату привязаны склады: "
+                + ", ".join(f"«{esc(w['name'])}»" for w in linked)
+                + "\nОтвязать: /nofeed", parse_mode="HTML")
+        else:
+            await update.message.reply_text(
+                "Использование: /feed ИмяСклада [ещё склады]\n"
+                "Пример: /feed Бишкек Кара-Балта")
+        return
+    done, missing = [], []
+    for name in context.args:
+        wh = db.warehouse_by_name(name)
+        if wh is None:
+            missing.append(name)
+        else:
+            db.set_feed_chat(wh["id"], chat.id, chat.title or str(chat.id))
+            done.append(wh["name"])
+    text = ""
+    if done:
+        text += ("✅ В этот чат будет приходить лента операций складов: "
+                 + ", ".join(f"«{esc(n)}»" for n in done))
+    if missing:
+        text += "\n⚠️ Не найдены склады: " + ", ".join(esc(n) for n in missing)
+    await update.message.reply_text(text.strip(), parse_mode="HTML")
+
+
+async def nofeed_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Только администратор.")
+        return
+    names = db.unlink_feed_chat(update.effective_chat.id)
+    if names:
+        await update.message.reply_text(
+            "✅ Лента отключена для складов: " + ", ".join(f"«{esc(n)}»" for n in names),
             parse_mode="HTML")
     else:
-        await update.message.reply_text("❌ Такое имя склада уже занято.")
+        await update.message.reply_text("К этому чату склады не привязаны.")
 
 
 async def invoice_hint(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1181,7 +1406,7 @@ async def draft_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 if __name__ == "__main__":
-    db.init(ADMIN_ID, PERMANENT_USERS)
+    db.init(ADMIN_ID, WAREHOUSE_NAMES, STAFF)
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
@@ -1201,6 +1426,11 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("access", access_cmd))
     app.add_handler(CommandHandler("noaccess", noaccess_cmd))
     app.add_handler(CommandHandler("whname", whname_cmd))
+    app.add_handler(CommandHandler("setwh", setwh_cmd))
+    app.add_handler(CommandHandler("whadd", whadd_cmd))
+    app.add_handler(CommandHandler("warehouses", warehouses_cmd))
+    app.add_handler(CommandHandler("feed", feed_cmd))
+    app.add_handler(CommandHandler("nofeed", nofeed_cmd))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, handle_message))
