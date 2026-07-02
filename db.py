@@ -426,6 +426,27 @@ def client_exact(wh_id: int, name: str):
     ).fetchone()
 
 
+def cash_on_hand(user_id: int) -> float:
+    """Наличные у сотрудника: принятые оплаты минус сданная выручка.
+
+    Считается по журналу, поэтому отмена операции автоматически
+    возвращает кассу в правильное состояние.
+    """
+    conn = connect()
+    received = conn.execute(
+        "SELECT COALESCE(SUM(CASE "
+        "  WHEN type='payment' THEN COALESCE(json_extract(data, '$.amount'), 0) "
+        "  WHEN type='invoice' THEN COALESCE(json_extract(data, '$.payment'), 0) "
+        "  ELSE 0 END), 0) "
+        "FROM operations WHERE user_id=? AND status='done' AND type IN ('payment', 'invoice')",
+        (user_id,)).fetchone()[0]
+    handed = conn.execute(
+        "SELECT COALESCE(SUM(COALESCE(json_extract(data, '$.amount'), 0)), 0) "
+        "FROM operations WHERE user_id=? AND status='done' AND type='handover'",
+        (user_id,)).fetchone()[0]
+    return received - handed
+
+
 def client_operations(cid: int):
     """Все проведённые операции клиента по порядку."""
     return connect().execute(
