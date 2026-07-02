@@ -109,6 +109,112 @@ def _watermark(font_bold_name):
     return draw
 
 
+def generate_act_pdf(client_name, warehouse_name, rows, start_debt, end_debt,
+                     period_label) -> io.BytesIO:
+    """Акт сверки: дата, документ, товар (+), оплата (−), долг после."""
+    from reportlab.lib.pagesizes import A4
+
+    font_name, font_bold_name = _register_fonts()
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=15*mm, leftMargin=15*mm,
+                            topMargin=12*mm, bottomMargin=12*mm)
+
+    HEADER_GREEN = colors.HexColor("#1b5e20")
+    LIGHT_ROW = colors.HexColor("#f1f8e9")
+
+    title_style = ParagraphStyle('title', fontName=font_bold_name, fontSize=15,
+                                 leading=20, alignment=TA_CENTER, spaceAfter=2)
+    sub_style = ParagraphStyle('sub', fontName=font_name, fontSize=10,
+                               leading=14, alignment=TA_LEFT)
+    cell_style = ParagraphStyle('cell', fontName=font_name, fontSize=9, leading=12)
+    cell_bold = ParagraphStyle('cellb', fontName=font_bold_name, fontSize=9,
+                               leading=12, textColor=colors.white, alignment=TA_CENTER)
+    total_style = ParagraphStyle('total', fontName=font_bold_name, fontSize=11,
+                                 leading=15, alignment=TA_LEFT)
+
+    story = []
+    logo = _find_logo()
+    if logo:
+        try:
+            img = Image(logo)
+            iw, ih = img.imageWidth, img.imageHeight
+            img.drawWidth = 40*mm
+            img.drawHeight = 40*mm * ih / iw
+            img.hAlign = "CENTER"
+            story.append(img)
+        except Exception:
+            pass
+
+    story.append(Paragraph("АКТ СВЕРКИ ВЗАИМОРАСЧЁТОВ", title_style))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(f"ОсОО «ВЕТОП» — <b>{xml_escape(str(client_name))}</b>", sub_style))
+    story.append(Paragraph(f"Склад: {xml_escape(str(warehouse_name))}", sub_style))
+    story.append(Paragraph(f"Период: {xml_escape(str(period_label))}", sub_style))
+    story.append(Paragraph(
+        f"Составлен: {datetime.now(BISHKEK).strftime('%d.%m.%Y')}", sub_style))
+    story.append(Spacer(1, 3*mm))
+
+    header = [
+        Paragraph("Дата", cell_bold),
+        Paragraph("Документ", cell_bold),
+        Paragraph("Товар (+)", cell_bold),
+        Paragraph("Оплата (−)", cell_bold),
+        Paragraph("Долг", cell_bold),
+    ]
+    table_data = [header]
+    table_data.append([
+        Paragraph("", cell_style),
+        Paragraph("Долг на начало периода", cell_style),
+        Paragraph("", cell_style), Paragraph("", cell_style),
+        Paragraph(fmt_num(start_debt), cell_style),
+    ])
+    for date_str, doc_str, plus, minus, balance in rows:
+        table_data.append([
+            Paragraph(xml_escape(str(date_str)), cell_style),
+            Paragraph(xml_escape(str(doc_str)), cell_style),
+            Paragraph(fmt_num(plus) if plus else "", cell_style),
+            Paragraph(fmt_num(minus) if minus else "", cell_style),
+            Paragraph(fmt_num(balance), cell_style),
+        ])
+
+    table = Table(table_data, colWidths=[25*mm, 75*mm, 27*mm, 27*mm, 26*mm],
+                  repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), HEADER_GREEN),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (2, 1), (-1, -1), "RIGHT"),
+        ("TOPPADDING", (0, 0), (-1, -1), 3),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 3),
+    ]
+    for r in range(1, len(table_data)):
+        if r % 2 == 0:
+            style.append(("BACKGROUND", (0, r), (-1, r), LIGHT_ROW))
+    table.setStyle(TableStyle(style))
+    story.append(table)
+    story.append(Spacer(1, 4*mm))
+
+    story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))
+    story.append(Spacer(1, 2*mm))
+    story.append(Paragraph(
+        f"Итого долг на {datetime.now(BISHKEK).strftime('%d.%m.%Y')}: "
+        f"<b>{fmt_num(end_debt)} сом</b>", total_style))
+    story.append(Spacer(1, 10*mm))
+    sig_style = ParagraphStyle('sig', fontName=font_name, fontSize=10, leading=14)
+    sig = Table([[Paragraph("ОсОО «ВЕТОП»: ________________", sig_style),
+                  Paragraph("Клиент: ________________", sig_style)]],
+                colWidths=[85*mm, 85*mm])
+    story.append(sig)
+    story.append(Spacer(1, 4*mm))
+    story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666  |  vettop@inbox.ru",
+                           sub_style))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
 def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                          payment=0, is_payment=False, warehouse_name=None,
                          draft=False, watermark=True) -> io.BytesIO:

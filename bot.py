@@ -17,7 +17,8 @@ from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, CommandHandl
 import db
 import prices
 from db import BISHKEK
-from invoice_pdf import fmt_num, generate_pdf_invoice, safe_filename
+from invoice_pdf import (fmt_num, generate_act_pdf, generate_pdf_invoice,
+                         safe_filename)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -943,6 +944,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debts — долги клиентов",
         "/report — отчёт (можно: /report неделя, /report Бишкек месяц)",
         "/olddebts — кто давно не платил (можно: /olddebts 45)",
+        "/client Имя — карточка клиента (долг, история)",
+        "/act Имя — акт сверки в PDF",
         "/price — прайс-лист",
         "/log — последние операции",
         "/undo — отменить свою последнюю операцию (15 минут)",
@@ -1196,6 +1199,147 @@ async def evening_summary_loop(app):
             await send_evening_summaries(app.bot)
         except Exception:
             log.exception("Ошибка вечерней сводки")
+
+
+def find_client_visible(actor, name: str):
+    """Ищет клиента по точному имени среди складов, доступных сотруднику."""
+    for wh in db.visible_warehouses(actor):
+        c = db.client_exact(wh["id"], name)
+        if c:
+            return c, wh
+    return None, None
+
+
+def client_statement(cid: int):
+    """История долга клиента: строки акта сверки + начальный долг.
+
+    Возвращает (rows, start_debt): rows = [(дата, документ, товар+, оплата−, долг_после)].
+    """
+    ops = db.client_operations(cid)
+    client = db.client_get(cid)
+    total_delta = 0.0
+    parsed = []
+    for op in ops:
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        delta = sum(d for c_id, d in data.get("debt_deltas", []) if c_id == cid)
+        total_delta += delta
+        parsed.append((op, data, delta))
+    start_debt = client["debt"] - total_delta  # долг, внесённый при создании клиента
+    rows = []
+    balance = start_debt
+    for op, data, delta in parsed:
+        try:
+            date_str = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y")
+        except ValueError:
+            date_str = op["ts"][:10]
+        balance += delta
+        if op["type"] == "invoice":
+            plus = data.get("total", 0)
+            minus = data.get("payment", 0)
+            doc = f"Накладная №{op['id']}"
+        elif op["type"] == "payment":
+            plus = 0
+            minus = data.get("amount", 0)
+            doc = f"Оплата №{op['id']}"
+        else:
+            plus, minus = max(delta, 0), max(-delta, 0)
+            doc = f"Операция №{op['id']}"
+        rows.append((date_str, doc, plus, minus, balance))
+    return rows, start_debt
+
+
+async def resolve_client_arg(update, actor, args, usage: str):
+    """Общий разбор аргумента-имени для /client и /act."""
+    if not args:
+        await update.message.reply_text(usage)
+        return None, None
+    name = " ".join(args)
+    c, wh = find_client_visible(actor, name)
+    if c is None:
+        hints = []
+        for w in db.visible_warehouses(actor):
+            hints += [f"{x['name']} ({w['name']})" for x in db.fuzzy_clients(w["id"], name)]
+        msg = f"❌ Клиент «{esc(name)}» не найден."
+        if hints:
+            msg += "\nВозможно: " + ", ".join(esc(h) for h in hints[:5])
+        await update.message.reply_text(msg, parse_mode="HTML")
+        return None, None
+    return c, wh
+
+
+async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    c, wh = await resolve_client_arg(update, actor, context.args,
+                                     "Использование: /client Имя\nПример: /client Асан")
+    if c is None:
+        return
+    rows, start_debt = client_statement(c["id"])
+    now = datetime.now(BISHKEK)
+    lines = [f"👤 <b>{esc(c['name'])}</b> · склад «{esc(wh['name'])}»"]
+    if c["debt"] > 0:
+        lines.append(f"⚠️ Текущий долг: <b>{money(c['debt'])}</b>")
+    elif c["debt"] < 0:
+        lines.append(f"💚 Переплата: <b>{money(-c['debt'])}</b>")
+    else:
+        lines.append("✅ Долга нет")
+    last_pay = None
+    for op in reversed(db.client_operations(c["id"])):
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        if op["type"] == "payment" or (op["type"] == "invoice" and data.get("payment", 0) > 0):
+            last_pay = op["ts"]
+            break
+    if last_pay:
+        try:
+            days = (now - datetime.fromisoformat(last_pay)).days
+            lines.append(f"💵 Последняя оплата: {days} дн. назад")
+        except ValueError:
+            pass
+    elif c["debt"] > 0:
+        lines.append("💵 Оплат ещё не было")
+    if start_debt:
+        lines.append(f"📌 Начальный долг (до бота): {money(start_debt)}")
+    if rows:
+        lines.append("")
+        lines.append(f"🗒 <b>Последние операции ({min(len(rows), 15)} из {len(rows)}):</b>")
+        for date_str, doc, plus, minus, balance in rows[-15:]:
+            parts = [f"{date_str} {doc}:"]
+            if plus:
+                parts.append(f"+{fmt_num(plus)}")
+            if minus:
+                parts.append(f"−{fmt_num(minus)}")
+            parts.append(f"→ долг {fmt_num(balance)}")
+            lines.append(esc(" ".join(parts)))
+    lines.append("")
+    lines.append(f"📄 Акт сверки в PDF: /act {esc(c['name'])}")
+    await send_long(update.message, "\n".join(lines))
+
+
+async def act_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    c, wh = await resolve_client_arg(update, actor, context.args,
+                                     "Использование: /act Имя\nПример: /act Асан")
+    if c is None:
+        return
+    rows, start_debt = client_statement(c["id"])
+    if rows:
+        period = f"{rows[0][0]} — {datetime.now(BISHKEK).strftime('%d.%m.%Y')}"
+    else:
+        period = "операций не было"
+    pdf = generate_act_pdf(c["name"], wh["name"], rows, start_debt, c["debt"], period)
+    filename = f"акт_сверки_{safe_filename(c['name'])}_{datetime.now(BISHKEK).strftime('%d%m%Y')}.pdf"
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=filename),
+        caption=f"📄 Акт сверки: {c['name']} — долг {fmt_num(c['debt'])} сом")
 
 
 def build_overdue(warehouses, min_days: int) -> str:
@@ -1684,6 +1828,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("draft", draft_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
+    app.add_handler(CommandHandler("client", client_cmd))
+    app.add_handler(CommandHandler("act", act_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))

@@ -375,6 +375,14 @@ def client_exact(wh_id: int, name: str):
     ).fetchone()
 
 
+def client_operations(cid: int):
+    """Все проведённые операции клиента по порядку."""
+    return connect().execute(
+        "SELECT * FROM operations WHERE client_id=? AND status='done' ORDER BY id",
+        (cid,),
+    ).fetchall()
+
+
 def debtors_with_age(wh_id: int):
     """Клиенты склада с долгом > 0 и датой последней оплаты.
 
