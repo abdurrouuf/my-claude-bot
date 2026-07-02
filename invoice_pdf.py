@@ -109,6 +109,116 @@ def _watermark(font_bold_name):
     return draw
 
 
+def generate_price_pdf(price_data) -> io.BytesIO:
+    """Фирменный прайс-лист для рассылки клиентам."""
+    from reportlab.lib.pagesizes import A4
+
+    font_name, font_bold_name = _register_fonts()
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=14*mm, leftMargin=14*mm,
+                            topMargin=10*mm, bottomMargin=12*mm)
+
+    HEADER_GREEN = colors.HexColor("#1b5e20")
+    LIGHT_ROW = colors.HexColor("#f1f8e9")
+
+    title_style = ParagraphStyle('title', fontName=font_bold_name, fontSize=16,
+                                 leading=20, alignment=TA_CENTER, spaceAfter=2)
+    slogan_style = ParagraphStyle('slogan', fontName=font_name, fontSize=9,
+                                  leading=12, alignment=TA_CENTER,
+                                  textColor=HEADER_GREEN, spaceAfter=2)
+    sub_style = ParagraphStyle('sub', fontName=font_name, fontSize=10,
+                               leading=14, alignment=TA_CENTER, spaceAfter=4)
+    cell_style = ParagraphStyle('cell', fontName=font_name, fontSize=8.5, leading=11)
+    cell_right = ParagraphStyle('cellr', fontName=font_bold_name, fontSize=8.5, leading=11)
+    cell_bold = ParagraphStyle('cellb', fontName=font_bold_name, fontSize=9,
+                               leading=12, textColor=colors.white, alignment=TA_CENTER)
+
+    story = []
+    story.append(Paragraph("Здоровье ваших животных — наш приоритет", slogan_style))
+    logo = _find_logo()
+    if logo:
+        try:
+            img = Image(logo)
+            iw, ih = img.imageWidth, img.imageHeight
+            img.drawWidth = 45*mm
+            img.drawHeight = 45*mm * ih / iw
+            img.hAlign = "CENTER"
+            story.append(img)
+        except Exception:
+            pass
+    story.append(Paragraph("ПРАЙС-ЛИСТ", title_style))
+    story.append(Paragraph(
+        f"ОсОО «ВЕТОП» · оптовые цены · от {datetime.now(BISHKEK).strftime('%d.%m.%Y')}",
+        sub_style))
+    story.append(Spacer(1, 2*mm))
+
+    header = [
+        Paragraph("№", cell_bold),
+        Paragraph("Название", cell_bold),
+        Paragraph("Фасовка", cell_bold),
+        Paragraph("шт/кор", cell_bold),
+        Paragraph("Цена, сом", cell_bold),
+    ]
+    table_data = [header]
+    for p in price_data:
+        table_data.append([
+            Paragraph(str(p["id"]), cell_style),
+            Paragraph(xml_escape(p["name"]), cell_style),
+            Paragraph(xml_escape(p["volume"]), cell_style),
+            Paragraph(str(p["box"]), cell_style),
+            Paragraph(fmt_num(p["price"]), cell_right),
+        ])
+
+    table = Table(table_data, colWidths=[10*mm, 92*mm, 26*mm, 18*mm, 22*mm],
+                  repeatRows=1)
+    style = [
+        ("BACKGROUND", (0, 0), (-1, 0), HEADER_GREEN),
+        ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("ALIGN", (0, 1), (0, -1), "CENTER"),
+        ("ALIGN", (3, 1), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 2),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+    ]
+    for r in range(1, len(table_data)):
+        if r % 2 == 0:
+            style.append(("BACKGROUND", (0, r), (-1, r), LIGHT_ROW))
+    table.setStyle(TableStyle(style))
+    story.append(table)
+    story.append(Spacer(1, 4*mm))
+
+    story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))
+    story.append(Spacer(1, 2*mm))
+    contact_style = ParagraphStyle('contact', fontName=font_name, fontSize=9,
+                                   leading=13, alignment=TA_LEFT)
+    qr_path = _find_qr()
+    if qr_path:
+        try:
+            qr_img = Image(qr_path)
+            qr_img.drawWidth = 20*mm
+            qr_img.drawHeight = 20*mm
+            contact_table = Table(
+                [[Paragraph("Заказы: +996 700 99 88 11, +996 700 887 666<br/>"
+                            "Эл. почта: vettop@inbox.ru", contact_style), qr_img]],
+                colWidths=[None, 22*mm])
+            contact_table.setStyle(TableStyle([
+                ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+                ("ALIGN", (1, 0), (1, 0), "RIGHT"),
+            ]))
+            story.append(contact_table)
+        except Exception:
+            story.append(Paragraph("Заказы: +996 700 99 88 11 | +996 700 887 666 | vettop@inbox.ru",
+                                   contact_style))
+    else:
+        story.append(Paragraph("Заказы: +996 700 99 88 11 | +996 700 887 666 | vettop@inbox.ru",
+                               contact_style))
+
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
 def generate_act_pdf(client_name, warehouse_name, rows, start_debt, end_debt,
                      period_label) -> io.BytesIO:
     """Акт сверки: дата, документ, товар (+), оплата (−), долг после."""

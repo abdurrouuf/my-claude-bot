@@ -18,7 +18,7 @@ import db
 import prices
 from db import BISHKEK
 from invoice_pdf import (fmt_num, generate_act_pdf, generate_pdf_invoice,
-                         safe_filename)
+                         generate_price_pdf, safe_filename)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -1455,6 +1455,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/client Имя — карточка клиента (долг, история)",
         "/act Имя — акт сверки в PDF",
         "/price — прайс-лист",
+        "/pricepdf — красивый PDF-прайс для отправки клиентам",
         "/log — последние операции",
         "/undo — отменить свою последнюю операцию (15 минут)",
         "/clear — очистить историю разговора",
@@ -1510,6 +1511,19 @@ async def show_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append(f"{p['id']}. {esc(p['name'])} | {esc(p['volume'])} | "
                      f"{p['box']} шт/кор | <b>{p['price']} сом</b>")
     await send_long(update.message, "\n".join(lines))
+
+
+async def pricepdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id,
+                                       action="upload_document")
+    pdf = generate_price_pdf(prices.PRICE_LIST_DATA)
+    filename = f"прайс_ВЕТОП_{datetime.now(BISHKEK).strftime('%d%m%Y')}.pdf"
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=filename),
+        caption="📋 Прайс-лист ВЕТОП — можно переслать клиенту")
 
 
 async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2386,6 +2400,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("price", show_price))
+    app.add_handler(CommandHandler("pricepdf", pricepdf_cmd))
     app.add_handler(CommandHandler("stock", show_stock))
     app.add_handler(CommandHandler("debts", show_debts))
     app.add_handler(CommandHandler("payment", payment_cmd))
