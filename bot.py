@@ -259,6 +259,15 @@ def build_system_prompt(actor) -> str:
                      '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": число}]}')
         parts.append('- qty: 0 означает убрать порог для товара.')
     parts.append("")
+    parts.append("=== РЕЖИМ 6: ИНВЕНТАРИЗАЦИЯ ===")
+    parts.append('Если сообщение — пересчёт фактических остатков («инвентаризация: '
+                 'Альтопен 100мл 18, Дексатоп 50мл 9», «инвентаризация Каракол: ...», '
+                 '«фактический остаток: ...»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "inventory", "warehouse": null_или_имя_склада, '
+                 '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": фактическое_количество}]}')
+    parts.append('- qty — сколько товара РЕАЛЬНО насчитали на складе (может быть 0).')
+    parts.append('- Здесь коробки тоже переводи в штуки по прайсу.')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -753,6 +762,125 @@ async def start_transfer(update, context, actor, data):
                                     reply_markup=confirm_kb(token))
 
 
+# ---------- Инвентаризация ----------
+
+def inventory_summary(p) -> str:
+    """Расхождения считаются по текущей базе — на момент показа/подтверждения."""
+    lines = [f"📋 <b>Инвентаризация — склад «{esc(p['wh_name'])}»</b>"]
+    if p.get("requester_name"):
+        lines.append(f"✍️ Провёл: <b>{esc(p['requester_name'])}</b>")
+    lines.append("")
+    diffs = 0
+    for it in p["items"]:
+        base = db.stock_qty(p["wh_id"], it["product_id"])
+        delta = it["fact"] - base
+        if delta == 0:
+            continue
+        sign = f"+{delta}" if delta > 0 else str(delta)
+        lines.append(f"• {esc(it['name'])} {esc(it['volume'])}: по базе <b>{base}</b>, "
+                     f"по факту <b>{it['fact']}</b> ({sign})")
+        diffs += 1
+    matched = len(p["items"]) - diffs
+    if matched:
+        lines.append(f"✅ Без расхождений: {matched} поз.")
+    for w in p.get("warnings", []):
+        lines.append(f"⚠️ {esc(w)}")
+    lines.append("")
+    if diffs:
+        lines.append("Провести корректировку остатков?")
+    else:
+        lines.append("Всё сходится — корректировка не нужна.")
+    return "\n".join(lines)
+
+
+def commit_inventory(p):
+    """Ставит остатки в фактические значения (дельты считаются на момент проведения)."""
+    stock_deltas = []
+    detail = []
+    for it in p["items"]:
+        base = db.stock_qty(p["wh_id"], it["product_id"])
+        delta = it["fact"] - base
+        if delta:
+            stock_deltas.append((p["wh_id"], it["product_id"], delta))
+            detail.append({"name": it["name"], "volume": it["volume"],
+                           "base": base, "fact": it["fact"]})
+    if not stock_deltas:
+        return None, "расхождений уже нет"
+    summary = f"Инвентаризация: склад {p['wh_name']} ({len(stock_deltas)} корректир.)"
+    extra = {"items": detail}
+    if p.get("approver_id"):
+        extra["approved_by"] = p["approver_id"]
+    op_id, _ = db.commit_operation(
+        p["user_id"], "inventory", p["wh_id"], None, summary, stock_deltas, [], extra)
+    return op_id, summary
+
+
+async def start_inventory(update, context, actor, data):
+    if transition_blocked(actor):
+        await update.message.reply_text(TRANSITION_HINT)
+        return
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    items, warnings = [], []
+    for it in (data.get("items") or []):
+        name = str(it.get("name") or "").strip()
+        volume = str(it.get("volume") or "").strip()
+        try:
+            fact = int(float(it.get("qty")))
+        except (TypeError, ValueError):
+            fact = -1
+        product = prices.match_product(name, volume)
+        if product is None or fact < 0:
+            warnings.append(f"«{name} {volume}» не распознан — пропущен")
+            continue
+        items.append({"product_id": product["id"], "name": product["name"],
+                      "volume": product["volume"], "fact": fact})
+    if not items:
+        await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу.")
+        return
+
+    payload = {
+        "kind": "inventory", "user_id": actor["id"], "chat_id": update.effective_chat.id,
+        "wh_id": wh["id"], "wh_name": wh["name"], "items": items, "warnings": warnings,
+    }
+    has_diffs = any(db.stock_qty(wh["id"], it["product_id"]) != it["fact"] for it in items)
+    if not has_diffs:
+        await update.message.reply_text(
+            f"✅ Инвентаризация склада «{esc(wh['name'])}»: всё сходится "
+            f"({len(items)} поз.), корректировка не нужна.", parse_mode="HTML")
+        await notify_admin(context, actor,
+                           f"инвентаризация склада {wh['name']}: всё сходится ({len(items)} поз.)")
+        return
+
+    # Корректировку остатков подтверждает только админ.
+    if not is_admin(actor):
+        payload["approver_id"] = ADMIN_ID
+        payload["requester_name"] = actor["name"]
+        token = new_pending(payload, ttl=APPROVAL_TTL)
+        try:
+            await context.bot.send_message(
+                ADMIN_ID, inventory_summary(payload), parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+                ]]))
+        except Exception:
+            log.exception("Не удалось отправить инвентаризацию админу")
+            PENDING.pop(token, None)
+            await update.message.reply_text("⚠️ Не удалось отправить админу. Попробуйте позже.")
+            return
+        await update.message.reply_text(
+            f"📨 Результаты инвентаризации склада «{esc(wh['name'])}» отправлены админу "
+            f"на подтверждение. Я сообщу результат.", parse_mode="HTML")
+        return
+
+    token = new_pending(payload)
+    await update.message.reply_text(inventory_summary(payload), parse_mode="HTML",
+                                    reply_markup=confirm_kb(token))
+
+
 # ---------- Минимальные остатки ----------
 
 def low_stock_hits(stock_deltas):
@@ -912,11 +1040,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         if p.get("approver_id"):
             await q.edit_message_text("❌ Заявка отклонена.")
+            if p["kind"] == "inventory":
+                what = f"инвентаризацию склада «{esc(p['wh_name'])}»"
+            else:
+                what = (f"перемещение «{esc(p.get('from_wh_name') or '')}» → "
+                        f"«{esc(p['wh_name'])}»")
             try:
                 await context.bot.send_message(
-                    p["chat_id"],
-                    f"❌ Ваша заявка на перемещение «{esc(p['from_wh_name'])}» → "
-                    f"«{esc(p['wh_name'])}» отклонена админом.", parse_mode="HTML")
+                    p["chat_id"], f"❌ Админ отклонил {what}.", parse_mode="HTML")
             except Exception:
                 log.warning("Не удалось уведомить заявителя об отклонении")
         else:
@@ -979,6 +1110,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await alert_low_stock(context, [
                         (p["from_wh_id"], it["product_id"], -it["qty"])
                         for it in p["items"] if it.get("product_id")])
+            elif p["kind"] == "inventory":
+                op_id, summary = commit_inventory(p)
+                if op_id is None:
+                    await q.edit_message_text("✅ Расхождений уже нет — корректировка не нужна.")
+                else:
+                    await q.edit_message_text(
+                        f"✅ {esc(summary)} — проведено (операция №{op_id}).", parse_mode="HTML")
+                    if p.get("approver_id"):
+                        try:
+                            await context.bot.send_message(
+                                p["chat_id"],
+                                f"✅ Админ подтвердил вашу инвентаризацию "
+                                f"(операция №{op_id}). Остатки скорректированы.",
+                                parse_mode="HTML")
+                        except Exception:
+                            log.warning("Не удалось уведомить заявителя")
+                    else:
+                        await notify_admin(context, actor, summary)
+                    actor_name = db.get_user(p["user_id"])["name"]
+                    note = "Подтвердил админ" if p.get("approver_id") else ""
+                    await feed_operation(context, op_id, actor_name, "📋", note)
             elif p["kind"] == "set_min":
                 for it in p["items"]:
                     db.set_min_stock(p["wh_id"], it["product_id"], it["qty"])
@@ -1025,6 +1177,8 @@ async def process_text(update, context, actor, text, draft=False):
             await start_transfer(update, context, actor, data)
         elif action == "set_min":
             await start_set_min(update, context, actor, data)
+        elif action == "inventory":
+            await start_inventory(update, context, actor, data)
         else:
             await update.message.reply_text(reply)
     except Exception as e:
@@ -1103,6 +1257,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
         "📦 <b>Перемещение товара</b> (заявка, подтверждает админ):",
         "<i>с Бишкека на Каракол: Альтопен 100мл 2к</i>",
+        "📋 <b>Инвентаризация</b> (корректировку подтверждает админ):",
+        "<i>инвентаризация: Альтопен 100мл 18, Дексатоп 50мл 9</i>",
     ]
     if can_transfer(actor):
         lines += [
