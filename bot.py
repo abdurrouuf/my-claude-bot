@@ -250,6 +250,14 @@ def build_system_prompt(actor) -> str:
     if not transfer_allowed:
         parts.append("Примечание: перемещение между складами проводит только админ — "
                      "заявка сотрудника уйдёт ему на подтверждение, это нормально.")
+    if transfer_allowed:
+        parts.append("")
+        parts.append("=== РЕЖИМ 5: МИНИМАЛЬНЫЕ ОСТАТКИ (только админ и старшие) ===")
+        parts.append('Если сообщение задаёт неснижаемый остаток («минимум для Каракола: '
+                     'Альтопен 100мл 20 шт, Дексатоп 50мл 10 шт»), верни ТОЛЬКО JSON:')
+        parts.append('{"action": "set_min", "warehouse": "имя склада", '
+                     '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": число}]}')
+        parts.append('- qty: 0 означает убрать порог для товара.')
     parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
@@ -745,6 +753,128 @@ async def start_transfer(update, context, actor, data):
                                     reply_markup=confirm_kb(token))
 
 
+# ---------- Минимальные остатки ----------
+
+def low_stock_hits(stock_deltas):
+    """Товары, у которых списание пробило порог минимума (было >= min, стало < min)."""
+    hits = []
+    for wh_id, pid, delta in stock_deltas:
+        if delta >= 0:
+            continue
+        m = db.min_stock_get(wh_id, pid)
+        if not m:
+            continue
+        new_qty = db.stock_qty(wh_id, pid)
+        old_qty = new_qty - delta
+        if new_qty < m <= old_qty:
+            hits.append((wh_id, pid, new_qty, m))
+    return hits
+
+
+async def alert_low_stock(context, stock_deltas):
+    """Предупреждает админа и чат-ленту склада о пробитии минимума."""
+    for wh_id, pid, new_qty, m in low_stock_hits(stock_deltas):
+        wh = db.warehouse_by_id(wh_id)
+        p = prices.BY_ID.get(pid)
+        if wh is None or p is None:
+            continue
+        text = (f"📉 <b>Заканчивается товар</b> на складе «{esc(wh['name'])}»:\n"
+                f"{esc(p['name'])} {esc(p['volume'])} — осталось <b>{new_qty} шт</b> "
+                f"(минимум {m}).\nПора пополнить перемещением или приходом.")
+        targets = {ADMIN_ID}
+        if wh["feed_chat_id"]:
+            targets.add(wh["feed_chat_id"])
+        for t in targets:
+            try:
+                await context.bot.send_message(t, text, parse_mode="HTML")
+            except Exception as e:
+                log.warning("Не удалось отправить предупреждение о минимуме: %s", e)
+
+
+def set_min_summary(p) -> str:
+    lines = [f"📉 <b>Минимальные остатки — склад «{esc(p['wh_name'])}»</b>", ""]
+    for it in p["items"]:
+        if it["qty"] > 0:
+            lines.append(f"• {esc(it['name'])} {esc(it['volume'])} — минимум <b>{it['qty']} шт</b>")
+        else:
+            lines.append(f"• {esc(it['name'])} {esc(it['volume'])} — <i>убрать порог</i>")
+    lines.append("")
+    lines.append("Когда остаток опустится ниже минимума, бот предупредит вас и чат склада.")
+    lines.append("Сохранить?")
+    return "\n".join(lines)
+
+
+async def start_set_min(update, context, actor, data):
+    if not can_transfer(actor):
+        await update.message.reply_text("⛔ Минимальные остатки настраивает админ или старший.")
+        return
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    items, missing = [], []
+    for it in (data.get("items") or []):
+        name = str(it.get("name") or "").strip()
+        volume = str(it.get("volume") or "").strip()
+        try:
+            qty = int(float(it.get("qty")))
+        except (TypeError, ValueError):
+            qty = -1
+        product = prices.match_product(name, volume)
+        if product is None or qty < 0:
+            missing.append(f"{name} {volume}")
+            continue
+        items.append({"product_id": product["id"], "name": product["name"],
+                      "volume": product["volume"], "qty": qty})
+    if not items:
+        await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу.")
+        return
+    payload = {
+        "kind": "set_min", "user_id": actor["id"], "chat_id": update.effective_chat.id,
+        "wh_id": wh["id"], "wh_name": wh["name"], "items": items,
+    }
+    token = new_pending(payload)
+    text = set_min_summary(payload)
+    if missing:
+        text = "⚠️ Не найдены в прайсе: " + ", ".join(esc(x) for x in missing) + "\n\n" + text
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=confirm_kb(token))
+
+
+async def minstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if arg:
+        wh = db.warehouse_by_name(arg)
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    lines = []
+    for wh in whs:
+        mmap = db.min_stock_map(wh["id"])
+        lines.append(f"📉 <b>Минимумы — склад «{esc(wh['name'])}»</b>")
+        if not mmap:
+            lines.append("— пороги не заданы —")
+        else:
+            smap = db.stock_map(wh["id"])
+            for p in prices.PRICE_LIST_DATA:
+                m = mmap.get(p["id"])
+                if m is None:
+                    continue
+                have = smap.get(p["id"], 0)
+                mark = " ⚠️ ниже минимума!" if have < m else ""
+                lines.append(f"{esc(p['name'])} {esc(p['volume'])} — {have} шт "
+                             f"(минимум {m}){mark}")
+        lines.append("")
+    lines.append("Задать: напишите «минимум для Каракола: Альтопен 100мл 20 шт» (админ/старший)")
+    await send_long(update.message, "\n".join(lines))
+
+
 # ---------- Кнопки ----------
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -816,6 +946,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
                 await notify_admin(context, actor, summary)
                 await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "🧾")
+                await alert_low_stock(context, [
+                    (p["wh_id"], it["product_id"], -it["qty"])
+                    for it in p["items"] if it.get("product_id")])
             elif p["kind"] == "payment":
                 op_id, client_label, old_debt, summary = commit_payment(p)
                 await q.edit_message_text(
@@ -842,6 +975,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await notify_admin(context, actor, summary)
                 actor_name = db.get_user(p["user_id"])["name"]
                 await feed_operation(context, op_id, actor_name, "📦", note)
+                if p["from_wh_id"]:
+                    await alert_low_stock(context, [
+                        (p["from_wh_id"], it["product_id"], -it["qty"])
+                        for it in p["items"] if it.get("product_id")])
+            elif p["kind"] == "set_min":
+                for it in p["items"]:
+                    db.set_min_stock(p["wh_id"], it["product_id"], it["qty"])
+                await q.edit_message_text(
+                    f"✅ Минимальные остатки для склада «{esc(p['wh_name'])}» сохранены "
+                    f"({len(p['items'])} поз.). Посмотреть: /minstock", parse_mode="HTML")
         except Exception as e:
             log.exception("Ошибка проведения операции")
             await context.bot.send_message(p["chat_id"], f"⚠️ Ошибка при проведении: {e}")
@@ -880,6 +1023,8 @@ async def process_text(update, context, actor, text, draft=False):
             await start_payment(update, context, actor, data)
         elif action == "transfer":
             await start_transfer(update, context, actor, data)
+        elif action == "set_min":
+            await start_set_min(update, context, actor, data)
         else:
             await update.message.reply_text(reply)
     except Exception as e:
@@ -978,6 +1123,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/whadd Имя | /whname Старое Новое — создать/переименовать склад",
             "/feed Склад... (в групповом чате) — подключить ленту операций",
             "/backup — прислать копию базы сейчас (и так каждый день в 03:00)",
+            "/minstock — пороги «заканчивается товар» "
+            "(задать: «минимум для Каракола: Альтопен 100мл 20 шт»)",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -1877,6 +2024,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("client", client_cmd))
     app.add_handler(CommandHandler("act", act_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("minstock", minstock_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))
