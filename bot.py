@@ -276,6 +276,16 @@ def build_system_prompt(actor) -> str:
                      '"items": [{"name": "точное название из прайса", "volume": "фасовка", "price": цена}]}')
         parts.append('- price: 0 означает убрать спеццену (вернётся цена прайса).')
     parts.append("")
+    parts.append("=== РЕЖИМ 8: ВОЗВРАТ ТОВАРА ОТ КЛИЕНТА ===")
+    parts.append('Если клиент возвращает товар («возврат от Асана: Альтопен 100мл 5 шт»), '
+                 'верни ТОЛЬКО JSON:')
+    parts.append('{"action": "return", "client": "Имя", "warehouse": null, '
+                 '"items": [{"name": "точное название из прайса", "volume": "фасовка", '
+                 '"qty": штук, "box_qty": коробок_или_null, "price": цена, "price_explicit": false}]}')
+    parts.append('- price бери из прайса; если сотрудник сам явно написал цену возврата '
+                 '(например «по 85») — поставь её и "price_explicit": true.')
+    parts.append('- Коробки переводи в штуки как обычно. Возврат подтверждает админ.')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -353,6 +363,7 @@ def parse_items(raw_items: list):
         items.append({
             "name": name, "volume": volume, "qty": qty, "price": price,
             "box_qty": box_qty, "product_id": product["id"] if product else None,
+            "price_explicit": bool(it.get("price_explicit")),
         })
     if not items:
         raise ValueError("Не распознал ни одной позиции.")
@@ -388,7 +399,8 @@ def apply_client_prices(p):
         return
     for it in p["items"]:
         pid = it.get("product_id")
-        if pid in special:
+        # Явно названную сотрудником цену не трогаем
+        if pid in special and not it.get("price_explicit"):
             it["price"] = special[pid]
             it["special"] = True
 
@@ -554,6 +566,146 @@ async def start_invoice(update, context, actor, data, draft=False):
                 f"Создать нового?")
     await update.message.reply_text(text, parse_mode="HTML",
                                     reply_markup=InlineKeyboardMarkup(rows))
+
+
+# ---------- Возврат товара ----------
+
+def return_summary(p) -> str:
+    c = db.client_get(p["client_id"])
+    lines = ["🔙 <b>Возврат товара — подтверждение</b>",
+             f"🏬 Склад: <b>{esc(p['wh_name'])}</b>",
+             f"👤 Клиент: <b>{esc(c['name'])}</b> (текущий долг: {money(c['debt'])})"]
+    if p.get("requester_name"):
+        lines.append(f"✍️ Заявка от: <b>{esc(p['requester_name'])}</b>")
+    lines.append("")
+    total = 0
+    for i, it in enumerate(p["items"], 1):
+        sub = it["qty"] * it["price"]
+        total += sub
+        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        special = " 💲спеццена" if it.get("special") else ""
+        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
+                     f"{fmt_num(it['price'])}{special} = <b>{money(sub)}</b>")
+    lines.append("")
+    lines.append(f"🔙 Сумма возврата: <b>{money(total)}</b>")
+    new_debt = c["debt"] - total
+    if new_debt < 0:
+        lines.append(f"📊 Долг после возврата: {money(0)} (переплата {money(-new_debt)})")
+    else:
+        lines.append(f"📊 Долг после возврата: <b>{money(new_debt)}</b>")
+    for w in p.get("warnings", []):
+        lines.append(f"⚠️ {esc(w)}")
+    lines.append("")
+    lines.append("Товар вернётся на склад, долг клиента уменьшится. Провести возврат?")
+    return "\n".join(lines)
+
+
+def commit_return(p):
+    c = db.client_get(p["client_id"])
+    old_debt = c["debt"]
+    total = sum(it["qty"] * it["price"] for it in p["items"])
+    stock_deltas = [(p["wh_id"], it["product_id"], it["qty"])
+                    for it in p["items"] if it.get("product_id")]
+    summary = f"Возврат: {c['name']} — {fmt_num(total)} сом (склад {p['wh_name']})"
+    extra = {
+        "items": [{k: it[k] for k in ("name", "volume", "qty", "price", "box_qty")}
+                  for it in p["items"]],
+        "total": total, "old_debt": old_debt,
+    }
+    if p.get("approver_id"):
+        extra["approved_by"] = p["approver_id"]
+    op_id, _ = db.commit_operation(
+        p["user_id"], "return", p["wh_id"], p["client_id"], summary,
+        stock_deltas, [(p["client_id"], -total)], extra)
+    return op_id, c["name"], old_debt, total, summary
+
+
+async def send_return_pdf(context, chat_id, client_label, p, old_debt, total):
+    pdf = generate_pdf_invoice(
+        client_label, p["items"], total, warehouse_name=p["wh_name"],
+        doc_title="ВОЗВРАТ ТОВАРА", total_label="Сумма возврата",
+        extra_totals=[("Долг до возврата", old_debt),
+                      ("Долг после возврата", max(old_debt - total, 0))])
+    date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
+    filename = f"возврат_{safe_filename(client_label)}_{date_str}.pdf"
+    await context.bot.send_document(
+        chat_id=chat_id, document=InputFile(pdf, filename=filename),
+        caption=f"🔙 Возврат товара от {client_label}")
+
+
+async def start_return(update, context, actor, data):
+    if transition_blocked(actor):
+        await update.message.reply_text(TRANSITION_HINT)
+        return
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    client_name = str(data.get("client") or "").strip()
+    if not client_name:
+        await update.message.reply_text("Не понял, от какого клиента возврат.")
+        return
+    try:
+        items, warnings = parse_items(data.get("items") or [])
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+
+    payload = {
+        "kind": "return", "user_id": actor["id"], "chat_id": update.effective_chat.id,
+        "wh_id": wh["id"], "wh_name": wh["name"],
+        "client_name": client_name, "client_id": None,
+        "items": items, "warnings": warnings,
+    }
+
+    async def _proceed():
+        apply_client_prices(payload)
+        # Возврат уменьшает долг и увеличивает склад — проводит только админ.
+        if not is_admin(actor):
+            payload["approver_id"] = ADMIN_ID
+            payload["requester_name"] = actor["name"]
+            token = new_pending(payload, ttl=APPROVAL_TTL)
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID, return_summary(payload), parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
+                        InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+                    ]]))
+            except Exception:
+                log.exception("Не удалось отправить возврат админу")
+                PENDING.pop(token, None)
+                await update.message.reply_text("⚠️ Не удалось отправить админу. Попробуйте позже.")
+                return
+            c = db.client_get(payload["client_id"])
+            await update.message.reply_text(
+                f"📨 Возврат от «{esc(c['name'])}» отправлен админу на подтверждение. "
+                f"Я сообщу результат.", parse_mode="HTML")
+        else:
+            token = new_pending(payload)
+            await update.message.reply_text(return_summary(payload), parse_mode="HTML",
+                                            reply_markup=confirm_kb(token))
+
+    exact = db.client_exact(wh["id"], client_name)
+    if exact:
+        payload["client_id"] = exact["id"]
+        await _proceed()
+        return
+    candidates = db.fuzzy_clients(wh["id"], client_name)
+    if not candidates:
+        await update.message.reply_text(
+            f"❌ Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}». "
+            f"Возврат возможен только от существующего клиента.", parse_mode="HTML")
+        return
+    token = new_pending(payload)
+    rows = [[InlineKeyboardButton(f"👤 {c['name']} (долг {fmt_num(c['debt'])})",
+                                  callback_data=f"pk:{token}:{c['id']}")]
+            for c in candidates]
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+    await update.message.reply_text(
+        f"Клиент «<b>{esc(client_name)}</b>» не найден на складе «{esc(wh['name'])}».\n"
+        f"Возможно, вы имели в виду:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
 
 # ---------- Приход денег ----------
@@ -1146,6 +1298,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("❌ Заявка отклонена.")
             if p["kind"] == "inventory":
                 what = f"инвентаризацию склада «{esc(p['wh_name'])}»"
+            elif p["kind"] == "return":
+                what = f"возврат от «{esc(p.get('client_name') or '')}»"
             else:
                 what = (f"перемещение «{esc(p.get('from_wh_name') or '')}» → "
                         f"«{esc(p['wh_name'])}»")
@@ -1161,6 +1315,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "pk":  # выбран существующий клиент
         p["client_id"] = int(parts[2])
         await q.answer()
+        if p["kind"] == "return":
+            apply_client_prices(p)
+            requester = db.get_user(p["user_id"])
+            if requester["role"] != "admin":
+                p["approver_id"] = ADMIN_ID
+                p["requester_name"] = requester["name"]
+                p["ttl"] = APPROVAL_TTL
+                try:
+                    await context.bot.send_message(
+                        ADMIN_ID, return_summary(p), parse_mode="HTML",
+                        reply_markup=InlineKeyboardMarkup([[
+                            InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
+                            InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+                        ]]))
+                    await q.edit_message_text(
+                        "📨 Возврат отправлен админу на подтверждение. Я сообщу результат.")
+                except Exception:
+                    log.exception("Не удалось отправить возврат админу")
+                    await q.edit_message_text("⚠️ Не удалось отправить админу. Попробуйте позже.")
+                    PENDING.pop(token, None)
+            else:
+                await q.edit_message_text(return_summary(p), parse_mode="HTML",
+                                          reply_markup=confirm_kb(token))
+            return
         if p["kind"] == "invoice":
             apply_client_prices(p)
             summary = invoice_summary(p)
@@ -1220,6 +1398,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await alert_low_stock(context, [
                         (p["from_wh_id"], it["product_id"], -it["qty"])
                         for it in p["items"] if it.get("product_id")])
+            elif p["kind"] == "return":
+                op_id, client_label, old_debt, total, summary = commit_return(p)
+                await q.edit_message_text(f"✅ Возврат №{op_id} проведён.")
+                await send_return_pdf(context, p["chat_id"], client_label, p, old_debt, total)
+                if p.get("approver_id"):
+                    try:
+                        await context.bot.send_message(
+                            p["chat_id"],
+                            f"✅ Админ подтвердил возврат (операция №{op_id}).",
+                            parse_mode="HTML")
+                    except Exception:
+                        log.warning("Не удалось уведомить заявителя")
+                actor_name = db.get_user(p["user_id"])["name"]
+                note = "Подтвердил админ" if p.get("approver_id") else ""
+                await feed_operation(context, op_id, actor_name, "🔙", note)
             elif p["kind"] == "inventory":
                 op_id, summary = commit_inventory(p)
                 if op_id is None:
@@ -1304,6 +1497,8 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_inventory(update, context, actor, data)
         elif action == "set_price":
             await start_set_price(update, context, actor, data)
+        elif action == "return":
+            await start_return(update, context, actor, data)
         else:
             await update.message.reply_text(reply)
     except Exception as e:
@@ -1466,6 +1661,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>с Бишкека на Каракол: Альтопен 100мл 2к</i>",
         "📋 <b>Инвентаризация</b> (корректировку подтверждает админ):",
         "<i>инвентаризация: Альтопен 100мл 18, Дексатоп 50мл 9</i>",
+        "🔙 <b>Возврат товара</b> (подтверждает админ):",
+        "<i>возврат от Асана: Альтопен 100мл 5 шт</i>",
     ]
     if can_transfer(actor):
         lines += [
@@ -1629,6 +1826,7 @@ def build_report(warehouses, days_back: int, label: str) -> str:
     grand_sales = grand_money = 0
     for wh in warehouses:
         inv_data, pay_sum, transfers = [], 0.0, 0
+        ret_sum, ret_count = 0.0, 0
         for op in ops:
             try:
                 data = json.loads(op["data"])
@@ -1638,10 +1836,13 @@ def build_report(warehouses, days_back: int, label: str) -> str:
                 inv_data.append(data)
             elif op["type"] == "payment" and op["warehouse_id"] == wh["id"]:
                 pay_sum += data.get("amount", 0)
+            elif op["type"] == "return" and op["warehouse_id"] == wh["id"]:
+                ret_sum += data.get("total", 0)
+                ret_count += 1
             elif op["type"] == "transfer" and wh["id"] in db.operation_warehouses(op):
                 transfers += 1
         lines.append(f"📊 <b>«{esc(wh['name'])}» {esc(label)}</b>")
-        if not inv_data and not pay_sum and not transfers:
+        if not inv_data and not pay_sum and not transfers and not ret_count:
             lines.append("— операций не было —")
             lines.append("")
             continue
@@ -1653,6 +1854,8 @@ def build_report(warehouses, days_back: int, label: str) -> str:
         lines.append(f"💵 Принято денег: <b>{money(money_recv)}</b>")
         if debt_added > 0:
             lines.append(f"📈 Выдано в долг: {money(debt_added)}")
+        if ret_count:
+            lines.append(f"🔙 Возвратов: {ret_count} на {money(ret_sum)}")
         if transfers:
             lines.append(f"📦 Приходов/перемещений товара: {transfers}")
         top = {}
@@ -1772,6 +1975,10 @@ def client_statement(cid: int):
             plus = 0
             minus = data.get("amount", 0)
             doc = f"Оплата №{op['id']}"
+        elif op["type"] == "return":
+            plus = 0
+            minus = data.get("total", 0)
+            doc = f"Возврат товара №{op['id']}"
         else:
             plus, minus = max(delta, 0), max(-delta, 0)
             doc = f"Операция №{op['id']}"
