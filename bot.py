@@ -66,6 +66,24 @@ BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "3"))
 # Товар считается «мёртвым», если не продавался столько дней
 DEADSTOCK_DAYS = int(os.environ.get("DEADSTOCK_DAYS", "60"))
 
+# --- Распознавание голосовых сообщений (речь -> текст, Whisper) ---
+# Claude аудио не принимает, поэтому используется отдельный сервис.
+# Рекомендуется Groq (бесплатно): зарегистрироваться на console.groq.com,
+# создать ключ и добавить на Railway переменную GROQ_API_KEY.
+# Альтернатива — OpenAI (платно): переменная OPENAI_API_KEY.
+STT_API_KEY = (os.environ.get("STT_API_KEY") or os.environ.get("GROQ_API_KEY")
+               or os.environ.get("OPENAI_API_KEY"))
+_STT_VIA_OPENAI = (not os.environ.get("STT_API_KEY")
+                   and not os.environ.get("GROQ_API_KEY")
+                   and bool(os.environ.get("OPENAI_API_KEY")))
+STT_BASE_URL = os.environ.get("STT_BASE_URL") or (
+    "https://api.openai.com/v1" if _STT_VIA_OPENAI
+    else "https://api.groq.com/openai/v1")
+STT_MODEL = os.environ.get("STT_MODEL") or (
+    "whisper-1" if _STT_VIA_OPENAI else "whisper-large-v3")
+STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "ru")
+MAX_VOICE_SECONDS = int(os.environ.get("MAX_VOICE_SECONDS", "300"))
+
 ADMIN_ID = 632294583  # Абдурроууф
 
 # Рабочие склады компании
@@ -1836,6 +1854,106 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await dispatch_action(update, context, actor, reply, draft=draft)
 
 
+def _build_stt_prompt() -> str:
+    """Подсказка Whisper: редкие названия препаратов и слова накладной,
+    чтобы «Албенивер» не превращался в «Албанию»."""
+    seen, names = set(), []
+    for it in prices.PRICE_LIST_DATA:
+        word = it["name"].split("(")[0].strip().split()[0].capitalize()
+        if word not in seen:
+            seen.add(word)
+            names.append(word)
+    body = "Накладная ветеринарной компании ВЕТОП. Препараты: " + ", ".join(names)
+    return body[:700] + ". Слова: черновик, коробка, штук, флакон, долг, приход, сом."
+
+
+STT_PROMPT = _build_stt_prompt()
+
+
+async def transcribe_audio(raw: bytes, filename: str, mime: str) -> str:
+    """Отправляет аудио в OpenAI-совместимый Whisper API, возвращает текст."""
+    import httpx
+    async with httpx.AsyncClient(timeout=120) as cl:
+        resp = await cl.post(
+            f"{STT_BASE_URL}/audio/transcriptions",
+            headers={"Authorization": f"Bearer {STT_API_KEY}"},
+            data={"model": STT_MODEL, "language": STT_LANGUAGE,
+                  "temperature": "0", "prompt": STT_PROMPT},
+            files={"file": (filename, raw, mime)},
+        )
+        resp.raise_for_status()
+        return (resp.json().get("text") or "").strip()
+
+
+async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Голосовое сообщение -> текст (Whisper) -> обычная обработка."""
+    if update.message is None:
+        return
+    if update.effective_chat.type != "private":
+        return
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    if not STT_API_KEY:
+        if is_admin(actor):
+            await update.message.reply_text(
+                "🎤 Распознавание голосовых пока не настроено.\n\n"
+                "1. Зарегистрируйтесь на console.groq.com (бесплатно)\n"
+                "2. Создайте API-ключ (кнопка API Keys)\n"
+                "3. На Railway добавьте переменную GROQ_API_KEY с этим ключом\n"
+                "После перезапуска бот начнёт понимать голосовые.")
+        else:
+            await update.message.reply_text(
+                "🎤 Голосовые пока не подключены — напишите текстом, пожалуйста.")
+        return
+    voice = update.message.voice
+    audio = update.message.audio
+    tg_obj = voice or audio
+    if tg_obj is None:
+        return
+    duration = tg_obj.duration or 0
+    if duration > MAX_VOICE_SECONDS:
+        await update.message.reply_text(
+            f"⚠️ Голосовое слишком длинное ({duration // 60} мин {duration % 60} сек). "
+            f"Максимум — {MAX_VOICE_SECONDS // 60} мин.")
+        return
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        tg_file = await tg_obj.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        log.exception("Не удалось скачать голосовое")
+        await update.message.reply_text(f"⚠️ Не удалось загрузить голосовое: {e}")
+        return
+    if voice is not None:
+        filename, mime = "voice.ogg", "audio/ogg"
+    else:
+        filename = audio.file_name or "audio.mp3"
+        mime = audio.mime_type or "audio/mpeg"
+    try:
+        text = await transcribe_audio(raw, filename, mime)
+    except Exception as e:
+        log.exception("Ошибка распознавания голосового")
+        await update.message.reply_text(f"⚠️ Не удалось распознать голосовое: {e}")
+        return
+    if not text:
+        await update.message.reply_text(
+            "⚠️ Не разобрал речь — попробуйте ещё раз или напишите текстом.")
+        return
+    await update.message.reply_text(f"🎤 Распознал: «{text}»")
+    draft = False
+    m = DRAFT_RE.match(text)
+    if m:
+        draft = True
+        text = text[m.end():].strip()
+        if not text:
+            await update.message.reply_text(
+                "После слова «черновик» продиктуйте накладную.")
+            return
+    await process_text(update, context, actor, text, draft=draft)
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or not update.message.text:
         return
@@ -1888,6 +2006,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📝 <b>Черновик</b> (без проведения): <i>черновик: Асан, ...</i>",
         "📷 <b>Фото списка</b> — сфотографируйте рукописный список, бот сам разберёт "
         "(в подписи можно указать клиента и «черновик»)",
+        "🎤 <b>Голосовое</b> — продиктуйте накладную или вопрос, бот распознает речь "
+        "(можно начать со слова «черновик»)",
         "💵 <b>Оплата</b>: <i>Асан приход 5000</i>",
         "",
         "📌 <b>Команды:</b>",
@@ -3202,5 +3322,7 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(
         (filters.PHOTO | filters.Document.IMAGE) & filters.UpdateType.MESSAGE,
         handle_photo))
+    app.add_handler(MessageHandler(
+        (filters.VOICE | filters.AUDIO) & filters.UpdateType.MESSAGE, handle_voice))
     print("Бот запущен...")
     app.run_polling(stop_signals=None)
