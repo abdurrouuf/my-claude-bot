@@ -53,6 +53,9 @@ def transition_blocked(actor) -> bool:
 # Час вечерней сводки по времени Бишкека (0-23)
 SUMMARY_HOUR = int(os.environ.get("SUMMARY_HOUR", "20"))
 
+# Долг считается «старым», если клиент не платил столько дней
+DEBT_ALERT_DAYS = int(os.environ.get("DEBT_ALERT_DAYS", "30"))
+
 ADMIN_ID = 632294583  # Абдурроууф
 
 # Рабочие склады компании
@@ -939,6 +942,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/stock — остатки склада",
         "/debts — долги клиентов",
         "/report — отчёт (можно: /report неделя, /report Бишкек месяц)",
+        "/olddebts — кто давно не платил (можно: /olddebts 45)",
         "/price — прайс-лист",
         "/log — последние операции",
         "/undo — отменить свою последнюю операцию (15 минут)",
@@ -1192,6 +1196,99 @@ async def evening_summary_loop(app):
             await send_evening_summaries(app.bot)
         except Exception:
             log.exception("Ошибка вечерней сводки")
+
+
+def build_overdue(warehouses, min_days: int) -> str:
+    """Список должников, не плативших min_days и более дней."""
+    now = datetime.now(BISHKEK)
+    lines = [f"⏰ <b>Давно не платили ({min_days}+ дней):</b>"]
+    found = 0
+    total = 0.0
+    for wh in warehouses:
+        rows = []
+        for c, ref_ts, has_paid in db.debtors_with_age(wh["id"]):
+            if ref_ts is None:
+                days = None  # операций нет вовсе — долг занесён вручную давно
+            else:
+                try:
+                    days = (now - datetime.fromisoformat(ref_ts)).days
+                except ValueError:
+                    days = None
+            if days is not None and days < min_days:
+                continue
+            rows.append((days, c, has_paid))
+        if not rows:
+            continue
+        lines.append("")
+        lines.append(f"🏬 <b>Склад «{esc(wh['name'])}»</b>")
+        for days, c, has_paid in sorted(rows, key=lambda r: -(r[0] if r[0] is not None else 10**6)):
+            age = f"{days} дн. без оплат" if days is not None else "давно (дата неизвестна)"
+            mark = "" if has_paid else " — ни одной оплаты"
+            lines.append(f"👤 {esc(c['name'])}: <b>{money(c['debt'])}</b> · {age}{mark}")
+            found += 1
+            total += c["debt"]
+    if not found:
+        return ""
+    lines.append("")
+    lines.append(f"💰 Итого зависших долгов: <b>{money(total)}</b>")
+    return "\n".join(lines)
+
+
+async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    min_days = DEBT_ALERT_DAYS
+    if context.args:
+        try:
+            min_days = max(1, int(context.args[0]))
+        except ValueError:
+            await update.message.reply_text(
+                "Использование: /olddebts [дней]\nПример: /olddebts 45")
+            return
+    text = build_overdue(db.visible_warehouses(actor), min_days)
+    if not text:
+        await update.message.reply_text(
+            f"✅ Нет клиентов без оплат дольше {min_days} дней.")
+        return
+    await send_long(update.message, text)
+
+
+async def send_debt_alerts(bot):
+    """Еженедельное напоминание о старых долгах: админу — всё, сотруднику — своё."""
+    admin_text = build_overdue(db.all_warehouses(), DEBT_ALERT_DAYS)
+    if admin_text:
+        try:
+            await bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("Не удалось отправить напоминание админу: %s", e)
+    for u in db.list_users():
+        if u["id"] == ADMIN_ID:
+            continue
+        text = build_overdue(db.visible_warehouses(u), DEBT_ALERT_DAYS)
+        if not text:
+            continue
+        try:
+            await bot.send_message(u["id"], text + "\n\nПора напомнить клиентам об оплате 📞",
+                                   parse_mode="HTML")
+        except Exception as e:
+            log.warning("Не удалось отправить напоминание %s: %s", u["name"], e)
+
+
+async def weekly_debt_loop(app):
+    """Каждый понедельник в 10:00 по Бишкеку."""
+    while True:
+        now = datetime.now(BISHKEK)
+        days_ahead = (0 - now.weekday()) % 7
+        target = (now + timedelta(days=days_ahead)).replace(
+            hour=10, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=7)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await send_debt_alerts(app.bot)
+        except Exception:
+            log.exception("Ошибка напоминания о долгах")
 
 
 async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1571,6 +1668,7 @@ async def draft_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def _post_init(app):
     app.create_task(evening_summary_loop(app))
+    app.create_task(weekly_debt_loop(app))
 
 
 if __name__ == "__main__":
@@ -1585,6 +1683,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("invoice", invoice_hint))
     app.add_handler(CommandHandler("draft", draft_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
+    app.add_handler(CommandHandler("olddebts", olddebts_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))

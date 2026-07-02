@@ -375,6 +375,29 @@ def client_exact(wh_id: int, name: str):
     ).fetchone()
 
 
+def debtors_with_age(wh_id: int):
+    """Клиенты склада с долгом > 0 и датой последней оплаты.
+
+    Возвращает [(client_row, last_ts_iso_or_None, платил_ли_вообще)].
+    Если оплат не было — берётся дата первой операции клиента (долг висит с неё).
+    """
+    conn = connect()
+    result = []
+    for c in conn.execute(
+            "SELECT * FROM clients WHERE warehouse_id=? AND debt > 0", (wh_id,)).fetchall():
+        last_pay = conn.execute(
+            "SELECT MAX(ts) FROM operations WHERE client_id=? AND status='done' AND "
+            "(type='payment' OR (type='invoice' AND json_extract(data, '$.payment') > 0))",
+            (c["id"],)).fetchone()[0]
+        ref = last_pay
+        if ref is None:
+            ref = conn.execute(
+                "SELECT MIN(ts) FROM operations WHERE client_id=? AND status='done'",
+                (c["id"],)).fetchone()[0]
+        result.append((c, ref, last_pay is not None))
+    return result
+
+
 def fuzzy_clients(wh_id: int, name: str, n: int = 3):
     """Похожие клиенты внутри склада (региона)."""
     rows = clients_of(wh_id)
