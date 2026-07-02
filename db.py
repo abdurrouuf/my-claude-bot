@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS clients(
     debt         REAL NOT NULL DEFAULT 0,
     UNIQUE(warehouse_id, name)
 );
+CREATE TABLE IF NOT EXISTS min_stock(
+    warehouse_id INTEGER NOT NULL,
+    product_id   INTEGER NOT NULL,
+    min_qty      INTEGER NOT NULL,
+    UNIQUE(warehouse_id, product_id)
+);
 CREATE TABLE IF NOT EXISTS operations(
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT NOT NULL,
@@ -367,6 +373,33 @@ def _apply_stock(conn, wh_id: int, product_id: int, delta: int):
         "ON CONFLICT(warehouse_id, product_id) DO UPDATE SET qty = qty + excluded.qty",
         (wh_id, product_id, delta),
     )
+
+
+def set_min_stock(wh_id: int, product_id: int, min_qty: int):
+    """Порог «заканчивается»; 0 или меньше — убрать порог."""
+    conn = connect()
+    with _lock, conn:
+        if min_qty <= 0:
+            conn.execute("DELETE FROM min_stock WHERE warehouse_id=? AND product_id=?",
+                         (wh_id, product_id))
+        else:
+            conn.execute(
+                "INSERT INTO min_stock(warehouse_id, product_id, min_qty) VALUES(?,?,?) "
+                "ON CONFLICT(warehouse_id, product_id) DO UPDATE SET min_qty=excluded.min_qty",
+                (wh_id, product_id, min_qty))
+
+
+def min_stock_get(wh_id: int, product_id: int):
+    row = connect().execute(
+        "SELECT min_qty FROM min_stock WHERE warehouse_id=? AND product_id=?",
+        (wh_id, product_id)).fetchone()
+    return row["min_qty"] if row else None
+
+
+def min_stock_map(wh_id: int) -> dict:
+    rows = connect().execute(
+        "SELECT product_id, min_qty FROM min_stock WHERE warehouse_id=?", (wh_id,)).fetchall()
+    return {r["product_id"]: r["min_qty"] for r in rows}
 
 
 # ---------- Клиенты ----------
