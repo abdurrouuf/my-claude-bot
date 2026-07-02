@@ -86,6 +86,20 @@ CREATE TABLE IF NOT EXISTS min_stock(
     min_qty      INTEGER NOT NULL,
     UNIQUE(warehouse_id, product_id)
 );
+CREATE TABLE IF NOT EXISTS api_usage(
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts            TEXT NOT NULL,
+    model         TEXT NOT NULL,
+    input_tokens  INTEGER NOT NULL DEFAULT 0,
+    output_tokens INTEGER NOT NULL DEFAULT 0,
+    cache_read    INTEGER NOT NULL DEFAULT 0,
+    cache_write   INTEGER NOT NULL DEFAULT 0,
+    cost_usd      REAL NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS settings(
+    key   TEXT PRIMARY KEY,
+    value TEXT
+);
 CREATE TABLE IF NOT EXISTS operations(
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT NOT NULL,
@@ -183,6 +197,37 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
                 if aw:
                     conn.execute("INSERT OR IGNORE INTO access(user_id, warehouse_id) VALUES(?,?)",
                                  (uid, aw["id"]))
+
+
+def set_setting(key: str, value: str):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("INSERT INTO settings(key, value) VALUES(?,?) "
+                     "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+
+
+def get_setting(key: str):
+    row = connect().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
+    return row["value"] if row else None
+
+
+def record_api_usage(model: str, input_tokens: int, output_tokens: int,
+                     cache_read: int, cache_write: int, cost_usd: float):
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT INTO api_usage(ts, model, input_tokens, output_tokens, "
+            "cache_read, cache_write, cost_usd) VALUES(?,?,?,?,?,?,?)",
+            (datetime.now(BISHKEK).isoformat(timespec="seconds"), model,
+             input_tokens, output_tokens, cache_read, cache_write, cost_usd))
+
+
+def api_usage_since(start_iso: str):
+    """(запросов, суммарная стоимость $) начиная с даты."""
+    row = connect().execute(
+        "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM api_usage WHERE ts >= ?",
+        (start_iso,)).fetchone()
+    return row[0], row[1]
 
 
 def backup_to(path: str):
