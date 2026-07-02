@@ -57,6 +57,9 @@ SUMMARY_HOUR = int(os.environ.get("SUMMARY_HOUR", "20"))
 # Долг считается «старым», если клиент не платил столько дней
 DEBT_ALERT_DAYS = int(os.environ.get("DEBT_ALERT_DAYS", "30"))
 
+# Час ежедневного бэкапа базы админу в личку (по Бишкеку)
+BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "3"))
+
 ADMIN_ID = 632294583  # Абдурроууф
 
 # Рабочие склады компании
@@ -974,6 +977,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/access Имя Склад | /noaccess Имя Склад — доступ к складу",
             "/whadd Имя | /whname Старое Новое — создать/переименовать склад",
             "/feed Склад... (в групповом чате) — подключить ленту операций",
+            "/backup — прислать копию базы сейчас (и так каждый день в 03:00)",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -1419,6 +1423,47 @@ async def send_debt_alerts(bot):
             log.warning("Не удалось отправить напоминание %s: %s", u["name"], e)
 
 
+async def send_backup(bot):
+    """Копия базы админу в личку."""
+    import tempfile
+    stamp = datetime.now(BISHKEK).strftime("%d%m%Y_%H%M")
+    path = os.path.join(tempfile.gettempdir(), f"vetop_backup_{stamp}.db")
+    try:
+        db.backup_to(path)
+        with open(path, "rb") as f:
+            await bot.send_document(
+                ADMIN_ID,
+                document=InputFile(f, filename=f"vetop_backup_{stamp}.db"),
+                caption=("💾 Резервная копия базы. Храните — если что-то случится "
+                         "с сервером, по этому файлу восстановим весь учёт."))
+    finally:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+async def daily_backup_loop(app):
+    while True:
+        now = datetime.now(BISHKEK)
+        target = now.replace(hour=BACKUP_HOUR, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await send_backup(app.bot)
+        except Exception:
+            log.exception("Ошибка ежедневного бэкапа")
+
+
+async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    await send_backup(context.bot)
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("💾 Копия отправлена админу.")
+
+
 async def weekly_debt_loop(app):
     """Каждый понедельник в 10:00 по Бишкеку."""
     while True:
@@ -1813,6 +1858,7 @@ async def draft_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _post_init(app):
     app.create_task(evening_summary_loop(app))
     app.create_task(weekly_debt_loop(app))
+    app.create_task(daily_backup_loop(app))
 
 
 if __name__ == "__main__":
@@ -1830,6 +1876,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
     app.add_handler(CommandHandler("client", client_cmd))
     app.add_handler(CommandHandler("act", act_cmd))
+    app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))
