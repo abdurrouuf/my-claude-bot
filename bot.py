@@ -1163,6 +1163,10 @@ async def process_text(update, context, actor, text, draft=False):
     chat_histories[chat_id].append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = chat_histories[chat_id][-HISTORY_LIMIT:]
 
+    await dispatch_action(update, context, actor, reply, draft)
+
+
+async def dispatch_action(update, context, actor, reply, draft=False):
     data = extract_action(reply)
     if data is None:
         await update.message.reply_text(reply)
@@ -1187,6 +1191,85 @@ async def process_text(update, context, actor, text, draft=False):
 
 
 DRAFT_RE = re.compile(r"^черновик[:,\s]*", re.IGNORECASE)
+
+MAX_PHOTO_BYTES = 4_500_000  # лимит Claude на изображение
+
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Фото рукописного/печатного списка -> накладная (или другое действие)."""
+    import base64
+    if update.message is None:
+        return
+    if update.effective_chat.type != "private":
+        return
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    caption = (update.message.caption or "").strip()
+    draft = False
+    m = DRAFT_RE.match(caption)
+    if m:
+        draft = True
+        caption = caption[m.end():].strip()
+
+    if update.message.photo:
+        tg_obj = update.message.photo[-1]
+        media_type = "image/jpeg"
+    elif update.message.document and (update.message.document.mime_type or "").startswith("image/"):
+        tg_obj = update.message.document
+        media_type = update.message.document.mime_type
+    else:
+        return
+
+    chat_id = update.effective_chat.id
+    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    try:
+        tg_file = await tg_obj.get_file()
+        raw = bytes(await tg_file.download_as_bytearray())
+    except Exception as e:
+        log.exception("Не удалось скачать фото")
+        await update.message.reply_text(f"⚠️ Не удалось загрузить фото: {e}")
+        return
+    if len(raw) > MAX_PHOTO_BYTES:
+        await update.message.reply_text(
+            "⚠️ Фото слишком большое. Отправьте его как обычное фото (со сжатием), "
+            "а не как файл.")
+        return
+
+    instruction = (
+        "На фото — рукописный или печатный список товаров. Внимательно прочитай его "
+        "и разбери по правилам выше: накладная -> JSON invoice, перемещение -> transfer, "
+        "инвентаризация -> inventory. Названия сопоставь с прайсом. "
+        "Если какая-то строка неразборчива — не выдумывай, спроси текстом.")
+    if caption:
+        instruction += f"\nПодпись сотрудника к фото: {caption}"
+    content = [
+        {"type": "image",
+         "source": {"type": "base64", "media_type": media_type,
+                    "data": base64.b64encode(raw).decode()}},
+        {"type": "text", "text": instruction},
+    ]
+
+    history = chat_histories.setdefault(chat_id, [])
+    messages = history[-HISTORY_LIMIT:] + [{"role": "user", "content": content}]
+    try:
+        resp = await anthropic_client.messages.create(
+            model=CLAUDE_MODEL, max_tokens=1500,
+            system=build_system_prompt(actor), messages=messages)
+        reply = resp.content[0].text.strip()
+    except Exception as e:
+        log.exception("Claude API error (photo)")
+        await update.message.reply_text(f"⚠️ Ошибка при распознавании фото: {e}")
+        return
+    # в историю кладём текстовый след вместо картинки, чтобы не раздувать контекст
+    trace = "[Отправил фото со списком товаров]"
+    if caption:
+        trace += f" Подпись: {caption}"
+    history.append({"role": "user", "content": trace})
+    history.append({"role": "assistant", "content": reply})
+    chat_histories[chat_id] = history[-HISTORY_LIMIT:]
+
+    await dispatch_action(update, context, actor, reply, draft=draft)
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1239,6 +1322,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>Асан, Албенивер 200мл 1к, Дексатоп 50мл 5 шт</i>",
         "С другого склада: <i>со склада Ош: Асан, ...</i>",
         "📝 <b>Черновик</b> (без проведения): <i>черновик: Асан, ...</i>",
+        "📷 <b>Фото списка</b> — сфотографируйте рукописный список, бот сам разберёт "
+        "(в подписи можно указать клиента и «черновик»)",
         "💵 <b>Оплата</b>: <i>Асан приход 5000</i>",
         "",
         "📌 <b>Команды:</b>",
@@ -2199,5 +2284,8 @@ if __name__ == "__main__":
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, handle_message))
+    app.add_handler(MessageHandler(
+        (filters.PHOTO | filters.Document.IMAGE) & filters.UpdateType.MESSAGE,
+        handle_photo))
     print("Бот запущен...")
     app.run_polling(stop_signals=None)
