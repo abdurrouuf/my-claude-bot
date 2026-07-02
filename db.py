@@ -73,6 +73,12 @@ CREATE TABLE IF NOT EXISTS clients(
     debt         REAL NOT NULL DEFAULT 0,
     UNIQUE(warehouse_id, name)
 );
+CREATE TABLE IF NOT EXISTS client_prices(
+    client_id  INTEGER NOT NULL,
+    product_id INTEGER NOT NULL,
+    price      REAL NOT NULL,
+    UNIQUE(client_id, product_id)
+);
 CREATE TABLE IF NOT EXISTS min_stock(
     warehouse_id INTEGER NOT NULL,
     product_id   INTEGER NOT NULL,
@@ -449,6 +455,26 @@ def debtors_with_age(wh_id: int):
                 (c["id"],)).fetchone()[0]
         result.append((c, ref, last_pay is not None))
     return result
+
+
+def set_client_price(cid: int, product_id: int, price: float):
+    """Спеццена клиента; 0 или меньше — убрать."""
+    conn = connect()
+    with _lock, conn:
+        if price <= 0:
+            conn.execute("DELETE FROM client_prices WHERE client_id=? AND product_id=?",
+                         (cid, product_id))
+        else:
+            conn.execute(
+                "INSERT INTO client_prices(client_id, product_id, price) VALUES(?,?,?) "
+                "ON CONFLICT(client_id, product_id) DO UPDATE SET price=excluded.price",
+                (cid, product_id, price))
+
+
+def client_prices_map(cid: int) -> dict:
+    rows = connect().execute(
+        "SELECT product_id, price FROM client_prices WHERE client_id=?", (cid,)).fetchall()
+    return {r["product_id"]: r["price"] for r in rows}
 
 
 def fuzzy_clients(wh_id: int, name: str, n: int = 3):

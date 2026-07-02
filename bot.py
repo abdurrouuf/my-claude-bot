@@ -267,6 +267,14 @@ def build_system_prompt(actor) -> str:
                  '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": фактическое_количество}]}')
     parts.append('- qty — сколько товара РЕАЛЬНО насчитали на складе (может быть 0).')
     parts.append('- Здесь коробки тоже переводи в штуки по прайсу.')
+    if transfer_allowed:
+        parts.append("")
+        parts.append("=== РЕЖИМ 7: СПЕЦЦЕНЫ КЛИЕНТА (только админ и старшие) ===")
+        parts.append('Если сообщение задаёт индивидуальную цену («цена для Асана: '
+                     'Альтопен 100мл 85», «спеццена для Асана ...»), верни ТОЛЬКО JSON:')
+        parts.append('{"action": "set_price", "client": "Имя", "warehouse": null, '
+                     '"items": [{"name": "точное название из прайса", "volume": "фасовка", "price": цена}]}')
+        parts.append('- price: 0 означает убрать спеццену (вернётся цена прайса).')
     parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
@@ -371,6 +379,20 @@ def resolve_warehouse(actor, wh_name: str):
 
 # ---------- Накладная ----------
 
+def apply_client_prices(p):
+    """Подставляет спеццены клиента в позиции накладной (после выбора клиента)."""
+    if not p.get("client_id"):
+        return
+    special = db.client_prices_map(p["client_id"])
+    if not special:
+        return
+    for it in p["items"]:
+        pid = it.get("product_id")
+        if pid in special:
+            it["price"] = special[pid]
+            it["special"] = True
+
+
 def invoice_summary(p) -> str:
     lines = ["📋 <b>Проверьте накладную</b>", f"🏬 Склад: <b>{esc(p['wh_name'])}</b>"]
     if p["client_id"]:
@@ -387,8 +409,9 @@ def invoice_summary(p) -> str:
         sub = it["qty"] * it["price"]
         total += sub
         box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        special = " 💲спеццена" if it.get("special") else ""
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
-                     f"{fmt_num(it['price'])} = <b>{money(sub)}</b>")
+                     f"{fmt_num(it['price'])}{special} = <b>{money(sub)}</b>")
     lines.append("")
     lines.append(f"🧾 Сумма накладной: <b>{money(total)}</b>")
     if old_debt:
@@ -488,6 +511,8 @@ async def start_invoice(update, context, actor, data, draft=False):
     if draft:
         c = db.client_exact(wh["id"], client_name)
         old_debt = c["debt"] if c else parsed_debt
+        if c:
+            apply_client_prices({"client_id": c["id"], "items": items})
         total = sum(it["qty"] * it["price"] for it in items)
         p = {"items": items, "payment": payment, "wh_name": wh["name"]}
         await send_invoice_pdf(context, update.effective_chat.id,
@@ -505,6 +530,7 @@ async def start_invoice(update, context, actor, data, draft=False):
     exact = db.client_exact(wh["id"], client_name)
     if exact:
         payload["client_id"] = exact["id"]
+        apply_client_prices(payload)
         token = new_pending(payload)
         await update.message.reply_text(invoice_summary(payload), parse_mode="HTML",
                                         reply_markup=confirm_kb(token))
@@ -760,6 +786,84 @@ async def start_transfer(update, context, actor, data):
     token = new_pending(payload)
     await update.message.reply_text(transfer_summary(payload), parse_mode="HTML",
                                     reply_markup=confirm_kb(token))
+
+
+# ---------- Спеццены ----------
+
+def set_price_summary(p) -> str:
+    c = db.client_get(p["client_id"])
+    lines = [f"💲 <b>Спеццены — клиент «{esc(c['name'])}» (склад «{esc(p['wh_name'])}»)</b>", ""]
+    for it in p["items"]:
+        base = prices.BY_ID[it["product_id"]]["price"]
+        if it["price"] > 0:
+            lines.append(f"• {esc(it['name'])} {esc(it['volume'])}: <b>{fmt_num(it['price'])} сом</b> "
+                         f"(прайс: {fmt_num(base)})")
+        else:
+            lines.append(f"• {esc(it['name'])} {esc(it['volume'])}: <i>убрать спеццену</i> "
+                         f"(вернётся {fmt_num(base)})")
+    lines.append("")
+    lines.append("Эти цены будут подставляться в накладные клиента автоматически. Сохранить?")
+    return "\n".join(lines)
+
+
+async def start_set_price(update, context, actor, data):
+    if not can_transfer(actor):
+        await update.message.reply_text("⛔ Спеццены настраивает админ или старший.")
+        return
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    client_name = str(data.get("client") or "").strip()
+    if not client_name:
+        await update.message.reply_text("Не понял имя клиента.")
+        return
+    items, missing = [], []
+    for it in (data.get("items") or []):
+        name = str(it.get("name") or "").strip()
+        volume = str(it.get("volume") or "").strip()
+        try:
+            price = float(it.get("price"))
+        except (TypeError, ValueError):
+            price = -1
+        product = prices.match_product(name, volume)
+        if product is None or price < 0:
+            missing.append(f"{name} {volume}")
+            continue
+        items.append({"product_id": product["id"], "name": product["name"],
+                      "volume": product["volume"], "price": price})
+    if not items:
+        await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу.")
+        return
+
+    payload = {
+        "kind": "set_price", "user_id": actor["id"], "chat_id": update.effective_chat.id,
+        "wh_id": wh["id"], "wh_name": wh["name"],
+        "client_name": client_name, "client_id": None, "items": items,
+    }
+    exact = db.client_exact(wh["id"], client_name)
+    if exact:
+        payload["client_id"] = exact["id"]
+        token = new_pending(payload)
+        text = set_price_summary(payload)
+        if missing:
+            text = "⚠️ Не найдены в прайсе: " + ", ".join(esc(x) for x in missing) + "\n\n" + text
+        await update.message.reply_text(text, parse_mode="HTML", reply_markup=confirm_kb(token))
+        return
+    candidates = db.fuzzy_clients(wh["id"], client_name)
+    if not candidates:
+        await update.message.reply_text(
+            f"❌ Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}». "
+            f"Спеццену можно задать только существующему клиенту.", parse_mode="HTML")
+        return
+    token = new_pending(payload)
+    rows = [[InlineKeyboardButton(f"👤 {c['name']}", callback_data=f"pk:{token}:{c['id']}")]
+            for c in candidates]
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+    await update.message.reply_text(
+        f"Клиент «<b>{esc(client_name)}</b>» не найден на складе «{esc(wh['name'])}».\n"
+        f"Возможно, вы имели в виду:",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
 
 # ---------- Инвентаризация ----------
@@ -1057,7 +1161,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "pk":  # выбран существующий клиент
         p["client_id"] = int(parts[2])
         await q.answer()
-        summary = invoice_summary(p) if p["kind"] == "invoice" else payment_summary(p)
+        if p["kind"] == "invoice":
+            apply_client_prices(p)
+            summary = invoice_summary(p)
+        elif p["kind"] == "set_price":
+            summary = set_price_summary(p)
+        else:
+            summary = payment_summary(p)
         await q.edit_message_text(summary, parse_mode="HTML", reply_markup=confirm_kb(token))
         return
 
@@ -1131,6 +1241,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     actor_name = db.get_user(p["user_id"])["name"]
                     note = "Подтвердил админ" if p.get("approver_id") else ""
                     await feed_operation(context, op_id, actor_name, "📋", note)
+            elif p["kind"] == "set_price":
+                c = db.client_get(p["client_id"])
+                for it in p["items"]:
+                    db.set_client_price(p["client_id"], it["product_id"], it["price"])
+                await q.edit_message_text(
+                    f"✅ Спеццены клиента «{esc(c['name'])}» сохранены ({len(p['items'])} поз.). "
+                    f"Посмотреть: /client {esc(c['name'])}", parse_mode="HTML")
+                await notify_admin(context, actor,
+                                   f"спеццены для {c['name']}: {len(p['items'])} поз.")
             elif p["kind"] == "set_min":
                 for it in p["items"]:
                     db.set_min_stock(p["wh_id"], it["product_id"], it["qty"])
@@ -1183,6 +1302,8 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_set_min(update, context, actor, data)
         elif action == "inventory":
             await start_inventory(update, context, actor, data)
+        elif action == "set_price":
+            await start_set_price(update, context, actor, data)
         else:
             await update.message.reply_text(reply)
     except Exception as e:
@@ -1366,6 +1487,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/backup — прислать копию базы сейчас (и так каждый день в 03:00)",
             "/minstock — пороги «заканчивается товар» "
             "(задать: «минимум для Каракола: Альтопен 100мл 20 шт»)",
+            "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -1698,6 +1820,15 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines.append("💵 Оплат ещё не было")
     if start_debt:
         lines.append(f"📌 Начальный долг (до бота): {money(start_debt)}")
+    specials = db.client_prices_map(c["id"])
+    if specials:
+        lines.append("")
+        lines.append("💲 <b>Спеццены:</b>")
+        for pid, price in specials.items():
+            p_row = prices.BY_ID.get(pid)
+            if p_row:
+                lines.append(f"• {esc(p_row['name'])} {esc(p_row['volume'])}: "
+                             f"{fmt_num(price)} сом (прайс {fmt_num(p_row['price'])})")
     if rows:
         lines.append("")
         lines.append(f"🗒 <b>Последние операции ({min(len(rows), 15)} из {len(rows)}):</b>")
