@@ -1805,6 +1805,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/whadd Имя | /whname Старое Новое — создать/переименовать склад",
             "/feed Склад... (в групповом чате) — подключить ленту операций",
             "/backup — прислать копию базы сейчас (и так каждый день в 03:00)",
+            "/export — Excel: операции, долги, остатки, кассы "
+            "(можно: /export неделя, /export все)",
             "/minstock — пороги «заканчивается товар» "
             "(задать: «минимум для Каракола: Альтопен 100мл 20 шт»)",
             "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
@@ -2329,6 +2331,38 @@ async def daily_backup_loop(app):
             log.exception("Ошибка ежедневного бэкапа")
 
 
+EXPORT_PERIODS = {
+    "день": (0, "за сегодня"), "сегодня": (0, "за сегодня"),
+    "неделя": (6, "за 7 дней"), "неделю": (6, "за 7 дней"),
+    "месяц": (29, "за 30 дней"),
+    "все": (3650, "за всё время"), "всё": (3650, "за всё время"),
+}
+
+
+async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    days_back, label = EXPORT_PERIODS["месяц"]
+    if context.args:
+        key = context.args[0].lower()
+        if key in EXPORT_PERIODS:
+            days_back, label = EXPORT_PERIODS[key]
+        else:
+            await update.message.reply_text(
+                "Использование: /export [день|неделя|месяц|все]")
+            return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id,
+                                       action="upload_document")
+    import export_xlsx
+    start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    xlsx = export_xlsx.build_export(start.isoformat(timespec="seconds"), label)
+    filename = f"экспорт_ВЕТОП_{datetime.now(BISHKEK).strftime('%d%m%Y')}.xlsx"
+    await update.message.reply_document(
+        document=InputFile(xlsx, filename=filename),
+        caption=f"📊 Экспорт {label}: операции, долги, остатки, кассы")
+
+
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _require_admin(update) is None:
         return
@@ -2753,6 +2787,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("minstock", minstock_cmd))
     app.add_handler(CommandHandler("cash", cash_cmd))
+    app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))
