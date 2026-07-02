@@ -27,6 +27,11 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-5")
 
+# Переходный режим: черновики выглядят как обычные накладные (без водяного
+# знака «ЧЕРНОВИК»), но базу по-прежнему не трогают. Когда полностью перейдёте
+# на учёт через бота — поставьте на Railway переменную DRAFT_WATERMARK=1.
+DRAFT_WATERMARK = os.environ.get("DRAFT_WATERMARK", "0") == "1"
+
 ADMIN_ID = 632294583  # Абдурроууф
 
 # Рабочие склады компании
@@ -402,12 +407,13 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total, d
     pdf = generate_pdf_invoice(
         client_label, p["items"], total,
         prev_debt=old_debt, payment=p["payment"], is_payment=p["payment"] > 0,
-        warehouse_name=p["wh_name"], draft=draft,
+        warehouse_name=p["wh_name"], draft=draft, watermark=DRAFT_WATERMARK,
     )
     date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
-    prefix = "черновик" if draft else "накладная"
+    marked = draft and DRAFT_WATERMARK
+    prefix = "черновик" if marked else "накладная"
     filename = f"{prefix}_{safe_filename(client_label)}_{date_str}.pdf"
-    caption = ("📝 ЧЕРНОВИК — не проведено, остатки и долги не изменены"
+    caption = ("📝 Черновик — не проведено, остатки и долги не изменены"
                if draft else f"📄 Накладная для {client_label}")
     await context.bot.send_document(
         chat_id=chat_id, document=InputFile(pdf, filename=filename), caption=caption

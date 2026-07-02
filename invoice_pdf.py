@@ -111,8 +111,13 @@ def _watermark(font_bold_name):
 
 def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                          payment=0, is_payment=False, warehouse_name=None,
-                         draft=False) -> io.BytesIO:
-    """Красивый PDF: логотип, таблица товаров, итоги."""
+                         draft=False, watermark=True) -> io.BytesIO:
+    """Красивый PDF: логотип, таблица товаров, итоги.
+
+    draft=True не меняет содержимое, только оформление: водяной знак и пометка
+    в заголовке — и то лишь при watermark=True (переходный режим — без пометок).
+    """
+    show_mark = draft and watermark
     font_name, font_bold_name = _register_fonts()
 
     buffer = io.BytesIO()
@@ -156,7 +161,7 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
         except Exception:
             pass
 
-    title = "НАКЛАДНАЯ (ЧЕРНОВИК)" if draft else "НАКЛАДНАЯ"
+    title = "НАКЛАДНАЯ (ЧЕРНОВИК)" if show_mark else "НАКЛАДНАЯ"
     story.append(Paragraph(title, title_style))
     story.append(Paragraph(datetime.now(BISHKEK).strftime("%d.%m.%Y"), sub_style))
     story.append(Paragraph(f"Контрагент: <b>{xml_escape(str(client_name))}</b>", sub_style))
@@ -255,7 +260,7 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
         story.append(Paragraph("+996 700 99 88 11  |  +996 700 887 666", sub_style))
         story.append(Paragraph("Эл. почта: vettop@inbox.ru", sub_style))
 
-    if draft:
+    if show_mark:
         wm = _watermark(font_bold_name)
         doc.build(story, onFirstPage=wm, onLaterPages=wm)
     else:
