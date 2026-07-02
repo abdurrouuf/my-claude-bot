@@ -361,6 +361,38 @@ def extract_action(reply: str):
     return None
 
 
+# Цены Anthropic, $ за миллион токенов: (вход, выход).
+# Кэш: чтение = 10% от входа, запись = 125% от входа.
+MODEL_PRICES_USD = {
+    "claude-sonnet-5": (2.0, 10.0),    # акция до 31.08.2026, потом (3.0, 15.0)
+    "claude-sonnet-4-5": (3.0, 15.0),
+    "claude-haiku-4-5": (1.0, 5.0),
+    "claude-opus-4-5": (5.0, 25.0),
+    "claude-opus-4-8": (5.0, 25.0),
+}
+
+
+def _request_cost_usd(model: str, input_tokens: int, output_tokens: int,
+                      cache_read: int, cache_write: int) -> float:
+    p_in, p_out = MODEL_PRICES_USD.get(model, (3.0, 15.0))
+    return (input_tokens * p_in + output_tokens * p_out
+            + cache_read * p_in * 0.1 + cache_write * p_in * 1.25) / 1_000_000
+
+
+def track_usage(resp):
+    """Пишет стоимость каждого запроса к API в базу (для /api)."""
+    try:
+        u = resp.usage
+        inp = u.input_tokens or 0
+        out = u.output_tokens or 0
+        cr = getattr(u, "cache_read_input_tokens", 0) or 0
+        cw = getattr(u, "cache_creation_input_tokens", 0) or 0
+        cost = _request_cost_usd(CLAUDE_MODEL, inp, out, cr, cw)
+        db.record_api_usage(CLAUDE_MODEL, inp, out, cr, cw, cost)
+    except Exception:
+        log.warning("Не удалось записать расход API", exc_info=True)
+
+
 def _response_text(resp) -> str:
     """Текст ответа. У Sonnet 5 первым блоком может идти размышление —
     берём первый текстовый блок, а не content[0]."""
@@ -374,6 +406,7 @@ async def ask_claude(history: list, actor) -> str:
         system=system_blocks(actor),
         messages=history,
     )
+    track_usage(resp)
     return _response_text(resp)
 
 
@@ -1786,6 +1819,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         resp = await anthropic_client.messages.create(
             model=CLAUDE_MODEL, max_tokens=2500,
             system=system_blocks(actor), messages=messages)
+        track_usage(resp)
         reply = _response_text(resp)
     except Exception as e:
         log.exception("Claude API error (photo)")
@@ -1902,6 +1936,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/backup — прислать копию базы сейчас (и так каждый день в 03:00)",
             "/export — Excel: операции, долги, остатки, кассы "
             "(можно: /export неделя, /export все)",
+            "/api — расходы на ИИ и остаток на счёте (задать: /apibalance 50)",
             "/minstock — пороги «заканчивается товар» "
             "(задать: «минимум для Каракола: Альтопен 100мл 20 шт»)",
             "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
@@ -2656,6 +2691,66 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📊 Экспорт {label}: операции, долги, остатки, кассы")
 
 
+async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Расходы на API Anthropic и остаток от заданного баланса."""
+    if await _require_admin(update) is None:
+        return
+    now = datetime.now(BISHKEK)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    n_today, spent_today = db.api_usage_since(today.isoformat(timespec="seconds"))
+    n_month, spent_month = db.api_usage_since(
+        (today - timedelta(days=29)).isoformat(timespec="seconds"))
+    lines = [
+        "🤖 <b>Расходы на API Anthropic</b>",
+        f"Сегодня: <b>${spent_today:.2f}</b> ({n_today} запросов)",
+        f"За 30 дней: <b>${spent_month:.2f}</b> ({n_month} запросов)",
+        f"Модель: {esc(CLAUDE_MODEL)}",
+    ]
+    balance = db.get_setting("api_balance")
+    balance_ts = db.get_setting("api_balance_ts")
+    if balance and balance_ts:
+        _, spent_since = db.api_usage_since(balance_ts)
+        remaining = float(balance) - spent_since
+        try:
+            since_str = datetime.fromisoformat(balance_ts).strftime("%d.%m.%Y")
+        except ValueError:
+            since_str = balance_ts
+        lines.append("")
+        lines.append(f"💳 Баланс ${float(balance):.2f} задан {since_str}, "
+                     f"потрачено с тех пор ${spent_since:.2f}")
+        icon = "⚠️" if remaining < 5 else "✅"
+        lines.append(f"{icon} <b>Осталось примерно: ${remaining:.2f}</b>")
+    else:
+        lines.append("")
+        lines.append("💳 Чтобы бот показывал остаток: пополните счёт в консоли Anthropic "
+                     "и напишите /apibalance 50 (сумма на счёте в долларах)")
+    lines.append("")
+    lines.append("ℹ️ Считается по токенам каждого запроса; точный остаток — "
+                 "в консоли console.anthropic.com")
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def apibalance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Использование: /apibalance 50\n"
+            "Укажите, сколько долларов сейчас на счёте Anthropic — "
+            "бот будет вычитать расходы и показывать остаток в /api")
+        return
+    try:
+        balance = float(context.args[0].replace("$", "").replace(",", "."))
+    except ValueError:
+        await update.message.reply_text("❌ Не понял сумму. Пример: /apibalance 50")
+        return
+    db.set_setting("api_balance", str(balance))
+    db.set_setting("api_balance_ts",
+                   datetime.now(BISHKEK).isoformat(timespec="seconds"))
+    await update.message.reply_text(
+        f"✅ Баланс ${balance:.2f} записан. Остаток смотрите командой /api")
+
+
 async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _require_admin(update) is None:
         return
@@ -3084,6 +3179,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("minstock", minstock_cmd))
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("api", api_cmd))
+    app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))
