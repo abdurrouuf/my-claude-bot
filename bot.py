@@ -286,6 +286,11 @@ def build_system_prompt(actor) -> str:
                  '(например «по 85») — поставь её и "price_explicit": true.')
     parts.append('- Коробки переводи в штуки как обычно. Возврат подтверждает админ.')
     parts.append("")
+    parts.append("=== РЕЖИМ 9: СДАЧА ВЫРУЧКИ (ИНКАССАЦИЯ) ===")
+    parts.append('Если сотрудник сдаёт наличные руководителю («сдал 50000», «сдаю выручку '
+                 '50 000», «инкассация 30000»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "handover", "amount": сумма}')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -566,6 +571,102 @@ async def start_invoice(update, context, actor, data, draft=False):
                 f"Создать нового?")
     await update.message.reply_text(text, parse_mode="HTML",
                                     reply_markup=InlineKeyboardMarkup(rows))
+
+
+# ---------- Касса и инкассация ----------
+
+def handover_summary(p) -> str:
+    cash = db.cash_on_hand(p["user_id"])
+    name = p.get("requester_name") or db.get_user(p["user_id"])["name"]
+    lines = ["💰 <b>Сдача выручки</b>",
+             f"✍️ Сотрудник: <b>{esc(name)}</b>",
+             f"💵 Сдаёт: <b>{money(p['amount'])}</b>",
+             f"🧮 В кассе по данным бота: {money(cash)}"]
+    if p["amount"] > cash:
+        lines.append(f"⚠️ Сдаёт больше, чем числится в кассе (разница {money(p['amount'] - cash)})")
+    elif p["amount"] < cash:
+        lines.append(f"📌 После сдачи в кассе останется {money(cash - p['amount'])}")
+    lines.append("")
+    lines.append("Принять деньги?")
+    return "\n".join(lines)
+
+
+def commit_handover(p):
+    u = db.get_user(p["user_id"])
+    wh = db.warehouse_of(p["user_id"])
+    summary = f"Инкассация: {u['name']} сдал {fmt_num(p['amount'])} сом"
+    extra = {"amount": p["amount"]}
+    if p.get("approver_id"):
+        extra["approved_by"] = p["approver_id"]
+    op_id, _ = db.commit_operation(
+        p["user_id"], "handover", wh["id"] if wh else None, None,
+        summary, [], [], extra)
+    return op_id, summary
+
+
+async def start_handover(update, context, actor, data):
+    if transition_blocked(actor):
+        await update.message.reply_text(TRANSITION_HINT)
+        return
+    try:
+        amount = float(data.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    if amount <= 0:
+        await update.message.reply_text("Не понял сумму. Пример: «сдал 50000».")
+        return
+    payload = {
+        "kind": "handover", "user_id": actor["id"],
+        "chat_id": update.effective_chat.id, "amount": amount,
+    }
+    if is_admin(actor):
+        token = new_pending(payload)
+        await update.message.reply_text(handover_summary(payload), parse_mode="HTML",
+                                        reply_markup=confirm_kb(token))
+        return
+    payload["approver_id"] = ADMIN_ID
+    payload["requester_name"] = actor["name"]
+    token = new_pending(payload, ttl=APPROVAL_TTL)
+    try:
+        await context.bot.send_message(
+            ADMIN_ID, handover_summary(payload), parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Принял деньги", callback_data=f"ok:{token}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+            ]]))
+    except Exception:
+        log.exception("Не удалось отправить инкассацию админу")
+        PENDING.pop(token, None)
+        await update.message.reply_text("⚠️ Не удалось отправить админу. Попробуйте позже.")
+        return
+    await update.message.reply_text(
+        f"📨 Сдача выручки {money(amount)} отправлена админу на подтверждение. "
+        f"Касса уменьшится, когда он подтвердит приём денег.", parse_mode="HTML")
+
+
+async def cash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    if is_admin(actor):
+        lines = ["💰 <b>Наличные на руках у сотрудников:</b>"]
+        total = 0.0
+        for u in db.list_users():
+            cash = db.cash_on_hand(u["id"])
+            if not cash and u["id"] != actor["id"]:
+                continue
+            mark = " 👑" if u["role"] == "admin" else ""
+            lines.append(f"👤 {esc(u['name'])}{mark}: <b>{money(cash)}</b>")
+            total += cash
+        lines.append("")
+        lines.append(f"💰 Всего в кассах: <b>{money(total)}</b>")
+        await send_long(update.message, "\n".join(lines))
+        return
+    cash = db.cash_on_hand(actor["id"])
+    await update.message.reply_text(
+        f"💰 Ваша касса: <b>{money(cash)}</b>\n"
+        f"Сдать выручку: напишите «сдал {fmt_num(cash) if cash > 0 else '50000'}»",
+        parse_mode="HTML")
 
 
 # ---------- Возврат товара ----------
@@ -1300,6 +1401,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 what = f"инвентаризацию склада «{esc(p['wh_name'])}»"
             elif p["kind"] == "return":
                 what = f"возврат от «{esc(p.get('client_name') or '')}»"
+            elif p["kind"] == "handover":
+                what = f"сдачу выручки {money(p['amount'])}"
             else:
                 what = (f"перемещение «{esc(p.get('from_wh_name') or '')}» → "
                         f"«{esc(p['wh_name'])}»")
@@ -1398,6 +1501,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await alert_low_stock(context, [
                         (p["from_wh_id"], it["product_id"], -it["qty"])
                         for it in p["items"] if it.get("product_id")])
+            elif p["kind"] == "handover":
+                op_id, summary = commit_handover(p)
+                remaining = db.cash_on_hand(p["user_id"])
+                await q.edit_message_text(
+                    f"✅ {esc(summary)} — принято (операция №{op_id}).\n"
+                    f"В его кассе осталось: {money(remaining)}", parse_mode="HTML")
+                if p.get("approver_id"):
+                    try:
+                        await context.bot.send_message(
+                            p["chat_id"],
+                            f"✅ Админ принял выручку {money(p['amount'])} (операция №{op_id}).\n"
+                            f"В вашей кассе осталось: {money(remaining)}", parse_mode="HTML")
+                    except Exception:
+                        log.warning("Не удалось уведомить заявителя")
+                actor_name = db.get_user(p["user_id"])["name"]
+                await feed_operation(context, op_id, actor_name, "💰")
             elif p["kind"] == "return":
                 op_id, client_label, old_debt, total, summary = commit_return(p)
                 await q.edit_message_text(f"✅ Возврат №{op_id} проведён.")
@@ -1499,6 +1618,8 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_set_price(update, context, actor, data)
         elif action == "return":
             await start_return(update, context, actor, data)
+        elif action == "handover":
+            await start_handover(update, context, actor, data)
         else:
             await update.message.reply_text(reply)
     except Exception as e:
@@ -1663,6 +1784,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>инвентаризация: Альтопен 100мл 18, Дексатоп 50мл 9</i>",
         "🔙 <b>Возврат товара</b> (подтверждает админ):",
         "<i>возврат от Асана: Альтопен 100мл 5 шт</i>",
+        "💰 <b>Сдать выручку</b>: <i>сдал 50000</i> · /cash — ваша касса",
     ]
     if can_transfer(actor):
         lines += [
@@ -1913,6 +2035,17 @@ async def send_evening_summaries(bot):
         text = build_report(whs, 0, "за сегодня")
         if "Накладных" not in text and "Приходов" not in text:
             continue  # день без операций — не шумим
+        wh_ids = {w["id"] for w in whs}
+        cash_lines = []
+        for u in db.list_users():
+            own = db.warehouse_of(u["id"])
+            if own is None or own["id"] not in wh_ids or u["role"] == "admin":
+                continue
+            cash = db.cash_on_hand(u["id"])
+            if cash > 0:
+                cash_lines.append(f"💰 В кассе у {esc(u['name'])}: <b>{money(cash)}</b>")
+        if cash_lines:
+            text += "\n\n" + "\n".join(cash_lines)
         try:
             await bot.send_message(chat_id, "🌆 Итоги дня\n\n" + text, parse_mode="HTML")
         except Exception as e:
@@ -2619,6 +2752,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("act", act_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("minstock", minstock_cmd))
+    app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))
