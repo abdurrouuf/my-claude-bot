@@ -1,4 +1,5 @@
 # Телеграм-бот ВЕТОП: накладные, склады по регионам, долги клиентов.
+import asyncio
 import html
 import json
 import logging
@@ -6,7 +7,7 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from anthropic import AsyncAnthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -47,6 +48,10 @@ TRANSITION_HINT = (
 
 def transition_blocked(actor) -> bool:
     return TRANSITION_MODE and not is_admin(actor)
+
+
+# Час вечерней сводки по времени Бишкека (0-23)
+SUMMARY_HOUR = int(os.environ.get("SUMMARY_HOUR", "20"))
 
 ADMIN_ID = 632294583  # Абдурроууф
 
@@ -933,6 +938,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "📌 <b>Команды:</b>",
         "/stock — остатки склада",
         "/debts — долги клиентов",
+        "/report — отчёт (можно: /report неделя, /report Бишкек месяц)",
         "/price — прайс-лист",
         "/log — последние операции",
         "/undo — отменить свою последнюю операцию (15 минут)",
@@ -1070,6 +1076,122 @@ async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     name = " ".join(args[:-1])
     await start_payment(update, context, actor, {"client": name, "amount": amount})
+
+
+PERIODS = {
+    "день": (0, "за сегодня"), "сегодня": (0, "за сегодня"),
+    "неделя": (6, "за 7 дней"), "неделю": (6, "за 7 дней"),
+    "месяц": (29, "за 30 дней"),
+}
+
+
+def build_report(warehouses, days_back: int, label: str) -> str:
+    """Отчёт по складам: продажи, деньги, долги, топ товаров."""
+    start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    ops = db.operations_since(start.isoformat(timespec="seconds"))
+    lines = []
+    grand_sales = grand_money = 0
+    for wh in warehouses:
+        inv_data, pay_sum, transfers = [], 0.0, 0
+        for op in ops:
+            try:
+                data = json.loads(op["data"])
+            except (ValueError, TypeError):
+                continue
+            if op["type"] == "invoice" and op["warehouse_id"] == wh["id"]:
+                inv_data.append(data)
+            elif op["type"] == "payment" and op["warehouse_id"] == wh["id"]:
+                pay_sum += data.get("amount", 0)
+            elif op["type"] == "transfer" and wh["id"] in db.operation_warehouses(op):
+                transfers += 1
+        lines.append(f"📊 <b>«{esc(wh['name'])}» {esc(label)}</b>")
+        if not inv_data and not pay_sum and not transfers:
+            lines.append("— операций не было —")
+            lines.append("")
+            continue
+        sales = sum(d.get("total", 0) for d in inv_data)
+        inv_payments = sum(d.get("payment", 0) for d in inv_data)
+        money_recv = inv_payments + pay_sum
+        debt_added = sales - inv_payments
+        lines.append(f"🧾 Накладных: {len(inv_data)} на <b>{money(sales)}</b>")
+        lines.append(f"💵 Принято денег: <b>{money(money_recv)}</b>")
+        if debt_added > 0:
+            lines.append(f"📈 Выдано в долг: {money(debt_added)}")
+        if transfers:
+            lines.append(f"📦 Приходов/перемещений товара: {transfers}")
+        top = {}
+        for d in inv_data:
+            for it in d.get("items", []):
+                key = f"{it.get('name', '')} {it.get('volume', '')}".strip()
+                top[key] = top.get(key, 0) + (it.get("qty") or 0)
+        if top:
+            lines.append("🔝 Топ товаров:")
+            for i, (name, qty) in enumerate(
+                    sorted(top.items(), key=lambda x: -x[1])[:5], 1):
+                lines.append(f"  {i}. {esc(name)} — {qty} шт")
+        lines.append("")
+        grand_sales += sales
+        grand_money += money_recv
+    if len(warehouses) > 1:
+        lines.append(f"💰 <b>Итого {esc(label)}: продажи {money(grand_sales)}, "
+                     f"деньги {money(grand_money)}</b>")
+    return "\n".join(lines).strip()
+
+
+async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    days_back, label = 0, "за сегодня"
+    wh_words = []
+    for word in (context.args or []):
+        w = word.lower()
+        if w in PERIODS:
+            days_back, label = PERIODS[w]
+        else:
+            wh_words.append(word)
+    if wh_words:
+        wh = db.warehouse_by_name(" ".join(wh_words))
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(' '.join(wh_words))}» не найден или нет доступа.\n"
+                "Использование: /report [Склад] [день|неделя|месяц]",
+                parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    await send_long(update.message, build_report(whs, days_back, label))
+
+
+async def send_evening_summaries(bot):
+    """Вечерняя сводка дня в каждый чат-ленту (если были операции)."""
+    by_chat = {}
+    for wh in db.all_warehouses():
+        if wh["feed_chat_id"]:
+            by_chat.setdefault(wh["feed_chat_id"], []).append(wh)
+    for chat_id, whs in by_chat.items():
+        text = build_report(whs, 0, "за сегодня")
+        if "Накладных" not in text and "Приходов" not in text:
+            continue  # день без операций — не шумим
+        try:
+            await bot.send_message(chat_id, "🌆 Итоги дня\n\n" + text, parse_mode="HTML")
+        except Exception as e:
+            log.warning("Не удалось отправить сводку в %s: %s", chat_id, e)
+
+
+async def evening_summary_loop(app):
+    while True:
+        now = datetime.now(BISHKEK)
+        target = now.replace(hour=SUMMARY_HOUR, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            await send_evening_summaries(app.bot)
+        except Exception:
+            log.exception("Ошибка вечерней сводки")
 
 
 async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1447,9 +1569,13 @@ async def draft_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_text(update, context, actor, " ".join(context.args), draft=True)
 
 
+async def _post_init(app):
+    app.create_task(evening_summary_loop(app))
+
+
 if __name__ == "__main__":
     db.init(ADMIN_ID, WAREHOUSE_NAMES, STAFF)
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
     app.add_handler(CommandHandler("price", show_price))
@@ -1458,6 +1584,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("payment", payment_cmd))
     app.add_handler(CommandHandler("invoice", invoice_hint))
     app.add_handler(CommandHandler("draft", draft_cmd))
+    app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))

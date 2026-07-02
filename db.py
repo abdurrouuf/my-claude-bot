@@ -439,6 +439,14 @@ def last_done_operation(user_id: int):
     ).fetchone()
 
 
+def operations_since(start_iso: str):
+    """Проведённые операции начиная с даты (ISO), по возрастанию."""
+    return connect().execute(
+        "SELECT * FROM operations WHERE status='done' AND ts >= ? ORDER BY id",
+        (start_iso,),
+    ).fetchall()
+
+
 def recent_operations(limit: int = 10, user_id=None):
     conn = connect()
     if user_id is None:
