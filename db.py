@@ -170,6 +170,18 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
                                  (uid, aw["id"]))
 
 
+def backup_to(path: str):
+    """Целостная копия базы в файл (безопасно при WAL-режиме)."""
+    src = connect()
+    with _lock:
+        dst = sqlite3.connect(path)
+        try:
+            with dst:
+                src.backup(dst)
+        finally:
+            dst.close()
+
+
 # ---------- Пользователи ----------
 
 def get_user(uid: int):
