@@ -327,11 +327,15 @@ def generate_act_pdf(client_name, warehouse_name, rows, start_debt, end_debt,
 
 def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                          payment=0, is_payment=False, warehouse_name=None,
-                         draft=False, watermark=True) -> io.BytesIO:
+                         draft=False, watermark=True, doc_title=None,
+                         total_label=None, extra_totals=None) -> io.BytesIO:
     """Красивый PDF: логотип, таблица товаров, итоги.
 
     draft=True не меняет содержимое, только оформление: водяной знак и пометка
     в заголовке — и то лишь при watermark=True (переходный режим — без пометок).
+    doc_title/total_label/extra_totals позволяют строить производные документы
+    (например, возвратную накладную): extra_totals — список (подпись, сумма),
+    он заменяет стандартный блок долгов и оплат.
     """
     show_mark = draft and watermark
     font_name, font_bold_name = _register_fonts()
@@ -377,7 +381,7 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
         except Exception:
             pass
 
-    title = "НАКЛАДНАЯ (ЧЕРНОВИК)" if show_mark else "НАКЛАДНАЯ"
+    title = doc_title or ("НАКЛАДНАЯ (ЧЕРНОВИК)" if show_mark else "НАКЛАДНАЯ")
     story.append(Paragraph(title, title_style))
     story.append(Paragraph(datetime.now(BISHKEK).strftime("%d.%m.%Y"), sub_style))
     story.append(Paragraph(f"Контрагент: <b>{xml_escape(str(client_name))}</b>", sub_style))
@@ -429,9 +433,15 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
 
     story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))
     story.append(Spacer(1, 2*mm))
-    story.append(Paragraph(f"Сумма накладной: <b>{fmt_num(invoice_total)} сом</b>", total_style))
+    story.append(Paragraph(
+        f"{total_label or 'Сумма накладной'}: <b>{fmt_num(invoice_total)} сом</b>",
+        total_style))
 
-    if is_payment:
+    if extra_totals is not None:
+        for label, value in extra_totals:
+            story.append(Paragraph(f"{xml_escape(str(label))}: <b>{fmt_num(value)} сом</b>",
+                                   total_style))
+    elif is_payment:
         total_debt = invoice_total + prev_debt
         remainder = total_debt - payment
         if prev_debt > 0:
