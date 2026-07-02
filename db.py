@@ -570,6 +570,13 @@ def operations_since(start_iso: str):
     ).fetchall()
 
 
+def operations_all_since(start_iso: str):
+    """Все операции (включая отменённые) начиная с даты, по возрастанию."""
+    return connect().execute(
+        "SELECT * FROM operations WHERE ts >= ? ORDER BY id", (start_iso,)
+    ).fetchall()
+
+
 def recent_operations(limit: int = 10, user_id=None):
     conn = connect()
     if user_id is None:

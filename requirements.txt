@@ -1,3 +1,4 @@
 python-telegram-bot==20.3
 anthropic==0.40.0
 reportlab==4.1.0
+openpyxl==3.1.5
