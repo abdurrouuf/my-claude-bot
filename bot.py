@@ -27,7 +27,10 @@ log = logging.getLogger("vetop")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-5")
+# Haiku 4.5 в 5 раз дешевле Opus и отлично разбирает накладные по прайсу.
+# Если качество разбора не устроит — верните дорогую модель переменной
+# окружения CLAUDE_MODEL (например, claude-sonnet-4-5 или claude-opus-4-5).
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
 
 # Переходный режим: черновики выглядят как обычные накладные (без водяного
 # знака «ЧЕРНОВИК»), но базу по-прежнему не трогают. Когда полностью перейдёте
@@ -81,7 +84,7 @@ STAFF = {
 anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 chat_histories = {}
-HISTORY_LIMIT = 20
+HISTORY_LIMIT = 10  # история пересылается с каждым запросом — короче = дешевле
 
 # Неподтверждённые заявки (накладные/приходы/перемещения) до нажатия кнопки.
 PENDING = {}
@@ -198,20 +201,16 @@ async def feed_operation(context, op_id: int, actor_name: str, prefix: str, note
 
 
 # ---------- Системный промпт ----------
+# Разделён на две части ради кэширования (экономия ~90% на повторных чтениях):
+# статичная (правила + прайс, одинаковые для всех и помеченные cache_control)
+# и динамичная (дата, сотрудник, склады) — она идёт ПОСЛЕ статичной,
+# чтобы не ломать кэш-префикс.
 
-def build_system_prompt(actor) -> str:
-    own = db.warehouse_of(actor["id"])
-    own_name = own["name"] if own else "—"
-    visible = db.visible_warehouses(actor)
-    visible_names = ", ".join(f"«{w['name']}»" for w in visible) or "—"
-    transfer_allowed = can_transfer(actor)
-
+def _build_static_system() -> str:
     parts = []
     parts.append('Ты — помощник компании ОсОО «ВЕТОП», оптового поставщика ветеринарных препаратов. '
                  'Ты разбираешь сообщения сотрудников и превращаешь их в структурированные действия.')
-    parts.append(f"Сегодня: {datetime.now(BISHKEK).strftime('%d.%m.%Y')}. "
-                 f"Сотрудник: {actor['name']}. Его склад по умолчанию: «{own_name}». "
-                 f"Склады, доступные сотруднику: {visible_names}.")
+    parts.append('Данные о сегодняшней дате, сотруднике и складах — в отдельном системном блоке ниже.')
     parts.append("")
     parts.append("=== РЕЖИМ 1: ВОПРОСЫ О ПРАЙСЕ ===")
     parts.append("Отвечай на вопросы о ценах, фасовках, составе препаратов. Кратко и по делу, обычным текстом.")
@@ -232,12 +231,6 @@ def build_system_prompt(actor) -> str:
     parts.append('Если сообщение — только оплата без товаров («Асан приход 5000», «Асан оплатил 3000»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "payment", "client": "Имя контрагента", "amount": сумма, "warehouse": null}')
     parts.append('- "warehouse": имя склада, если явно указан («со склада Ош»), иначе null.')
-    all_whs = db.all_warehouses()
-    emp_lines = []
-    for u in db.list_users():
-        w = db.warehouse_of(u["id"])
-        if w:
-            emp_lines.append(f"- {u['name']} → склад «{w['name']}»")
     parts.append("")
     parts.append("=== РЕЖИМ 4: ПРИХОД / ПЕРЕМЕЩЕНИЕ ТОВАРА ===")
     parts.append('Если сообщение — пополнение склада товаром или перемещение между складами '
@@ -245,24 +238,21 @@ def build_system_prompt(actor) -> str:
                  '«с Бишкека на Каракол: ...», «нужно на Каракол: ...»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "transfer", "from_warehouse": null_или_имя_склада, "to_warehouse": "имя склада", '
                  '"items": [{"name": "...", "volume": "...", "qty": штук, "box_qty": коробок_или_null, "price": цена}]}')
-    parts.append('- Если назван сотрудник — подставь имя склада этого сотрудника в to_warehouse.')
+    parts.append('- Если назван сотрудник — подставь имя склада этого сотрудника в to_warehouse '
+                 '(список сотрудников и складов — в блоке ниже).')
     parts.append('- "from_warehouse" заполняй только при явном перемещении «с X на Y»; '
                  'приход товара извне (с завода/базы) — null.')
-    parts.append("Сотрудники и их склады по умолчанию:")
-    parts.extend(emp_lines)
-    parts.append("Все склады: " + ", ".join(f"«{w['name']}»" for w in all_whs))
-    parts.append("ВАЖНО: если первое слово — имя сотрудника из списка выше, это перемещение (transfer), а не накладная.")
-    if not transfer_allowed:
-        parts.append("Примечание: перемещение между складами проводит только админ — "
-                     "заявка сотрудника уйдёт ему на подтверждение, это нормально.")
-    if transfer_allowed:
-        parts.append("")
-        parts.append("=== РЕЖИМ 5: МИНИМАЛЬНЫЕ ОСТАТКИ (только админ и старшие) ===")
-        parts.append('Если сообщение задаёт неснижаемый остаток («минимум для Каракола: '
-                     'Альтопен 100мл 20 шт, Дексатоп 50мл 10 шт»), верни ТОЛЬКО JSON:')
-        parts.append('{"action": "set_min", "warehouse": "имя склада", '
-                     '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": число}]}')
-        parts.append('- qty: 0 означает убрать порог для товара.')
+    parts.append("ВАЖНО: если первое слово — имя сотрудника из списка в блоке ниже, "
+                 "это перемещение (transfer), а не накладная.")
+    parts.append("Перемещение между складами проводит только админ — заявка обычного "
+                 "сотрудника уйдёт ему на подтверждение, это нормально.")
+    parts.append("")
+    parts.append("=== РЕЖИМ 5: МИНИМАЛЬНЫЕ ОСТАТКИ (только админ и старшие) ===")
+    parts.append('Если сообщение задаёт неснижаемый остаток («минимум для Каракола: '
+                 'Альтопен 100мл 20 шт, Дексатоп 50мл 10 шт»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "set_min", "warehouse": "имя склада", '
+                 '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": число}]}')
+    parts.append('- qty: 0 означает убрать порог для товара.')
     parts.append("")
     parts.append("=== РЕЖИМ 6: ИНВЕНТАРИЗАЦИЯ ===")
     parts.append('Если сообщение — пересчёт фактических остатков («инвентаризация: '
@@ -272,14 +262,13 @@ def build_system_prompt(actor) -> str:
                  '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": фактическое_количество}]}')
     parts.append('- qty — сколько товара РЕАЛЬНО насчитали на складе (может быть 0).')
     parts.append('- Здесь коробки тоже переводи в штуки по прайсу.')
-    if transfer_allowed:
-        parts.append("")
-        parts.append("=== РЕЖИМ 7: СПЕЦЦЕНЫ КЛИЕНТА (только админ и старшие) ===")
-        parts.append('Если сообщение задаёт индивидуальную цену («цена для Асана: '
-                     'Альтопен 100мл 85», «спеццена для Асана ...»), верни ТОЛЬКО JSON:')
-        parts.append('{"action": "set_price", "client": "Имя", "warehouse": null, '
-                     '"items": [{"name": "точное название из прайса", "volume": "фасовка", "price": цена}]}')
-        parts.append('- price: 0 означает убрать спеццену (вернётся цена прайса).')
+    parts.append("")
+    parts.append("=== РЕЖИМ 7: СПЕЦЦЕНЫ КЛИЕНТА (только админ и старшие) ===")
+    parts.append('Если сообщение задаёт индивидуальную цену («цена для Асана: '
+                 'Альтопен 100мл 85», «спеццена для Асана ...»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "set_price", "client": "Имя", "warehouse": null, '
+                 '"items": [{"name": "точное название из прайса", "volume": "фасовка", "price": цена}]}')
+    parts.append('- price: 0 означает убрать спеццену (вернётся цена прайса).')
     parts.append("")
     parts.append("=== РЕЖИМ 8: ВОЗВРАТ ТОВАРА ОТ КЛИЕНТА ===")
     parts.append('Если клиент возвращает товар («возврат от Асана: Альтопен 100мл 5 шт»), '
@@ -324,6 +313,39 @@ def build_system_prompt(actor) -> str:
     return "\n".join(parts)
 
 
+# Строится один раз: байт-в-байт одинаковый для всех запросов — иначе кэш не работает.
+STATIC_SYSTEM = _build_static_system()
+
+
+def build_dynamic_system(actor) -> str:
+    """Маленький изменяемый блок: дата, сотрудник, склады."""
+    own = db.warehouse_of(actor["id"])
+    visible = db.visible_warehouses(actor)
+    role = {"admin": "админ", "senior": "старший"}.get(actor["role"], "обычный сотрудник")
+    lines = [
+        f"Сегодня: {datetime.now(BISHKEK).strftime('%d.%m.%Y')}.",
+        f"Сотрудник: {actor['name']} (роль: {role}).",
+        f"Его склад по умолчанию: «{own['name'] if own else '—'}».",
+        "Склады, доступные сотруднику: "
+        + (", ".join(f"«{w['name']}»" for w in visible) or "—") + ".",
+        "Сотрудники и их склады по умолчанию:",
+    ]
+    for u in db.list_users():
+        w = db.warehouse_of(u["id"])
+        if w:
+            lines.append(f"- {u['name']} → склад «{w['name']}»")
+    lines.append("Все склады: " + ", ".join(f"«{w['name']}»" for w in db.all_warehouses()))
+    return "\n".join(lines)
+
+
+def system_blocks(actor) -> list:
+    """Системный промпт с кэшированием статичной части (~90% скидка на чтениях)."""
+    return [
+        {"type": "text", "text": STATIC_SYSTEM, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": build_dynamic_system(actor)},
+    ]
+
+
 def extract_action(reply: str):
     """Достаёт из ответа модели первый JSON-объект с полем action."""
     decoder = json.JSONDecoder()
@@ -339,11 +361,11 @@ def extract_action(reply: str):
     return None
 
 
-async def ask_claude(history: list, system: str) -> str:
+async def ask_claude(history: list, actor) -> str:
     resp = await anthropic_client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=1500,
-        system=system,
+        system=system_blocks(actor),
         messages=history,
     )
     return resp.content[0].text.strip()
@@ -1649,7 +1671,7 @@ async def process_text(update, context, actor, text, draft=False):
 
     await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        reply = await ask_claude(chat_histories[chat_id], build_system_prompt(actor))
+        reply = await ask_claude(chat_histories[chat_id], actor)
     except Exception as e:
         log.exception("Claude API error")
         await update.message.reply_text(f"⚠️ Ошибка при обращении к ИИ: {e}")
@@ -1757,7 +1779,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         resp = await anthropic_client.messages.create(
             model=CLAUDE_MODEL, max_tokens=1500,
-            system=build_system_prompt(actor), messages=messages)
+            system=system_blocks(actor), messages=messages)
         reply = resp.content[0].text.strip()
     except Exception as e:
         log.exception("Claude API error (photo)")
