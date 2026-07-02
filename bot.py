@@ -60,6 +60,9 @@ DEBT_ALERT_DAYS = int(os.environ.get("DEBT_ALERT_DAYS", "30"))
 # Час ежедневного бэкапа базы админу в личку (по Бишкеку)
 BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "3"))
 
+# Товар считается «мёртвым», если не продавался столько дней
+DEADSTOCK_DAYS = int(os.environ.get("DEADSTOCK_DAYS", "60"))
+
 ADMIN_ID = 632294583  # Абдурроууф
 
 # Рабочие склады компании
@@ -1830,6 +1833,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debts — долги клиентов",
         "/report — отчёт (можно: /report неделя, /report Бишкек месяц)",
         "/olddebts — кто давно не платил (можно: /olddebts 45)",
+        "/deadstock — залежавшийся товар · /forecast — что скоро закончится",
         "/client Имя — карточка клиента (долг, история)",
         "/act Имя — акт сверки в PDF",
         "/price — прайс-лист",
@@ -2287,6 +2291,198 @@ async def act_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=InputFile(pdf, filename=filename),
         caption=f"📄 Акт сверки: {c['name']} — долг {fmt_num(c['debt'])} сом")
+
+
+def _cutoff_iso(days: int) -> str:
+    return (datetime.now(BISHKEK) - timedelta(days=days)).replace(
+        hour=0, minute=0, second=0, microsecond=0).isoformat(timespec="seconds")
+
+
+def sales_by_warehouse(days: int) -> dict:
+    """Продажи за период по журналу: {wh_id: {product_id: продано_шт}}."""
+    sold = {}
+    for op in db.operations_since(_cutoff_iso(days)):
+        if op["type"] != "invoice":
+            continue
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        for wh_id, pid, delta in data.get("stock_deltas", []):
+            if delta < 0:
+                sold.setdefault(wh_id, {})[pid] = sold.get(wh_id, {}).get(pid, 0) - delta
+    return sold
+
+
+def arrivals_by_warehouse(days: int) -> dict:
+    """Недавние поступления (приход/перемещение/инвентаризация +): {wh_id: {pid}}."""
+    arrived = {}
+    for op in db.operations_since(_cutoff_iso(days)):
+        if op["type"] not in ("transfer", "inventory"):
+            continue
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        for wh_id, pid, delta in data.get("stock_deltas", []):
+            if delta > 0:
+                arrived.setdefault(wh_id, set()).add(pid)
+    return arrived
+
+
+def build_deadstock(warehouses, days: int) -> str:
+    """Товар с остатком, который не продавался days+ дней."""
+    sold_all = sales_by_warehouse(days)
+    recent_arrivals = arrivals_by_warehouse(21)  # свежий приход — рано судить
+    lines = [f"🧊 <b>Мёртвый товар — без продаж {days}+ дней</b>"]
+    grand_frozen = 0.0
+    found = False
+    for wh in warehouses:
+        smap = db.stock_map(wh["id"])
+        sold = sold_all.get(wh["id"], {})
+        arrived = recent_arrivals.get(wh["id"], set())
+        rows = []
+        for p in prices.PRICE_LIST_DATA:
+            qty = smap.get(p["id"], 0)
+            if qty <= 0 or sold.get(p["id"], 0) > 0 or p["id"] in arrived:
+                continue
+            value = qty * p["price"]
+            sellers = [w for w in db.all_warehouses()
+                       if w["id"] != wh["id"] and sold_all.get(w["id"], {}).get(p["id"], 0) > 0]
+            rows.append((value, p, qty, sellers))
+        if not rows:
+            continue
+        found = True
+        lines.append("")
+        lines.append(f"🏬 <b>Склад «{esc(wh['name'])}»</b>")
+        subtotal = 0.0
+        for value, p, qty, sellers in sorted(rows, key=lambda r: -r[0]):
+            hint = ""
+            if sellers:
+                hint = " · продаётся в " + ", ".join(f"«{esc(w['name'])}»" for w in sellers[:2])
+            lines.append(f"• {esc(p['name'])} {esc(p['volume'])} — {qty} шт "
+                         f"(<b>{money(value)}</b>){hint}")
+            subtotal += value
+        lines.append(f"💰 Заморожено: <b>{money(subtotal)}</b>")
+        grand_frozen += subtotal
+    if not found:
+        return ""
+    if len(warehouses) > 1:
+        lines.append("")
+        lines.append(f"🧊 Всего заморожено: <b>{money(grand_frozen)}</b>")
+    lines.append("")
+    lines.append("💡 Залежавшееся можно перекинуть туда, где оно продаётся: "
+                 "«с Манаса на Каракол: ...»")
+    return "\n".join(lines)
+
+
+FORECAST_WINDOW = 14   # скорость продаж считаем за 2 недели
+FORECAST_HORIZON = 14  # показываем то, чего хватит менее чем на 2 недели
+
+
+def build_forecast(warehouses) -> str:
+    """Прогноз: чего хватит менее чем на FORECAST_HORIZON дней."""
+    sold_all = sales_by_warehouse(FORECAST_WINDOW)
+    lines = [f"⏳ <b>Скоро закончится (при продажах последних {FORECAST_WINDOW} дней)</b>"]
+    found = False
+    for wh in warehouses:
+        sold = sold_all.get(wh["id"], {})
+        if not sold:
+            continue
+        smap = db.stock_map(wh["id"])
+        rows = []
+        for pid, sold_qty in sold.items():
+            qty = smap.get(pid, 0)
+            p = prices.BY_ID.get(pid)
+            if p is None or qty < 0:
+                continue
+            days_left = qty / (sold_qty / FORECAST_WINDOW)
+            if days_left <= FORECAST_HORIZON:
+                rows.append((days_left, p, qty, sold_qty))
+        if not rows:
+            continue
+        found = True
+        lines.append("")
+        lines.append(f"🏬 <b>Склад «{esc(wh['name'])}»</b>")
+        for days_left, p, qty, sold_qty in sorted(rows, key=lambda r: r[0]):
+            when = "уже закончился!" if qty <= 0 else f"хватит на ≈{max(int(days_left), 0)} дн."
+            lines.append(f"• {esc(p['name'])} {esc(p['volume'])} — {qty} шт, {when} "
+                         f"(продано {sold_qty} шт за {FORECAST_WINDOW} дн.)")
+    if not found:
+        return ""
+    return "\n".join(lines)
+
+
+async def deadstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    days = DEADSTOCK_DAYS
+    wh_words = []
+    for word in (context.args or []):
+        if word.isdigit():
+            days = max(7, int(word))
+        else:
+            wh_words.append(word)
+    if wh_words:
+        wh = db.warehouse_by_name(" ".join(wh_words))
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text("Склад не найден или нет доступа.")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    text = build_deadstock(whs, days)
+    if not text:
+        await update.message.reply_text(
+            f"🎉 Мёртвого товара нет — всё с остатком продавалось за последние {days} дней "
+            f"(свежие поступления не считаются).")
+        return
+    await send_long(update.message, text)
+
+
+async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if arg:
+        wh = db.warehouse_by_name(arg)
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text("Склад не найден или нет доступа.")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    text = build_forecast(whs)
+    if not text:
+        await update.message.reply_text(
+            f"✅ Ничего не заканчивается: всех продаваемых товаров хватит более чем на "
+            f"{FORECAST_HORIZON} дней.")
+        return
+    await send_long(update.message, text)
+
+
+async def monthly_deadstock_loop(app):
+    """Первого числа каждого месяца в 09:00 — отчёт админу."""
+    while True:
+        now = datetime.now(BISHKEK)
+        if now.month == 12:
+            target = now.replace(year=now.year + 1, month=1, day=1,
+                                 hour=9, minute=0, second=0, microsecond=0)
+        else:
+            target = now.replace(month=now.month + 1, day=1,
+                                 hour=9, minute=0, second=0, microsecond=0)
+        first_this = now.replace(day=1, hour=9, minute=0, second=0, microsecond=0)
+        if first_this > now:
+            target = first_this
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            text = build_deadstock(db.all_warehouses(), DEADSTOCK_DAYS)
+            if text:
+                await app.bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+        except Exception:
+            log.exception("Ошибка отчёта о мёртвом товаре")
 
 
 def build_overdue(warehouses, min_days: int) -> str:
@@ -2835,6 +3031,7 @@ async def _post_init(app):
     app.create_task(evening_summary_loop(app))
     app.create_task(weekly_debt_loop(app))
     app.create_task(daily_backup_loop(app))
+    app.create_task(monthly_deadstock_loop(app))
 
 
 if __name__ == "__main__":
@@ -2851,6 +3048,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("draft", draft_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
+    app.add_handler(CommandHandler("deadstock", deadstock_cmd))
+    app.add_handler(CommandHandler("forecast", forecast_cmd))
     app.add_handler(CommandHandler("client", client_cmd))
     app.add_handler(CommandHandler("act", act_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
