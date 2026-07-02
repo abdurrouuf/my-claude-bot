@@ -27,10 +27,10 @@ log = logging.getLogger("vetop")
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
-# Haiku 4.5 в 5 раз дешевле Opus и отлично разбирает накладные по прайсу.
-# Если качество разбора не устроит — верните дорогую модель переменной
-# окружения CLAUDE_MODEL (например, claude-sonnet-4-5 или claude-opus-4-5).
-CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-haiku-4-5")
+# Sonnet 5: сильная модель по цене $2/$10 за млн токенов (акция до 31.08.2026,
+# потом $3/$15) — в 2.5 раза дешевле Opus. Переопределяется переменной
+# окружения CLAUDE_MODEL (например, claude-haiku-4-5 — ещё дешевле).
+CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 
 # Переходный режим: черновики выглядят как обычные накладные (без водяного
 # знака «ЧЕРНОВИК»), но базу по-прежнему не трогают. Когда полностью перейдёте
@@ -361,14 +361,20 @@ def extract_action(reply: str):
     return None
 
 
+def _response_text(resp) -> str:
+    """Текст ответа. У Sonnet 5 первым блоком может идти размышление —
+    берём первый текстовый блок, а не content[0]."""
+    return next((b.text for b in resp.content if b.type == "text"), "").strip()
+
+
 async def ask_claude(history: list, actor) -> str:
     resp = await anthropic_client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=1500,
+        max_tokens=2500,  # запас на размышления Sonnet 5 + длинный JSON
         system=system_blocks(actor),
         messages=history,
     )
-    return resp.content[0].text.strip()
+    return _response_text(resp)
 
 
 # ---------- Разбор позиций ----------
@@ -1778,9 +1784,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = history[-HISTORY_LIMIT:] + [{"role": "user", "content": content}]
     try:
         resp = await anthropic_client.messages.create(
-            model=CLAUDE_MODEL, max_tokens=1500,
+            model=CLAUDE_MODEL, max_tokens=2500,
             system=system_blocks(actor), messages=messages)
-        reply = resp.content[0].text.strip()
+        reply = _response_text(resp)
     except Exception as e:
         log.exception("Claude API error (photo)")
         await update.message.reply_text(f"⚠️ Ошибка при распознавании фото: {e}")
