@@ -220,7 +220,7 @@ def generate_price_pdf(price_data) -> io.BytesIO:
 
 
 def generate_act_pdf(client_name, warehouse_name, rows, start_debt, end_debt,
-                     period_label) -> io.BytesIO:
+                     period_label, client_phone=None) -> io.BytesIO:
     """Акт сверки: дата, документ, товар (+), оплата (−), долг после."""
     from reportlab.lib.pagesizes import A4
 
@@ -259,6 +259,8 @@ def generate_act_pdf(client_name, warehouse_name, rows, start_debt, end_debt,
     story.append(Paragraph("АКТ СВЕРКИ ВЗАИМОРАСЧЁТОВ", title_style))
     story.append(Spacer(1, 2*mm))
     story.append(Paragraph(f"ОсОО «ВЕТОП» — <b>{xml_escape(str(client_name))}</b>", sub_style))
+    if client_phone:
+        story.append(Paragraph(f"Тел. клиента: {xml_escape(str(client_phone))}", sub_style))
     story.append(Paragraph(f"Склад: {xml_escape(str(warehouse_name))}", sub_style))
     story.append(Paragraph(f"Период: {xml_escape(str(period_label))}", sub_style))
     story.append(Paragraph(

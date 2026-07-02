@@ -216,8 +216,10 @@ def build_system_prompt(actor) -> str:
     parts.append("=== РЕЖИМ 2: НАКЛАДНАЯ ===")
     parts.append("Когда сотрудник перечисляет клиента и товары — верни ТОЛЬКО JSON, без пояснений и без ```:")
     parts.append('{"action": "invoice", "client": "Имя контрагента", "warehouse": null, "debt": 0, "payment": 0, '
+                 '"phone": null, '
                  '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": количество_в_штуках, '
                  '"box_qty": количество_коробок_или_null, "price": цена_из_прайса}]}')
+    parts.append('- "phone": если сотрудник указал телефон клиента — строкой, иначе null.')
     parts.append('- "warehouse": если сотрудник явно написал «со склада X» — подставь точное имя склада X, иначе null.')
     parts.append('- "debt": заполняй ТОЛЬКО если сотрудник сам явно указал долг числом (например «долг 31470»). '
                  'Старый долг существующих клиентов бот подставит из базы автоматически — не выдумывай его.')
@@ -285,6 +287,11 @@ def build_system_prompt(actor) -> str:
     parts.append('- price бери из прайса; если сотрудник сам явно написал цену возврата '
                  '(например «по 85») — поставь её и "price_explicit": true.')
     parts.append('- Коробки переводи в штуки как обычно. Возврат подтверждает админ.')
+    parts.append("")
+    parts.append("=== РЕЖИМ 10: ТЕЛЕФОН КЛИЕНТА ===")
+    parts.append('Если сообщение сохраняет номер клиента («телефон Асана: 0700 12 34 56», '
+                 '«номер Асана 0555443322»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "set_phone", "client": "Имя", "phone": "номер строкой", "warehouse": null}')
     parts.append("")
     parts.append("=== РЕЖИМ 9: СДАЧА ВЫРУЧКИ (ИНКАССАЦИЯ) ===")
     parts.append('Если сотрудник сдаёт наличные руководителю («сдал 50000», «сдаю выручку '
@@ -464,13 +471,15 @@ def commit_invoice(p):
     cid = p["client_id"]
     create = None
     if cid is None:
-        create = (p["wh_id"], p["client_name"], p["parsed_debt"])
+        create = (p["wh_id"], p["client_name"], p["parsed_debt"], p.get("phone"))
         old_debt = p["parsed_debt"]
         client_label = p["client_name"]
     else:
         c = db.client_get(cid)
         old_debt = c["debt"]
         client_label = c["name"]
+        if p.get("phone"):
+            db.client_set_phone(cid, p["phone"])
     stock_deltas = [(p["wh_id"], it["product_id"], -it["qty"])
                     for it in p["items"] if it.get("product_id")]
     debt_delta = total - p["payment"]
@@ -524,6 +533,7 @@ async def start_invoice(update, context, actor, data, draft=False):
         return
     payment = float(data.get("payment") or 0)
     parsed_debt = float(data.get("debt") or 0)
+    phone = str(data.get("phone") or "").strip() or None
 
     if draft:
         c = db.client_exact(wh["id"], client_name)
@@ -541,7 +551,7 @@ async def start_invoice(update, context, actor, data, draft=False):
         "wh_id": wh["id"], "wh_name": wh["name"],
         "client_name": client_name, "client_id": None,
         "items": items, "warnings": warnings,
-        "payment": payment, "parsed_debt": parsed_debt,
+        "payment": payment, "parsed_debt": parsed_debt, "phone": phone,
     }
 
     exact = db.client_exact(wh["id"], client_name)
@@ -571,6 +581,49 @@ async def start_invoice(update, context, actor, data, draft=False):
                 f"Создать нового?")
     await update.message.reply_text(text, parse_mode="HTML",
                                     reply_markup=InlineKeyboardMarkup(rows))
+
+
+# ---------- Телефон клиента ----------
+
+def _clean_phone(raw: str):
+    phone = re.sub(r"[^\d+]", "", str(raw or ""))
+    return phone if len(re.sub(r"\D", "", phone)) >= 6 else None
+
+
+async def start_set_phone(update, context, actor, data):
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    client_name = str(data.get("client") or "").strip()
+    phone = _clean_phone(data.get("phone"))
+    if not client_name or not phone:
+        await update.message.reply_text(
+            "Не понял клиента или номер. Пример: «телефон Асана: 0700 12 34 56»")
+        return
+    exact = db.client_exact(wh["id"], client_name)
+    if exact:
+        db.client_set_phone(exact["id"], phone)
+        await update.message.reply_text(
+            f"✅ Телефон клиента <b>{esc(exact['name'])}</b>: {esc(phone)}", parse_mode="HTML")
+        return
+    candidates = db.fuzzy_clients(wh["id"], client_name)
+    if not candidates:
+        await update.message.reply_text(
+            f"❌ Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}».",
+            parse_mode="HTML")
+        return
+    payload = {"kind": "set_phone", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id,
+               "wh_id": wh["id"], "wh_name": wh["name"],
+               "client_name": client_name, "client_id": None, "phone": phone}
+    token = new_pending(payload)
+    rows = [[InlineKeyboardButton(f"👤 {c['name']}", callback_data=f"pk:{token}:{c['id']}")]
+            for c in candidates]
+    rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+    await update.message.reply_text(
+        f"Клиент «<b>{esc(client_name)}</b>» не найден. Кому сохранить номер {esc(phone)}?",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
 
 
 # ---------- Касса и инкассация ----------
@@ -1418,6 +1471,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "pk":  # выбран существующий клиент
         p["client_id"] = int(parts[2])
         await q.answer()
+        if p["kind"] == "set_phone":
+            PENDING.pop(token, None)
+            c = db.client_get(p["client_id"])
+            db.client_set_phone(c["id"], p["phone"])
+            await q.edit_message_text(
+                f"✅ Телефон клиента «{esc(c['name'])}»: {esc(p['phone'])}", parse_mode="HTML")
+            return
         if p["kind"] == "return":
             apply_client_prices(p)
             requester = db.get_user(p["user_id"])
@@ -1620,6 +1680,8 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_return(update, context, actor, data)
         elif action == "handover":
             await start_handover(update, context, actor, data)
+        elif action == "set_phone":
+            await start_set_phone(update, context, actor, data)
         else:
             await update.message.reply_text(reply)
     except Exception as e:
@@ -1785,6 +1847,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🔙 <b>Возврат товара</b> (подтверждает админ):",
         "<i>возврат от Асана: Альтопен 100мл 5 шт</i>",
         "💰 <b>Сдать выручку</b>: <i>сдал 50000</i> · /cash — ваша касса",
+        "📞 <b>Телефон клиента</b>: <i>телефон Асана: 0700 12 34 56</i>",
     ]
     if can_transfer(actor):
         lines += [
@@ -2151,6 +2214,10 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows, start_debt = client_statement(c["id"])
     now = datetime.now(BISHKEK)
     lines = [f"👤 <b>{esc(c['name'])}</b> · склад «{esc(wh['name'])}»"]
+    if c["phone"]:
+        lines.append(f"📞 {esc(c['phone'])}")
+    else:
+        lines.append(f"📞 нет номера — сохранить: «телефон {esc(c['name'])}: 0700...»")
     if c["debt"] > 0:
         lines.append(f"⚠️ Текущий долг: <b>{money(c['debt'])}</b>")
     elif c["debt"] < 0:
@@ -2214,7 +2281,8 @@ async def act_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         period = f"{rows[0][0]} — {datetime.now(BISHKEK).strftime('%d.%m.%Y')}"
     else:
         period = "операций не было"
-    pdf = generate_act_pdf(c["name"], wh["name"], rows, start_debt, c["debt"], period)
+    pdf = generate_act_pdf(c["name"], wh["name"], rows, start_debt, c["debt"], period,
+                           client_phone=c["phone"])
     filename = f"акт_сверки_{safe_filename(c['name'])}_{datetime.now(BISHKEK).strftime('%d%m%Y')}.pdf"
     await update.message.reply_document(
         document=InputFile(pdf, filename=filename),
@@ -2247,7 +2315,8 @@ def build_overdue(warehouses, min_days: int) -> str:
         for days, c, has_paid in sorted(rows, key=lambda r: -(r[0] if r[0] is not None else 10**6)):
             age = f"{days} дн. без оплат" if days is not None else "давно (дата неизвестна)"
             mark = "" if has_paid else " — ни одной оплаты"
-            lines.append(f"👤 {esc(c['name'])}: <b>{money(c['debt'])}</b> · {age}{mark}")
+            phone = f" · 📞 {esc(c['phone'])}" if c["phone"] else ""
+            lines.append(f"👤 {esc(c['name'])}: <b>{money(c['debt'])}</b> · {age}{mark}{phone}")
             found += 1
             total += c["debt"]
     if not found:

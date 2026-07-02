@@ -71,6 +71,7 @@ CREATE TABLE IF NOT EXISTS clients(
     warehouse_id INTEGER NOT NULL,
     name         TEXT NOT NULL COLLATE NOCASEU,
     debt         REAL NOT NULL DEFAULT 0,
+    phone        TEXT,
     UNIQUE(warehouse_id, name)
 );
 CREATE TABLE IF NOT EXISTS client_prices(
@@ -149,6 +150,8 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
         conn.executescript(SCHEMA)
         if "default_wh" not in _columns(conn, "users"):
             conn.execute("ALTER TABLE users ADD COLUMN default_wh INTEGER")
+        if "phone" not in _columns(conn, "clients"):
+            conn.execute("ALTER TABLE clients ADD COLUMN phone TEXT")
         if "feed_chat_id" not in _columns(conn, "warehouses") and \
            "owner_id" not in _columns(conn, "warehouses"):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_id INTEGER")
@@ -498,6 +501,12 @@ def client_prices_map(cid: int) -> dict:
     return {r["product_id"]: r["price"] for r in rows}
 
 
+def client_set_phone(cid: int, phone):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("UPDATE clients SET phone=? WHERE id=?", (phone or None, cid))
+
+
 def fuzzy_clients(wh_id: int, name: str, n: int = 3):
     """Похожие клиенты внутри склада (региона)."""
     rows = clients_of(wh_id)
@@ -523,10 +532,11 @@ def commit_operation(user_id: int, op_type: str, warehouse_id, client_id,
     with _lock, conn:
         new_cid = None
         if create_client:
-            c_wh, c_name, c_debt = create_client
+            c_wh, c_name, c_debt = create_client[:3]
+            c_phone = create_client[3] if len(create_client) > 3 else None
             cur = conn.execute(
-                "INSERT INTO clients(warehouse_id, name, debt) VALUES(?,?,?)",
-                (c_wh, c_name.strip(), c_debt),
+                "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,?,?)",
+                (c_wh, c_name.strip(), c_debt, c_phone or None),
             )
             new_cid = cur.lastrowid
         if client_id is None:
