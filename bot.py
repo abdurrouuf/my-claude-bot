@@ -32,6 +32,22 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-opus-4-5")
 # на учёт через бота — поставьте на Railway переменную DRAFT_WATERMARK=1.
 DRAFT_WATERMARK = os.environ.get("DRAFT_WATERMARK", "0") == "1"
 
+# Переходный период: сотрудникам доступны ТОЛЬКО черновики и вопросы о прайсе.
+# Накладные, оплаты, перемещения и создание клиентов заблокированы (админу — нет).
+# Когда база будет готова — поставьте на Railway переменную TRANSITION_MODE=0.
+TRANSITION_MODE = os.environ.get("TRANSITION_MODE", "1") == "1"
+
+TRANSITION_HINT = (
+    "⏳ Идёт настройка базы данных — бот пока работает только в режиме черновика.\n\n"
+    "Добавьте слово «черновик» в начало сообщения:\n"
+    "черновик: Асан, Албенивер 200мл 1к, долг 31470, приход 5000\n\n"
+    "Придёт готовая PDF-накладная, ничего в базу не запишется."
+)
+
+
+def transition_blocked(actor) -> bool:
+    return TRANSITION_MODE and not is_admin(actor)
+
 ADMIN_ID = 632294583  # Абдурроууф
 
 # Рабочие склады компании
@@ -421,6 +437,9 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total, d
 
 
 async def start_invoice(update, context, actor, data, draft=False):
+    if not draft and transition_blocked(actor):
+        await update.message.reply_text(TRANSITION_HINT)
+        return
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
@@ -538,6 +557,9 @@ def commit_payment(p):
 
 
 async def start_payment(update, context, actor, data):
+    if transition_blocked(actor):
+        await update.message.reply_text(TRANSITION_HINT)
+        return
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
@@ -637,6 +659,9 @@ def commit_transfer(p):
 
 
 async def start_transfer(update, context, actor, data):
+    if transition_blocked(actor):
+        await update.message.reply_text(TRANSITION_HINT)
+        return
     to_name = str(data.get("to_warehouse") or "").strip()
     to_wh = db.warehouse_by_name(to_name) if to_name else None
     if to_wh is None:
@@ -888,6 +913,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "👋 Привет! Я бот компании <b>ВЕТОП</b> 🐄💊",
         f"Ваш склад: <b>{esc(own['name']) if own else '—'}</b>",
         "",
+    ]
+    if transition_blocked(actor):
+        lines += [
+            "⏳ <b>Сейчас переходный период</b> — работаем только черновиками:",
+            "<i>черновик: Асан, Албенивер 200мл 1к, долг 31470</i>",
+            "Придёт PDF-накладная для клиента, база не меняется.",
+            "Ещё можно спрашивать цены: <i>сколько стоит Альтопен 1л?</i> и /price",
+            "",
+            "Остальные функции откроются после настройки базы:",
+        ]
+    lines += [
         "📋 <b>Накладная</b> — просто напишите:",
         "<i>Асан, Албенивер 200мл 1к, Дексатоп 50мл 5 шт</i>",
         "С другого склада: <i>со склада Ош: Асан, ...</i>",
