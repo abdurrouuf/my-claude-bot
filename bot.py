@@ -57,6 +57,9 @@ def transition_blocked(actor) -> bool:
 # Час вечерней сводки по времени Бишкека (0-23)
 SUMMARY_HOUR = int(os.environ.get("SUMMARY_HOUR", "20"))
 
+# Час вечерней сводки по черновикам админу в личку (переходный период)
+DRAFT_SUMMARY_HOUR = int(os.environ.get("DRAFT_SUMMARY_HOUR", "19"))
+
 # Долг считается «старым», если клиент не платил столько дней
 DEBT_ALERT_DAYS = int(os.environ.get("DEBT_ALERT_DAYS", "30"))
 
@@ -638,6 +641,7 @@ async def start_invoice(update, context, actor, data, draft=False):
             apply_client_prices({"client_id": c["id"], "items": items})
         total = sum(it["qty"] * it["price"] for it in items)
         p = {"items": items, "payment": payment, "wh_name": wh["name"]}
+        db.log_draft(actor["id"], c["name"] if c else client_name, total)
         await send_invoice_pdf(context, update.effective_chat.id,
                                c["name"] if c else client_name, p, old_debt, total, draft=True)
         return
@@ -2091,6 +2095,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/export — Excel: операции, долги, остатки, кассы "
             "(можно: /export неделя, /export все)",
             "/api — расходы на ИИ и остаток на счёте (задать: /apibalance 50)",
+            "/drafts — черновики за сегодня по сотрудникам "
+            "(сводка сама приходит в 19:00)",
             "/minstock — пороги «заканчивается товар» "
             "(задать: «минимум для Каракола: Альтопен 100мл 20 шт»)",
             "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
@@ -2336,6 +2342,46 @@ async def send_evening_summaries(bot):
             await bot.send_message(chat_id, "🌆 Итоги дня\n\n" + text, parse_mode="HTML")
         except Exception as e:
             log.warning("Не удалось отправить сводку в %s: %s", chat_id, e)
+
+
+def build_draft_summary() -> str | None:
+    """Сводка по черновикам за сегодня; None, если черновиков не было."""
+    today = datetime.now(BISHKEK).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = db.drafts_since(today.isoformat(timespec="seconds"))
+    if not rows:
+        return None
+    lines = [f"📝 <b>Черновики за {today.strftime('%d.%m.%Y')}</b>", ""]
+    total_n, total_sum = 0, 0.0
+    for r in rows:
+        lines.append(f"• {esc(r['name'])}: {r['n']} шт. — <b>{money(r['total'])}</b>")
+        total_n += r["n"]
+        total_sum += r["total"]
+    lines += ["", f"Итого: {total_n} шт. на <b>{money(total_sum)}</b>"]
+    return "\n".join(lines)
+
+
+async def draft_summary_loop(app):
+    """Каждый вечер в DRAFT_SUMMARY_HOUR — сводка по черновикам админу в личку."""
+    while True:
+        now = datetime.now(BISHKEK)
+        target = now.replace(hour=DRAFT_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            text = build_draft_summary()
+            if text:
+                await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+        except Exception:
+            log.exception("Ошибка сводки по черновикам")
+
+
+async def drafts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    text = build_draft_summary()
+    await update.message.reply_text(
+        text or "📝 Сегодня черновиков ещё не было.", parse_mode="HTML")
 
 
 async def evening_summary_loop(app):
@@ -3309,6 +3355,7 @@ async def _post_init(app):
     app.create_task(weekly_debt_loop(app))
     app.create_task(daily_backup_loop(app))
     app.create_task(monthly_deadstock_loop(app))
+    app.create_task(draft_summary_loop(app))
 
 
 if __name__ == "__main__":
@@ -3334,6 +3381,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("api", api_cmd))
+    app.add_handler(CommandHandler("drafts", drafts_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
