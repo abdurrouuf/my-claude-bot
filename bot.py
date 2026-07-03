@@ -43,9 +43,9 @@ DRAFT_WATERMARK = os.environ.get("DRAFT_WATERMARK", "0") == "1"
 TRANSITION_MODE = os.environ.get("TRANSITION_MODE", "1") == "1"
 
 TRANSITION_HINT = (
-    "⏳ Идёт настройка базы данных — бот пока работает только в режиме черновика.\n\n"
-    "Добавьте слово «черновик» в начало сообщения:\n"
-    "черновик: Асан, Албенивер 200мл 1к, долг 31470, приход 5000\n\n"
+    "⏳ Идёт настройка базы данных — эта операция пока недоступна.\n\n"
+    "А вот накладные выписывать можно — просто напишите как обычно:\n"
+    "Асан, Албенивер 200мл 1к, долг 31470, приход 5000\n\n"
     "Придёт готовая PDF-накладная, ничего в базу не запишется."
 )
 
@@ -598,8 +598,9 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total, d
 
 async def start_invoice(update, context, actor, data, draft=False):
     if not draft and transition_blocked(actor):
-        await update.message.reply_text(TRANSITION_HINT)
-        return
+        # Переходный период: слово «черновик» писать не обязательно —
+        # накладная сотрудника сама становится черновиком (база не меняется).
+        draft = True
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
@@ -1992,9 +1993,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
     if transition_blocked(actor):
         lines += [
-            "⏳ <b>Сейчас переходный период</b> — работаем только черновиками:",
-            "<i>черновик: Асан, Албенивер 200мл 1к, долг 31470</i>",
+            "⏳ <b>Сейчас переходный период</b> — накладные выдаются черновиками.",
+            "Просто напишите как обычно:",
+            "<i>Асан, Албенивер 200мл 1к, долг 31470</i>",
             "Придёт PDF-накладная для клиента, база не меняется.",
+            "Слово «черновик» писать не нужно (но можно).",
             "Ещё можно спрашивать цены: <i>сколько стоит Альтопен 1л?</i> и /price",
             "",
             "Остальные функции откроются после настройки базы:",
