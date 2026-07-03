@@ -597,9 +597,9 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total, d
 
 
 async def start_invoice(update, context, actor, data, draft=False):
-    if not draft and transition_blocked(actor):
-        # Переходный период: слово «черновик» писать не обязательно —
-        # накладная сотрудника сама становится черновиком (база не меняется).
+    if not draft and TRANSITION_MODE:
+        # Переходный период: любая накладная — и сотрудника, и админа —
+        # автоматически становится черновиком (база не меняется).
         draft = True
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
