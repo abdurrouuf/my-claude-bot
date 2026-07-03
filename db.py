@@ -100,6 +100,13 @@ CREATE TABLE IF NOT EXISTS settings(
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS draft_log(
+    id      INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts      TEXT NOT NULL,
+    user_id INTEGER NOT NULL,
+    client  TEXT NOT NULL,
+    total   REAL NOT NULL DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS operations(
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     ts           TEXT NOT NULL,
@@ -228,6 +235,26 @@ def api_usage_since(start_iso: str):
         "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM api_usage WHERE ts >= ?",
         (start_iso,)).fetchone()
     return row[0], row[1]
+
+
+def log_draft(user_id: int, client: str, total: float):
+    """Журнал черновиков (переходный период): учёт не трогает, только статистика."""
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT INTO draft_log(ts, user_id, client, total) VALUES(?,?,?,?)",
+            (datetime.now(BISHKEK).isoformat(timespec="seconds"),
+             user_id, client, total))
+
+
+def drafts_since(start_iso: str):
+    """[(имя сотрудника, штук, сумма)] по черновикам начиная с даты."""
+    return connect().execute(
+        "SELECT COALESCE(u.name, 'ID ' || d.user_id) AS name, COUNT(*) AS n, "
+        "COALESCE(SUM(d.total), 0) AS total "
+        "FROM draft_log d LEFT JOIN users u ON u.id = d.user_id "
+        "WHERE d.ts >= ? GROUP BY d.user_id ORDER BY total DESC",
+        (start_iso,)).fetchall()
 
 
 def backup_to(path: str):

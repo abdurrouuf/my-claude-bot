@@ -99,13 +99,17 @@
     препаратов из прайса (укорочена до ~320 символов — лимит Whisper
     224 токена, длинная давала 400 от Groq). Владелец добавил GROQ_API_KEY
     на Railway и 04.07.2026 подтвердил: голосовые распознаются. ✅
+20. Сводка по черновикам: таблица draft_log (журнал черновиков, учёт не
+    трогает), каждый вечер в 19:00 (DRAFT_SUMMARY_HOUR) админу в личку —
+    кто сколько черновиков выписал и на какую сумму; если черновиков не
+    было, сводка не шлётся. Команда /drafts — то же самое в любой момент.
 
 ## Env-переменные (Railway)
 
 TELEGRAM_TOKEN, ANTHROPIC_API_KEY — обязательные.
 Опциональные: CLAUDE_MODEL (claude-sonnet-5), DB_PATH (/data/vetop.db),
 TRANSITION_MODE (1), DRAFT_WATERMARK (0), SUMMARY_HOUR (20), BACKUP_HOUR (3),
-DEBT_ALERT_DAYS (30), DEADSTOCK_DAYS (60).
+DEBT_ALERT_DAYS (30), DEADSTOCK_DAYS (60), DRAFT_SUMMARY_HOUR (19).
 Голосовые (STT): GROQ_API_KEY (рекомендуется, бесплатно) или OPENAI_API_KEY;
 тонкая настройка — STT_API_KEY, STT_BASE_URL, STT_MODEL, STT_LANGUAGE (ru),
 MAX_VOICE_SECONDS (300).
