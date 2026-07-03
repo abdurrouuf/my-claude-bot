@@ -1856,16 +1856,23 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 def _build_stt_prompt() -> str:
-    """Подсказка Whisper: редкие названия препаратов и слова накладной,
-    чтобы «Албенивер» не превращался в «Албанию»."""
+    """Подсказка Whisper, чтобы «Албенивер» не превращался в «Албанию».
+    У Whisper лимит подсказки 224 токена, кириллица «тяжёлая» (~2 символа
+    на токен), поэтому держим строку короче ~320 символов."""
     seen, names = set(), []
     for it in prices.PRICE_LIST_DATA:
         word = it["name"].split("(")[0].strip().split()[0].capitalize()
         if word not in seen:
             seen.add(word)
             names.append(word)
-    body = "Накладная ветеринарной компании ВЕТОП. Препараты: " + ", ".join(names)
-    return body[:700] + ". Слова: черновик, коробка, штук, флакон, долг, приход, сом."
+    head = "Накладная ветаптеки ВЕТОП: "
+    tail = "; черновик, коробка, штук, долг, приход, сом."
+    body = ""
+    for n in names:
+        if len(head) + len(body) + len(n) + len(tail) + 2 > 320:
+            break
+        body += (", " if body else "") + n
+    return head + body + tail
 
 
 STT_PROMPT = _build_stt_prompt()
@@ -1874,15 +1881,26 @@ STT_PROMPT = _build_stt_prompt()
 async def transcribe_audio(raw: bytes, filename: str, mime: str) -> str:
     """Отправляет аудио в OpenAI-совместимый Whisper API, возвращает текст."""
     import httpx
+    url = f"{STT_BASE_URL}/audio/transcriptions"
+    headers = {"Authorization": f"Bearer {STT_API_KEY}"}
+    data = {"model": STT_MODEL, "language": STT_LANGUAGE,
+            "temperature": "0", "prompt": STT_PROMPT}
     async with httpx.AsyncClient(timeout=120) as cl:
-        resp = await cl.post(
-            f"{STT_BASE_URL}/audio/transcriptions",
-            headers={"Authorization": f"Bearer {STT_API_KEY}"},
-            data={"model": STT_MODEL, "language": STT_LANGUAGE,
-                  "temperature": "0", "prompt": STT_PROMPT},
-            files={"file": (filename, raw, mime)},
-        )
-        resp.raise_for_status()
+        resp = await cl.post(url, headers=headers, data=data,
+                             files={"file": (filename, raw, mime)})
+        if resp.status_code == 400:
+            # Скорее всего сервису не понравилась подсказка — пробуем без неё.
+            log.warning("STT 400, повтор без подсказки: %s", resp.text[:500])
+            data.pop("prompt", None)
+            resp = await cl.post(url, headers=headers, data=data,
+                                 files={"file": (filename, raw, mime)})
+        if resp.status_code >= 400:
+            log.error("STT %s: %s", resp.status_code, resp.text[:500])
+            try:
+                detail = resp.json()["error"]["message"]
+            except Exception:
+                detail = resp.text[:200]
+            raise RuntimeError(f"сервис распознавания ответил {resp.status_code} ({detail})")
         return (resp.json().get("text") or "").strip()
 
 
