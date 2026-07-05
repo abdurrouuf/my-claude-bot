@@ -671,11 +671,12 @@ async def start_invoice(update, context, actor, data, draft=False):
             apply_client_prices({"client_id": c["id"], "items": items})
         total = sum(it["qty"] * it["price"] for it in items)
         p = {"items": items, "payment": payment, "wh_name": wh["name"]}
+        await send_invoice_pdf(context, update.effective_chat.id,
+                               c["name"] if c else client_name, p, old_debt, total, draft=True)
+        # В журнал — после успешной отправки, чтобы при сбое не задвоить сводку
         db.log_draft(actor["id"], c["name"] if c else client_name, total,
                      [{"name": it["name"], "volume": it["volume"], "qty": it["qty"],
                        "sum": it["qty"] * it["price"]} for it in items])
-        await send_invoice_pdf(context, update.effective_chat.id,
-                               c["name"] if c else client_name, p, old_debt, total, draft=True)
         return
 
     payload = {
