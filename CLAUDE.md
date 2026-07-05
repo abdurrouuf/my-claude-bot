@@ -108,13 +108,20 @@
 21. Прайс в базе: таблицы products + price_history. Админ меняет цену
     фразой «новая цена Альтопен 100мл 95» (action change_price,
     подтверждение кнопкой), /pricelog — история изменений.
+22. Обещания оплаты: таблица promises (клиент — текстом, не привязан к
+    clients). «Асан обещал 50000 в пятницу» (action promise), «Асан
+    выполнил обещание» (promise_done, закрывает все открытые по имени).
+    /promises: админ видит все, сотрудник — свои. Утром в 09:00
+    (PROMISE_HOUR) напоминание о сегодняшних и просроченных: админу всё,
+    сотрудникам — их записи. Пишется без кнопки подтверждения (не учёт).
 
 ## Env-переменные (Railway)
 
 TELEGRAM_TOKEN, ANTHROPIC_API_KEY — обязательные.
 Опциональные: CLAUDE_MODEL (claude-sonnet-5), DB_PATH (/data/vetop.db),
 TRANSITION_MODE (1), DRAFT_WATERMARK (0), SUMMARY_HOUR (20), BACKUP_HOUR (3),
-DEBT_ALERT_DAYS (30), DEADSTOCK_DAYS (60), DRAFT_SUMMARY_HOUR (19).
+DEBT_ALERT_DAYS (30), DEADSTOCK_DAYS (60), DRAFT_SUMMARY_HOUR (19),
+PROMISE_HOUR (9).
 Голосовые (STT): GROQ_API_KEY (рекомендуется, бесплатно) или OPENAI_API_KEY;
 тонкая настройка — STT_API_KEY, STT_BASE_URL, STT_MODEL, STT_LANGUAGE (ru),
 MAX_VOICE_SECONDS (300).
