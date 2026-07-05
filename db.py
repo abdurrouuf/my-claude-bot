@@ -198,6 +198,8 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             conn.execute("ALTER TABLE users ADD COLUMN default_wh INTEGER")
         if "phone" not in _columns(conn, "clients"):
             conn.execute("ALTER TABLE clients ADD COLUMN phone TEXT")
+        if "items" not in _columns(conn, "draft_log"):
+            conn.execute("ALTER TABLE draft_log ADD COLUMN items TEXT")
         if "feed_chat_id" not in _columns(conn, "warehouses") and \
            "owner_id" not in _columns(conn, "warehouses"):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_id INTEGER")
@@ -352,14 +354,22 @@ def promises_close(client: str):
         return cur.rowcount
 
 
-def log_draft(user_id: int, client: str, total: float):
+def log_draft(user_id: int, client: str, total: float, items: list | None = None):
     """Журнал черновиков (переходный период): учёт не трогает, только статистика."""
     conn = connect()
     with _lock, conn:
         conn.execute(
-            "INSERT INTO draft_log(ts, user_id, client, total) VALUES(?,?,?,?)",
+            "INSERT INTO draft_log(ts, user_id, client, total, items) VALUES(?,?,?,?,?)",
             (datetime.now(BISHKEK).isoformat(timespec="seconds"),
-             user_id, client, total))
+             user_id, client, total,
+             json.dumps(items, ensure_ascii=False) if items else None))
+
+
+def drafts_with_items_since(start_iso: str):
+    """Черновики с составом (для аналитики переходного периода)."""
+    return connect().execute(
+        "SELECT client, total, items FROM draft_log WHERE ts >= ?",
+        (start_iso,)).fetchall()
 
 
 def drafts_since(start_iso: str):
