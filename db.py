@@ -100,6 +100,22 @@ CREATE TABLE IF NOT EXISTS settings(
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS products(
+    id     INTEGER PRIMARY KEY,
+    name   TEXT NOT NULL,
+    volume TEXT NOT NULL,
+    box    INTEGER NOT NULL,
+    price  REAL NOT NULL,
+    active INTEGER NOT NULL DEFAULT 1
+);
+CREATE TABLE IF NOT EXISTS price_history(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    product_id INTEGER NOT NULL,
+    old_price  REAL NOT NULL,
+    new_price  REAL NOT NULL,
+    user_id    INTEGER NOT NULL
+);
 CREATE TABLE IF NOT EXISTS draft_log(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts      TEXT NOT NULL,
@@ -235,6 +251,54 @@ def api_usage_since(start_iso: str):
         "SELECT COUNT(*), COALESCE(SUM(cost_usd), 0) FROM api_usage WHERE ts >= ?",
         (start_iso,)).fetchone()
     return row[0], row[1]
+
+
+def seed_products(seed: list):
+    """Первое заполнение прайса из кода; дальше прайс живёт в базе."""
+    conn = connect()
+    with _lock, conn:
+        if conn.execute("SELECT 1 FROM products LIMIT 1").fetchone():
+            return False
+        conn.executemany(
+            "INSERT INTO products(id, name, volume, box, price) VALUES(?,?,?,?,?)",
+            [(p["id"], p["name"], p["volume"], p["box"], p["price"]) for p in seed])
+        return True
+
+
+def products_active():
+    """Актуальный прайс: [{id, name, volume, box, price}] в порядке номеров."""
+    rows = connect().execute(
+        "SELECT id, name, volume, box, price FROM products WHERE active=1 ORDER BY id"
+    ).fetchall()
+    return [dict(r) for r in rows]
+
+
+def product_set_price(product_id: int, new_price: float, user_id: int):
+    """Меняет цену товара, пишет историю. Возвращает старую цену."""
+    conn = connect()
+    with _lock, conn:
+        row = conn.execute("SELECT price FROM products WHERE id=?", (product_id,)).fetchone()
+        if row is None:
+            raise ValueError(f"товар №{product_id} не найден")
+        old = row["price"]
+        conn.execute("UPDATE products SET price=? WHERE id=?", (new_price, product_id))
+        conn.execute(
+            "INSERT INTO price_history(ts, product_id, old_price, new_price, user_id) "
+            "VALUES(?,?,?,?,?)",
+            (datetime.now(BISHKEK).isoformat(timespec="seconds"),
+             product_id, old, new_price, user_id))
+        return old
+
+
+def price_history_recent(limit: int = 15):
+    """Последние изменения цен: [(дата, товар, фасовка, было, стало, кто)]."""
+    return connect().execute(
+        "SELECT h.ts, p.name, p.volume, h.old_price, h.new_price, "
+        "COALESCE(u.name, 'ID ' || h.user_id) AS user_name "
+        "FROM price_history h "
+        "JOIN products p ON p.id = h.product_id "
+        "LEFT JOIN users u ON u.id = h.user_id "
+        "ORDER BY h.id DESC LIMIT ?", (limit,)).fetchall()
 
 
 def log_draft(user_id: int, client: str, total: float):

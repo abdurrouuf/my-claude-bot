@@ -1,7 +1,8 @@
-# Прайс-лист ВЕТОП. Пока хранится в коде, позже переедет в базу.
+# Прайс-лист ВЕТОП. Исходные данные (SEED_DATA) заполняют базу при первом
+# запуске; дальше прайс живёт в таблице products и загружается через set_data().
 import difflib
 
-PRICE_LIST_DATA = [
+SEED_DATA = [
     {"id": 1,  "name": "АЛЬТОПЕН-ФОРТЕ (альбен, левамизоль суспензия)",          "volume": "100 мл",        "box": 80,  "price": 160},
     {"id": 2,  "name": "АЛЬТОПЕН-ФОРТЕ (альбен, левамизоль суспензия)",          "volume": "1 л",           "box": 12,  "price": 1060},
     {"id": 3,  "name": "АЛЬТОПЕН-ФОРТЕ ПЛЮС (альбен, оксиклозанид)",             "volume": "100 мл",        "box": 80,  "price": 125},
@@ -108,14 +109,35 @@ PRICE_LIST_DATA = [
     {"id": 104,"name": "СУРФАГОН УЛЬТРА 50 мкг",                                "volume": "20 мл",         "box": 162, "price": 580},
 ]
 
-PRICE_LIST_TEXT = "\n".join(
-    f"{p['id']}. {p['name']} | {p['volume']} | {p['box']} шт/кор | {p['price']} сом"
-    for p in PRICE_LIST_DATA
-)
+PRICE_LIST_DATA = list(SEED_DATA)
+PRICE_LIST_TEXT = ""
+BY_ID = {}
+_KEYS = {}
 
-BY_ID = {p["id"]: p for p in PRICE_LIST_DATA}
 
-_KEYS = {f"{p['name']} | {p['volume']}".lower(): p for p in PRICE_LIST_DATA}
+def _fmt_price(x):
+    return int(x) if float(x) == int(x) else x
+
+
+def _rebuild():
+    global PRICE_LIST_TEXT, BY_ID, _KEYS
+    PRICE_LIST_TEXT = "\n".join(
+        f"{p['id']}. {p['name']} | {p['volume']} | {p['box']} шт/кор | "
+        f"{_fmt_price(p['price'])} сом"
+        for p in PRICE_LIST_DATA
+    )
+    BY_ID = {p["id"]: p for p in PRICE_LIST_DATA}
+    _KEYS = {f"{p['name']} | {p['volume']}".lower(): p for p in PRICE_LIST_DATA}
+
+
+def set_data(rows: list):
+    """Загружает актуальный прайс (обычно из базы) и перестраивает индексы."""
+    global PRICE_LIST_DATA
+    PRICE_LIST_DATA = [dict(r) for r in rows]
+    _rebuild()
+
+
+_rebuild()
 
 
 def match_product(name: str, volume: str):

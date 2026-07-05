@@ -324,6 +324,15 @@ def _build_static_system() -> str:
                  '50 000», «инкассация 30000»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "handover", "amount": сумма}')
     parts.append("")
+    parts.append("=== РЕЖИМ 11: ИЗМЕНЕНИЕ ОБЩЕГО ПРАЙСА (только админ) ===")
+    parts.append('Если админ меняет цену в общем прайсе — БЕЗ имени клиента '
+                 '(«новая цена Альтопен 100мл — 95», «поменяй цену Дексатоп 50мл на 190», '
+                 '«теперь Клозатоп 1л стоит 990»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "change_price", "items": [{"name": "точное название из прайса", '
+                 '"volume": "фасовка", "price": новая_цена}]}')
+    parts.append('- Не путай со спецценой клиента (set_price): там всегда названо имя клиента. '
+                 'Здесь меняется прайс для всех.')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -349,6 +358,14 @@ def _build_static_system() -> str:
 
 # Строится один раз: байт-в-байт одинаковый для всех запросов — иначе кэш не работает.
 STATIC_SYSTEM = _build_static_system()
+
+
+def _refresh_price_dependents():
+    """После изменения прайса: пересобрать системный промпт и подсказку Whisper.
+    Кэш промпта при этом обновится один раз — это нормально."""
+    global STATIC_SYSTEM, STT_PROMPT
+    STATIC_SYSTEM = _build_static_system()
+    STT_PROMPT = _build_stt_prompt()
 
 
 def build_dynamic_system(actor) -> str:
@@ -1196,6 +1213,53 @@ async def start_transfer(update, context, actor, data):
 
 # ---------- Спеццены ----------
 
+def change_price_summary(p) -> str:
+    lines = [f"🏷 <b>Изменение прайса</b> ({len(p['items'])} поз.)", ""]
+    for i, it in enumerate(p["items"], 1):
+        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])}: "
+                     f"{fmt_num(it['old_price'])} → <b>{fmt_num(it['price'])} сом</b>")
+    lines += ["", "Новая цена подставится во все будущие накладные. Провести?"]
+    return "\n".join(lines)
+
+
+async def start_change_price(update, context, actor, data):
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Цены общего прайса меняет только админ.")
+        return
+    items, missing = [], []
+    for raw in (data.get("items") or []):
+        name = str(raw.get("name") or "")
+        volume = str(raw.get("volume") or "")
+        product = prices.match_product(name, volume)
+        if product is None:
+            missing.append(f"{name} {volume}".strip())
+            continue
+        try:
+            price = float(raw.get("price"))
+        except (TypeError, ValueError):
+            missing.append(f"{name} {volume} (не понял цену)")
+            continue
+        if price <= 0:
+            missing.append(f"{name} {volume} (цена должна быть больше нуля)")
+            continue
+        items.append({"product_id": product["id"], "name": product["name"],
+                      "volume": product["volume"], "old_price": product["price"],
+                      "price": price})
+    if missing:
+        await update.message.reply_text(
+            "⚠️ Не понял позиции: " + "; ".join(missing) +
+            "\nНичего не менял — напишите ещё раз точнее.")
+        return
+    if not items:
+        await update.message.reply_text("Не понял, какие цены менять.")
+        return
+    payload = {"kind": "change_price", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id, "items": items}
+    token = new_pending(payload)
+    await update.message.reply_text(change_price_summary(payload), parse_mode="HTML",
+                                    reply_markup=confirm_kb(token))
+
+
 def set_price_summary(p) -> str:
     c = db.client_get(p["client_id"])
     lines = [f"💲 <b>Спеццены — клиент «{esc(c['name'])}» (склад «{esc(p['wh_name'])}»)</b>", ""]
@@ -1728,6 +1792,17 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(
                     f"✅ Минимальные остатки для склада «{esc(p['wh_name'])}» сохранены "
                     f"({len(p['items'])} поз.). Посмотреть: /minstock", parse_mode="HTML")
+            elif p["kind"] == "change_price":
+                for it in p["items"]:
+                    db.product_set_price(it["product_id"], it["price"], p["user_id"])
+                prices.set_data(db.products_active())
+                _refresh_price_dependents()
+                lines = [f"✅ Прайс обновлён ({len(p['items'])} поз.):"]
+                for it in p["items"]:
+                    lines.append(f"• {esc(it['name'])} {esc(it['volume'])}: "
+                                 f"{fmt_num(it['old_price'])} → <b>{fmt_num(it['price'])} сом</b>")
+                lines.append("История: /pricelog")
+                await q.edit_message_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:
             log.exception("Ошибка проведения операции")
             await context.bot.send_message(p["chat_id"], f"⚠️ Ошибка при проведении: {e}")
@@ -1776,6 +1851,8 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_inventory(update, context, actor, data)
         elif action == "set_price":
             await start_set_price(update, context, actor, data)
+        elif action == "change_price":
+            await start_change_price(update, context, actor, data)
         elif action == "return":
             await start_return(update, context, actor, data)
         elif action == "handover":
@@ -2100,6 +2177,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/minstock — пороги «заканчивается товар» "
             "(задать: «минимум для Каракола: Альтопен 100мл 20 шт»)",
             "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
+            "Общий прайс: «новая цена Альтопен 100мл 95» · /pricelog — история",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -2374,6 +2452,27 @@ async def draft_summary_loop(app):
                 await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
         except Exception:
             log.exception("Ошибка сводки по черновикам")
+
+
+async def pricelog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if await _require_admin(update) is None:
+        return
+    rows = db.price_history_recent(15)
+    if not rows:
+        await update.message.reply_text(
+            "🏷 Цены прайса ещё не менялись.\n"
+            "Изменить: «новая цена Альтопен 100мл 95»")
+        return
+    lines = ["🏷 <b>Последние изменения прайса</b>", ""]
+    for r in rows:
+        try:
+            d = datetime.fromisoformat(r["ts"]).strftime("%d.%m.%Y")
+        except ValueError:
+            d = r["ts"]
+        lines.append(f"{d} — {esc(r['name'])} {esc(r['volume'])}: "
+                     f"{fmt_num(r['old_price'])} → <b>{fmt_num(r['new_price'])} сом</b> "
+                     f"({esc(r['user_name'])})")
+    await send_long(update.message, "\n".join(lines))
 
 
 async def drafts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -3360,6 +3459,10 @@ async def _post_init(app):
 
 if __name__ == "__main__":
     db.init(ADMIN_ID, WAREHOUSE_NAMES, STAFF)
+    if db.seed_products(prices.SEED_DATA):
+        log.info("Прайс перенесён в базу (%d позиций)", len(prices.SEED_DATA))
+    prices.set_data(db.products_active())
+    _refresh_price_dependents()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("clear", clear))
@@ -3382,6 +3485,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("drafts", drafts_cmd))
+    app.add_handler(CommandHandler("pricelog", pricelog_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
