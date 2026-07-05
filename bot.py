@@ -671,7 +671,9 @@ async def start_invoice(update, context, actor, data, draft=False):
             apply_client_prices({"client_id": c["id"], "items": items})
         total = sum(it["qty"] * it["price"] for it in items)
         p = {"items": items, "payment": payment, "wh_name": wh["name"]}
-        db.log_draft(actor["id"], c["name"] if c else client_name, total)
+        db.log_draft(actor["id"], c["name"] if c else client_name, total,
+                     [{"name": it["name"], "volume": it["volume"], "qty": it["qty"],
+                       "sum": it["qty"] * it["price"]} for it in items])
         await send_invoice_pdf(context, update.effective_chat.id,
                                c["name"] if c else client_name, p, old_debt, total, draft=True)
         return
@@ -2312,6 +2314,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "(задать: «минимум для Каракола: Альтопен 100мл 20 шт»)",
             "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
             "Общий прайс: «новая цена Альтопен 100мл 95» · /pricelog — история",
+            "/abc — АВС-анализ: топ товаров и клиентов (можно: /abc неделя)",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -3583,6 +3586,99 @@ async def draft_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_text(update, context, actor, " ".join(context.args), draft=True)
 
 
+async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """АВС-анализ: какие товары и клиенты дают выручку. По реальным накладным;
+    пока их нет (переходный период) — по черновикам."""
+    if await _require_admin(update) is None:
+        return
+    days_back, label = EXPORT_PERIODS["месяц"]
+    if context.args:
+        key = context.args[0].lower()
+        if key in EXPORT_PERIODS:
+            days_back, label = EXPORT_PERIODS[key]
+    start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    start_iso = start.isoformat(timespec="seconds")
+
+    prod_rev, cli_rev, cli_n = {}, {}, {}
+    total_rev = 0.0
+    source = ""
+    for op in db.operations_since(start_iso):
+        if op["type"] != "invoice":
+            continue
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        cname = "—"
+        if op["client_id"]:
+            c = db.client_get(op["client_id"])
+            if c:
+                cname = c["name"]
+        t = data.get("total", 0)
+        cli_rev[cname] = cli_rev.get(cname, 0) + t
+        cli_n[cname] = cli_n.get(cname, 0) + 1
+        total_rev += t
+        for it in data.get("items", []):
+            key = f"{it.get('name', '')} {it.get('volume', '')}".strip()
+            prod_rev[key] = prod_rev.get(key, 0) + (it.get("qty") or 0) * (it.get("price") or 0)
+
+    if total_rev == 0:  # переходный период — считаем по черновикам
+        source = ", по черновикам"
+        for r in db.drafts_with_items_since(start_iso):
+            cli_rev[r["client"]] = cli_rev.get(r["client"], 0) + r["total"]
+            cli_n[r["client"]] = cli_n.get(r["client"], 0) + 1
+            total_rev += r["total"]
+            if r["items"]:
+                try:
+                    its = json.loads(r["items"])
+                except (ValueError, TypeError):
+                    its = []
+                for it in its:
+                    key = f"{it.get('name', '')} {it.get('volume', '')}".strip()
+                    prod_rev[key] = prod_rev.get(key, 0) + (it.get("sum") or 0)
+
+    if total_rev == 0:
+        await update.message.reply_text(
+            f"📊 Нет данных {label}. Как появятся накладные или черновики — "
+            "будет и анализ.")
+        return
+
+    lines = [f"📊 <b>АВС-анализ {esc(label)}{esc(source)}</b>", ""]
+
+    prod_total = sum(prod_rev.values())
+    if prod_total > 0:
+        lines.append("<b>Товары по выручке:</b>")
+        groups = {"A": [], "B": [], "C": []}
+        cum = 0.0
+        for name, rev in sorted(prod_rev.items(), key=lambda x: -x[1]):
+            g = "A" if cum < 0.8 else ("B" if cum < 0.95 else "C")
+            groups[g].append((name, rev))
+            cum += rev / prod_total
+        lines.append("🅰 <b>Главные (80% выручки):</b>")
+        for i, (name, rev) in enumerate(groups["A"], 1):
+            lines.append(f"  {i}. {esc(name)} — {money(rev)} "
+                         f"({rev / prod_total * 100:.0f}%)")
+        if groups["B"]:
+            lines.append("🅱 <b>Средние (ещё 15%):</b>")
+            for name, rev in groups["B"][:8]:
+                lines.append(f"  • {esc(name)} — {money(rev)}")
+            if len(groups["B"]) > 8:
+                lines.append(f"  … и ещё {len(groups['B']) - 8} поз.")
+        if groups["C"]:
+            c_sum = sum(r for _, r in groups["C"])
+            lines.append(f"🅲 Остальные: {len(groups['C'])} поз. — {money(c_sum)} "
+                         f"({c_sum / prod_total * 100:.0f}%)")
+        lines.append("")
+
+    lines.append("<b>Топ клиентов:</b>")
+    for i, (name, rev) in enumerate(sorted(cli_rev.items(), key=lambda x: -x[1])[:10], 1):
+        lines.append(f"  {i}. {esc(name)} — {money(rev)} "
+                     f"({rev / total_rev * 100:.0f}%), {cli_n[name]} шт.")
+    lines += ["", f"💰 Итого выручка: <b>{money(total_rev)}</b>"]
+    await send_long(update.message, "\n".join(lines))
+
+
 async def _post_init(app):
     app.create_task(evening_summary_loop(app))
     app.create_task(weekly_debt_loop(app))
@@ -3622,6 +3718,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("drafts", drafts_cmd))
     app.add_handler(CommandHandler("pricelog", pricelog_cmd))
     app.add_handler(CommandHandler("promises", promises_cmd))
+    app.add_handler(CommandHandler("abc", abc_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
