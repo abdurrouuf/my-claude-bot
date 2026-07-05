@@ -116,6 +116,15 @@ CREATE TABLE IF NOT EXISTS price_history(
     new_price  REAL NOT NULL,
     user_id    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS promises(
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts       TEXT NOT NULL,
+    client   TEXT NOT NULL,
+    amount   REAL NOT NULL DEFAULT 0,
+    due_date TEXT NOT NULL,                  -- YYYY-MM-DD
+    user_id  INTEGER NOT NULL,
+    status   TEXT NOT NULL DEFAULT 'open'    -- open | done
+);
 CREATE TABLE IF NOT EXISTS draft_log(
     id      INTEGER PRIMARY KEY AUTOINCREMENT,
     ts      TEXT NOT NULL,
@@ -299,6 +308,48 @@ def price_history_recent(limit: int = 15):
         "JOIN products p ON p.id = h.product_id "
         "LEFT JOIN users u ON u.id = h.user_id "
         "ORDER BY h.id DESC LIMIT ?", (limit,)).fetchall()
+
+
+def promise_add(client: str, amount: float, due_date: str, user_id: int):
+    conn = connect()
+    with _lock, conn:
+        cur = conn.execute(
+            "INSERT INTO promises(ts, client, amount, due_date, user_id) VALUES(?,?,?,?,?)",
+            (datetime.now(BISHKEK).isoformat(timespec="seconds"),
+             client, amount, due_date, user_id))
+        return cur.lastrowid
+
+
+def promises_open(user_id: int | None = None):
+    """Открытые обещания (все или записанные одним сотрудником), ближайшие первыми."""
+    sql = ("SELECT p.*, COALESCE(u.name, 'ID ' || p.user_id) AS user_name "
+           "FROM promises p LEFT JOIN users u ON u.id = p.user_id "
+           "WHERE p.status = 'open'")
+    args = []
+    if user_id is not None:
+        sql += " AND p.user_id = ?"
+        args.append(user_id)
+    sql += " ORDER BY p.due_date, p.id"
+    return connect().execute(sql, args).fetchall()
+
+
+def promises_due(today: str):
+    """Открытые обещания со сроком сегодня или раньше (просроченные)."""
+    return connect().execute(
+        "SELECT p.*, COALESCE(u.name, 'ID ' || p.user_id) AS user_name "
+        "FROM promises p LEFT JOIN users u ON u.id = p.user_id "
+        "WHERE p.status = 'open' AND p.due_date <= ? ORDER BY p.due_date, p.id",
+        (today,)).fetchall()
+
+
+def promises_close(client: str):
+    """Закрывает все открытые обещания клиента. Возвращает, сколько закрыто."""
+    conn = connect()
+    with _lock, conn:
+        cur = conn.execute(
+            "UPDATE promises SET status='done' "
+            "WHERE status='open' AND client = ? COLLATE NOCASEU", (client,))
+        return cur.rowcount
 
 
 def log_draft(user_id: int, client: str, total: float):

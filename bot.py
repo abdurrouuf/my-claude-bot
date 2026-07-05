@@ -333,6 +333,19 @@ def _build_static_system() -> str:
     parts.append('- Не путай со спецценой клиента (set_price): там всегда названо имя клиента. '
                  'Здесь меняется прайс для всех.')
     parts.append("")
+    parts.append("=== РЕЖИМ 12: ОБЕЩАНИЕ ОПЛАТЫ ===")
+    parts.append('Если клиент пообещал заплатить («Асан обещал 50000 в пятницу», '
+                 '«Болот заплатит 20000 пятнадцатого», «Асан обещал рассчитаться завтра»), '
+                 'верни ТОЛЬКО JSON:')
+    parts.append('{"action": "promise", "client": "Имя", "amount": сумма_или_0, "date": "YYYY-MM-DD"}')
+    parts.append('- Дату вычисли из сегодняшней даты (в блоке ниже): «завтра», «в пятницу», '
+                 '«15 числа» → конкретная дата ISO. Если дата не названа — поставь завтра.')
+    parts.append('- Если сумма не названа — amount: 0.')
+    parts.append('Если клиент ВЫПОЛНИЛ обещание («Асан выполнил обещание», «Асан закрыл '
+                 'обещание») — верни ТОЛЬКО JSON: {"action": "promise_done", "client": "Имя"}')
+    parts.append('- promise_done выбирай только при слове «обещание». Если названа сумма '
+                 'принесённых денег («Асан принёс 5000») — это оплата, режим 3.')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -1213,6 +1226,121 @@ async def start_transfer(update, context, actor, data):
 
 # ---------- Спеццены ----------
 
+async def start_promise(update, context, actor, data):
+    client = str(data.get("client") or "").strip()
+    if not client:
+        await update.message.reply_text("Не понял имя клиента — скажите ещё раз.")
+        return
+    try:
+        amount = float(data.get("amount") or 0)
+    except (TypeError, ValueError):
+        amount = 0
+    due_raw = str(data.get("date") or "").strip()
+    try:
+        due = datetime.fromisoformat(due_raw).date()
+    except ValueError:
+        await update.message.reply_text(
+            "Не понял дату. Скажите, например: «Асан обещал 50000 в пятницу».")
+        return
+    db.promise_add(client, amount, due.isoformat(), actor["id"])
+    amt = f"{money(amount)} " if amount else ""
+    await update.message.reply_text(
+        f"📅 Записал: {esc(client)} обещал {amt}к {due.strftime('%d.%m.%Y')}.\n"
+        f"Утром в этот день напомню. Все обещания: /promises", parse_mode="HTML")
+    if actor["id"] != ADMIN_ID:
+        await notify_admin(context, actor,
+                           f"обещание: {client} — {money(amount) if amount else 'сумма не названа'} "
+                           f"к {due.strftime('%d.%m.%Y')}")
+
+
+async def start_promise_done(update, context, actor, data):
+    client = str(data.get("client") or "").strip()
+    if not client:
+        await update.message.reply_text("Не понял имя клиента — скажите ещё раз.")
+        return
+    n = db.promises_close(client)
+    if n:
+        await update.message.reply_text(
+            f"✅ Отметил: {esc(client)} выполнил обещание. Молодец!", parse_mode="HTML")
+        if actor["id"] != ADMIN_ID:
+            await notify_admin(context, actor, f"{client} выполнил обещание оплаты")
+    else:
+        await update.message.reply_text(
+            f"У клиента «{esc(client)}» нет открытых обещаний. Список: /promises",
+            parse_mode="HTML")
+
+
+def _promise_line(r, today, with_author=False) -> str:
+    due = datetime.fromisoformat(r["due_date"]).date()
+    amt = money(r["amount"]) if r["amount"] else "сумма не названа"
+    if due < today:
+        when = f"⚠️ просрочено {(today - due).days} дн."
+    elif due == today:
+        when = "сегодня"
+    else:
+        when = due.strftime("%d.%m.%Y")
+    line = f"• {esc(r['client'])}: <b>{amt}</b> — {when}"
+    if with_author:
+        line += f" (записал {esc(r['user_name'])})"
+    return line
+
+
+async def promises_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    admin = is_admin(actor)
+    rows = db.promises_open(None if admin else actor["id"])
+    if not rows:
+        await update.message.reply_text(
+            "📅 Открытых обещаний нет.\n"
+            "Записать: «Асан обещал 50000 в пятницу»")
+        return
+    today = datetime.now(BISHKEK).date()
+    lines = ["📅 <b>Обещания оплаты</b>", ""]
+    lines += [_promise_line(r, today, with_author=admin) for r in rows]
+    lines += ["", "Когда клиент заплатит: «Асан выполнил обещание»"]
+    await send_long(update.message, "\n".join(lines))
+
+
+# Час утреннего напоминания об обещаниях (по Бишкеку)
+PROMISE_HOUR = int(os.environ.get("PROMISE_HOUR", "9"))
+
+
+async def promise_reminder_loop(app):
+    """Каждое утро: кому сегодня обещали заплатить (и что просрочено)."""
+    while True:
+        now = datetime.now(BISHKEK)
+        target = now.replace(hour=PROMISE_HOUR, minute=0, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            today = datetime.now(BISHKEK).date()
+            rows = db.promises_due(today.isoformat())
+            if not rows:
+                continue
+            header = f"📅 <b>Обещания оплаты на {today.strftime('%d.%m.%Y')}</b>"
+            tail = "\nКогда клиент заплатит: «Асан выполнил обещание»"
+            # Админу — всё, каждому сотруднику — записанные им
+            text = "\n".join([header, ""] +
+                             [_promise_line(r, today, with_author=True) for r in rows] + [tail])
+            await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+            by_author = {}
+            for r in rows:
+                if r["user_id"] != ADMIN_ID:
+                    by_author.setdefault(r["user_id"], []).append(r)
+            for uid, items in by_author.items():
+                text = "\n".join([header, ""] +
+                                 [_promise_line(r, today) for r in items] + [tail])
+                try:
+                    await app.bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+                except Exception:
+                    log.warning("Не удалось отправить напоминание об обещаниях %s", uid)
+        except Exception:
+            log.exception("Ошибка напоминания об обещаниях")
+
+
 def change_price_summary(p) -> str:
     lines = [f"🏷 <b>Изменение прайса</b> ({len(p['items'])} поз.)", ""]
     for i, it in enumerate(p["items"], 1):
@@ -1853,6 +1981,10 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_set_price(update, context, actor, data)
         elif action == "change_price":
             await start_change_price(update, context, actor, data)
+        elif action == "promise":
+            await start_promise(update, context, actor, data)
+        elif action == "promise_done":
+            await start_promise_done(update, context, actor, data)
         elif action == "return":
             await start_return(update, context, actor, data)
         elif action == "handover":
@@ -2149,6 +2281,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>возврат от Асана: Альтопен 100мл 5 шт</i>",
         "💰 <b>Сдать выручку</b>: <i>сдал 50000</i> · /cash — ваша касса",
         "📞 <b>Телефон клиента</b>: <i>телефон Асана: 0700 12 34 56</i>",
+        "📅 <b>Обещание оплаты</b>: <i>Асан обещал 50000 в пятницу</i> — утром "
+        "напомню · /promises — список (заплатил: <i>Асан выполнил обещание</i>)",
     ]
     if can_transfer(actor):
         lines += [
@@ -3455,6 +3589,7 @@ async def _post_init(app):
     app.create_task(daily_backup_loop(app))
     app.create_task(monthly_deadstock_loop(app))
     app.create_task(draft_summary_loop(app))
+    app.create_task(promise_reminder_loop(app))
 
 
 if __name__ == "__main__":
@@ -3486,6 +3621,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("drafts", drafts_cmd))
     app.add_handler(CommandHandler("pricelog", pricelog_cmd))
+    app.add_handler(CommandHandler("promises", promises_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))
