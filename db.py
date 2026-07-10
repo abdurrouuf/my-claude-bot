@@ -354,16 +354,34 @@ def promises_close(client: str):
         return cur.rowcount
 
 
+def clients_add_bulk(wh_id: int, names: list):
+    """Создаёт клиентов справочником (долг 0). Возвращает (добавлены, пропущены)."""
+    conn = connect()
+    added, skipped = [], []
+    with _lock, conn:
+        for raw in names:
+            name = str(raw or "").strip()
+            if not name:
+                continue
+            row = conn.execute(
+                "SELECT 1 FROM clients WHERE warehouse_id=? AND name=?",
+                (wh_id, name)).fetchone()
+            if row:
+                skipped.append(name)
+                continue
+            conn.execute(
+                "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,0,NULL)",
+                (wh_id, name))
+            added.append(name)
+    return added, skipped
+
+
 def known_client_names(limit: int = 40):
-    """Имена клиентов: из базы клиентов + журнала черновиков (частые сначала).
-    Нужны как подсказка распознаванию голосовых."""
+    """Имена клиентов для подсказки распознаванию голосовых.
+    Сначала часто используемые (из журнала черновиков), потом остальной
+    справочник — чтобы большой импорт не вытеснил ходовые имена."""
     conn = connect()
     seen, out = set(), []
-    for r in conn.execute("SELECT name FROM clients ORDER BY id"):
-        k = r["name"].lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(r["name"])
     for r in conn.execute(
             "SELECT client, COUNT(*) AS n FROM draft_log "
             "GROUP BY client COLLATE NOCASEU ORDER BY n DESC, MAX(id) DESC"):
@@ -371,6 +389,11 @@ def known_client_names(limit: int = 40):
         if k not in seen:
             seen.add(k)
             out.append(r["client"])
+    for r in conn.execute("SELECT name FROM clients ORDER BY name"):
+        k = r["name"].lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(r["name"])
     return out[:limit]
 
 
