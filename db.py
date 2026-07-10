@@ -354,6 +354,26 @@ def promises_close(client: str):
         return cur.rowcount
 
 
+def known_client_names(limit: int = 40):
+    """Имена клиентов: из базы клиентов + журнала черновиков (частые сначала).
+    Нужны как подсказка распознаванию голосовых."""
+    conn = connect()
+    seen, out = set(), []
+    for r in conn.execute("SELECT name FROM clients ORDER BY id"):
+        k = r["name"].lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(r["name"])
+    for r in conn.execute(
+            "SELECT client, COUNT(*) AS n FROM draft_log "
+            "GROUP BY client COLLATE NOCASEU ORDER BY n DESC, MAX(id) DESC"):
+        k = r["client"].lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(r["client"])
+    return out[:limit]
+
+
 def log_draft(user_id: int, client: str, total: float, items: list | None = None):
     """Журнал черновиков (переходный период): учёт не трогает, только статистика."""
     conn = connect()
