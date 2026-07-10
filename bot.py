@@ -399,6 +399,12 @@ def build_dynamic_system(actor) -> str:
         if w:
             lines.append(f"- {u['name']} → склад «{w['name']}»")
     lines.append("Все склады: " + ", ".join(f"«{w['name']}»" for w in db.all_warehouses()))
+    known = db.known_client_names(40)
+    if known:
+        lines.append(
+            "Известные клиенты (сообщения часто приходят из распознавания голоса "
+            "с ошибками в именах — если имя клиента в сообщении созвучно одному "
+            "из этих, подставь точное имя из списка): " + ", ".join(known) + ".")
     return "\n".join(lines)
 
 
@@ -2087,7 +2093,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
 def _build_stt_prompt() -> str:
     """Подсказка Whisper, чтобы «Албенивер» не превращался в «Албанию».
     У Whisper лимит подсказки 224 токена, кириллица «тяжёлая» (~2 символа
-    на токен), поэтому держим строку короче ~320 символов."""
+    на токен), поэтому препараты держим в ~260 символах — остаток бюджета
+    отдаём именам клиентов (см. _stt_prompt_full)."""
     seen, names = set(), []
     for it in prices.PRICE_LIST_DATA:
         word = it["name"].split("(")[0].strip().split()[0].capitalize()
@@ -2098,10 +2105,32 @@ def _build_stt_prompt() -> str:
     tail = "; черновик, коробка, штук, долг, приход, сом."
     body = ""
     for n in names:
-        if len(head) + len(body) + len(n) + len(tail) + 2 > 320:
+        if len(head) + len(body) + len(n) + len(tail) + 2 > 260:
             break
         body += (", " if body else "") + n
     return head + body + tail
+
+
+STT_PROMPT_BUDGET = 420  # ~210 токенов кириллицы — с запасом до лимита 224
+
+
+def _stt_prompt_full() -> str:
+    """Подсказка Whisper: препараты + имена известных клиентов из базы."""
+    base = STT_PROMPT
+    try:
+        names = db.known_client_names(30)
+    except Exception:
+        log.exception("Не удалось получить имена клиентов для подсказки STT")
+        names = []
+    if not names:
+        return base
+    extra = ""
+    for n in names:
+        add = (", " if extra else " Клиенты: ") + n
+        if len(base) + len(extra) + len(add) + 1 > STT_PROMPT_BUDGET:
+            break
+        extra += add
+    return base + (extra + "." if extra else "")
 
 
 STT_PROMPT = _build_stt_prompt()
@@ -2113,7 +2142,7 @@ async def transcribe_audio(raw: bytes, filename: str, mime: str) -> str:
     url = f"{STT_BASE_URL}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {STT_API_KEY}"}
     data = {"model": STT_MODEL, "language": STT_LANGUAGE,
-            "temperature": "0", "prompt": STT_PROMPT}
+            "temperature": "0", "prompt": _stt_prompt_full()}
     async with httpx.AsyncClient(timeout=120) as cl:
         resp = await cl.post(url, headers=headers, data=data,
                              files={"file": (filename, raw, mime)})
