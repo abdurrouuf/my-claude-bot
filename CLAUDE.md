@@ -137,8 +137,15 @@ TRANSITION_MODE (1), DRAFT_WATERMARK (0), SUMMARY_HOUR (20), BACKUP_HOUR (3),
 DEBT_ALERT_DAYS (30), DEADSTOCK_DAYS (60), DRAFT_SUMMARY_HOUR (19),
 PROMISE_HOUR (9).
 Голосовые (STT): GROQ_API_KEY (рекомендуется, бесплатно) или OPENAI_API_KEY;
-тонкая настройка — STT_API_KEY, STT_BASE_URL, STT_MODEL, STT_LANGUAGE (ru),
-MAX_VOICE_SECONDS (300).
+тонкая настройка — STT_API_KEY, STT_BASE_URL, STT_MODEL, STT_LANGUAGE
+(ru; "auto" = автоопределение), MAX_VOICE_SECONDS (300).
+Кыргызский язык: ELEVENLABS_API_KEY — если задан, голосовые идут через
+ElevenLabs Scribe (ELEVENLABS_STT_MODEL, по умолчанию scribe_v1) с
+автоопределением языка: русский и кыргызский, можно вперемешку. Whisper
+кыргызский НЕ поддерживает (нет в его 99 языках). Подсказка с препаратами
+и клиентами в ElevenLabs не передаётся — ошибки имён правит ИИ по списку
+«Известные клиенты». Владельцу предложено зарегистрироваться на
+elevenlabs.io (бесплатный тариф ограничен, дальше от ~$5/мес).
 
 ## Идеи в очереди (обсуждены, владелец в курсе)
 

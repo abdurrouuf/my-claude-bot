@@ -84,8 +84,14 @@ STT_BASE_URL = os.environ.get("STT_BASE_URL") or (
     else "https://api.groq.com/openai/v1")
 STT_MODEL = os.environ.get("STT_MODEL") or (
     "whisper-1" if _STT_VIA_OPENAI else "whisper-large-v3")
-STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "ru")
+STT_LANGUAGE = os.environ.get("STT_LANGUAGE", "ru")  # "auto" = определять язык самому
 MAX_VOICE_SECONDS = int(os.environ.get("MAX_VOICE_SECONDS", "300"))
+
+# ElevenLabs Scribe — распознавание с поддержкой кыргызского (Whisper его не
+# знает). Если задан ELEVENLABS_API_KEY, голосовые идут через ElevenLabs
+# с автоопределением языка (русский/кыргызский вперемешку — ок).
+ELEVENLABS_API_KEY = os.environ.get("ELEVENLABS_API_KEY")
+ELEVENLABS_STT_MODEL = os.environ.get("ELEVENLABS_STT_MODEL", "scribe_v1")
 
 ADMIN_ID = 632294583  # Абдурроууф
 
@@ -375,7 +381,10 @@ def _build_static_system() -> str:
     parts.append("ПРАЙС-ЛИСТ (формат: №. Название | Фасовка | шт/кор | цена):")
     parts.append(prices.PRICE_LIST_TEXT)
     parts.append("")
-    parts.append("Общайся на русском. Отвечай кратко.")
+    parts.append("Сотрудники пишут и диктуют по-русски или по-кыргызски (бывает "
+                 "вперемешку) — понимай оба языка. Названия товаров всё равно "
+                 "сопоставляй с прайсом, числительные переводи в цифры.")
+    parts.append("Отвечай кратко, на языке сотрудника (по умолчанию — на русском).")
     return "\n".join(parts)
 
 
@@ -2204,13 +2213,42 @@ def _stt_prompt_full() -> str:
 STT_PROMPT = _build_stt_prompt()
 
 
-async def transcribe_audio(raw: bytes, filename: str, mime: str) -> str:
-    """Отправляет аудио в OpenAI-совместимый Whisper API, возвращает текст."""
+def _stt_error(resp) -> RuntimeError:
+    log.error("STT %s: %s", resp.status_code, resp.text[:500])
+    try:
+        j = resp.json()
+        detail = j.get("error", {}).get("message") or j.get("detail")
+        if isinstance(detail, dict):
+            detail = detail.get("message") or str(detail)
+        detail = str(detail or resp.text[:200])
+    except Exception:
+        detail = resp.text[:200]
+    return RuntimeError(f"сервис распознавания ответил {resp.status_code} ({detail})")
+
+
+async def _transcribe_elevenlabs(raw: bytes, filename: str, mime: str) -> str:
+    """ElevenLabs Scribe: поддерживает кыргызский, язык определяет сам."""
+    import httpx
+    async with httpx.AsyncClient(timeout=120) as cl:
+        resp = await cl.post(
+            "https://api.elevenlabs.io/v1/speech-to-text",
+            headers={"xi-api-key": ELEVENLABS_API_KEY},
+            data={"model_id": ELEVENLABS_STT_MODEL},
+            files={"file": (filename, raw, mime)},
+        )
+        if resp.status_code >= 400:
+            raise _stt_error(resp)
+        return (resp.json().get("text") or "").strip()
+
+
+async def _transcribe_whisper(raw: bytes, filename: str, mime: str) -> str:
+    """OpenAI-совместимый Whisper API (Groq/OpenAI)."""
     import httpx
     url = f"{STT_BASE_URL}/audio/transcriptions"
     headers = {"Authorization": f"Bearer {STT_API_KEY}"}
-    data = {"model": STT_MODEL, "language": STT_LANGUAGE,
-            "temperature": "0", "prompt": _stt_prompt_full()}
+    data = {"model": STT_MODEL, "temperature": "0", "prompt": _stt_prompt_full()}
+    if STT_LANGUAGE and STT_LANGUAGE != "auto":
+        data["language"] = STT_LANGUAGE
     async with httpx.AsyncClient(timeout=120) as cl:
         resp = await cl.post(url, headers=headers, data=data,
                              files={"file": (filename, raw, mime)})
@@ -2221,13 +2259,15 @@ async def transcribe_audio(raw: bytes, filename: str, mime: str) -> str:
             resp = await cl.post(url, headers=headers, data=data,
                                  files={"file": (filename, raw, mime)})
         if resp.status_code >= 400:
-            log.error("STT %s: %s", resp.status_code, resp.text[:500])
-            try:
-                detail = resp.json()["error"]["message"]
-            except Exception:
-                detail = resp.text[:200]
-            raise RuntimeError(f"сервис распознавания ответил {resp.status_code} ({detail})")
+            raise _stt_error(resp)
         return (resp.json().get("text") or "").strip()
+
+
+async def transcribe_audio(raw: bytes, filename: str, mime: str) -> str:
+    """Речь -> текст. ElevenLabs (если задан ключ, умеет кыргызский), иначе Whisper."""
+    if ELEVENLABS_API_KEY:
+        return await _transcribe_elevenlabs(raw, filename, mime)
+    return await _transcribe_whisper(raw, filename, mime)
 
 
 async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2239,7 +2279,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
-    if not STT_API_KEY:
+    if not STT_API_KEY and not ELEVENLABS_API_KEY:
         if is_admin(actor):
             await update.message.reply_text(
                 "🎤 Распознавание голосовых пока не настроено.\n\n"
