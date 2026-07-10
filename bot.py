@@ -346,6 +346,16 @@ def _build_static_system() -> str:
     parts.append('- promise_done выбирай только при слове «обещание». Если названа сумма '
                  'принесённых денег («Асан принёс 5000») — это оплата, режим 3.')
     parts.append("")
+    parts.append("=== РЕЖИМ 13: СПИСОК НОВЫХ КЛИЕНТОВ (только админ) ===")
+    parts.append('Если админ передаёт список клиентов для справочника («добавь клиентов '
+                 'на Каракол: Асан, Болот, ...», «новые клиенты: ...», или фото списка '
+                 'клиентов), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "add_clients", "warehouse": null_или_имя_склада, '
+                 '"clients": ["Полное имя 1", "Полное имя 2"]}')
+    parts.append('- Имена пиши полностью, включая город/село («Джумгалбек Кара-Балта»).')
+    parts.append('- Выбирай этот режим только при явных словах о добавлении клиентов, '
+                 'без товаров и сумм.')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -1235,6 +1245,53 @@ async def start_transfer(update, context, actor, data):
 
 # ---------- Спеццены ----------
 
+def add_clients_summary(p) -> str:
+    names = p["names"]
+    shown = names[:30]
+    lines = [f"👥 <b>Новые клиенты</b> — склад «{esc(p['wh_name'])}» "
+             f"({len(names)} чел.)", ""]
+    lines += [f"{i}. {esc(n)}" for i, n in enumerate(shown, 1)]
+    if len(names) > 30:
+        lines.append(f"… и ещё {len(names) - 30}")
+    if p["skipped"]:
+        lines.append(f"\nУже есть в базе (пропущу): {len(p['skipped'])}")
+    lines.append("\nДобавить в справочник? Долги у всех будут 0 — их занесём при "
+                 "полном переходе на учёт.")
+    return "\n".join(lines)
+
+
+async def start_add_clients(update, context, actor, data):
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Справочник клиентов пополняет только админ.")
+        return
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    seen, names, skipped = set(), [], []
+    for raw in (data.get("clients") or []):
+        name = str(raw or "").strip()
+        if not name or name.lower() in seen:
+            continue
+        seen.add(name.lower())
+        if db.client_exact(wh["id"], name):
+            skipped.append(name)
+        else:
+            names.append(name)
+    if not names:
+        await update.message.reply_text(
+            "Все названные клиенты уже есть в базе — добавлять нечего." if skipped
+            else "Не понял имена клиентов — перечислите их через запятую.")
+        return
+    payload = {"kind": "add_clients", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id,
+               "wh_id": wh["id"], "wh_name": wh["name"],
+               "names": names, "skipped": skipped}
+    token = new_pending(payload)
+    await update.message.reply_text(add_clients_summary(payload), parse_mode="HTML",
+                                    reply_markup=confirm_kb(token))
+
+
 async def start_promise(update, context, actor, data):
     client = str(data.get("client") or "").strip()
     if not client:
@@ -1929,6 +1986,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(
                     f"✅ Минимальные остатки для склада «{esc(p['wh_name'])}» сохранены "
                     f"({len(p['items'])} поз.). Посмотреть: /minstock", parse_mode="HTML")
+            elif p["kind"] == "add_clients":
+                added, skipped = db.clients_add_bulk(p["wh_id"], p["names"])
+                msg = (f"✅ Добавлено клиентов на склад «{esc(p['wh_name'])}»: "
+                       f"{len(added)}.")
+                if skipped:
+                    msg += f" Пропущено (уже были): {len(skipped)}."
+                msg += "\nТеперь голосовые будут распознавать эти имена точнее."
+                await q.edit_message_text(msg, parse_mode="HTML")
             elif p["kind"] == "change_price":
                 for it in p["items"]:
                     db.product_set_price(it["product_id"], it["price"], p["user_id"])
@@ -1990,6 +2055,8 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_set_price(update, context, actor, data)
         elif action == "change_price":
             await start_change_price(update, context, actor, data)
+        elif action == "add_clients":
+            await start_add_clients(update, context, actor, data)
         elif action == "promise":
             await start_promise(update, context, actor, data)
         elif action == "promise_done":
@@ -2054,9 +2121,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     instruction = (
-        "На фото — рукописный или печатный список товаров. Внимательно прочитай его "
+        "На фото — рукописный или печатный список. Внимательно прочитай его "
         "и разбери по правилам выше: накладная -> JSON invoice, перемещение -> transfer, "
-        "инвентаризация -> inventory. Названия сопоставь с прайсом. "
+        "инвентаризация -> inventory; если по подписи это список клиентов (без товаров) "
+        "-> add_clients. Названия товаров сопоставь с прайсом. "
         "Если какая-то строка неразборчива — не выдумывай, спроси текстом.")
     if caption:
         instruction += f"\nПодпись сотрудника к фото: {caption}"
@@ -2345,6 +2413,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
             "Общий прайс: «новая цена Альтопен 100мл 95» · /pricelog — история",
             "/abc — АВС-анализ: топ товаров и клиентов (можно: /abc неделя)",
+            "Справочник клиентов: «добавь клиентов на Каракол: Асан, Болот...» "
+            "(можно голосом или фото списка)",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
