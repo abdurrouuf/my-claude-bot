@@ -18,7 +18,7 @@ import db
 import prices
 from db import BISHKEK
 from invoice_pdf import (fmt_num, generate_act_pdf, generate_pdf_invoice,
-                         generate_price_pdf, safe_filename)
+                         generate_price_pdf, generate_report_pdf, safe_filename)
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
@@ -2739,21 +2739,33 @@ async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
-    lines = []
+    sections, summary = [], []
     for wh in whs:
         smap = db.stock_map(wh["id"])
-        lines.append(f"📦 <b>Склад «{esc(wh['name'])}»</b>")
-        any_row = False
+        rows, total_qty = [], 0
         for p in prices.PRICE_LIST_DATA:
             qty = smap.get(p["id"], 0)
             if qty:
-                mark = " ⚠️" if qty < 0 else ""
-                lines.append(f"{esc(p['name'])} {esc(p['volume'])} — <b>{qty} шт</b>{mark}")
-                any_row = True
-        if not any_row:
-            lines.append("— пусто —")
-        lines.append("")
-    await send_long(update.message, "\n".join(lines))
+                rows.append([p["id"], p["name"], p["volume"], f"{qty} шт"])
+                total_qty += qty
+        if rows:
+            sections.append({
+                "title": f"Склад «{wh['name']}»",
+                "headers": ["№", "Товар", "Фасовка", "Остаток"],
+                "rows": rows, "widths": [10, 105, 28, 24],
+                "footer": f"Позиций: {len(rows)} · всего {fmt_num(total_qty)} шт",
+            })
+            summary.append(f"📦 «{wh['name']}»: {len(rows)} поз., {fmt_num(total_qty)} шт")
+        else:
+            summary.append(f"📦 «{wh['name']}»: пусто")
+    if not sections:
+        await update.message.reply_text("\n".join(summary))
+        return
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf("ОСТАТКИ СКЛАДОВ", f"ОсОО «ВЕТОП» · на {date_str}", sections)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"остатки_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary))
 
 
 async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2770,27 +2782,42 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
-    lines = []
+    sections, summary = [], []
     grand_total = 0
     for wh in whs:
         clients = [c for c in db.clients_of(wh["id"]) if c["debt"] != 0]
-        lines.append(f"🏬 <b>Склад «{esc(wh['name'])}»</b>")
         if not clients:
-            lines.append("✅ Долгов нет")
-        else:
-            total = 0
-            for c in sorted(clients, key=lambda r: -r["debt"]):
-                if c["debt"] > 0:
-                    lines.append(f"👤 {esc(c['name'])}: <b>{money(c['debt'])}</b>")
-                    total += c["debt"]
-                else:
-                    lines.append(f"👤 {esc(c['name'])}: переплата {money(-c['debt'])}")
-            lines.append(f"💰 Итого: <b>{money(total)}</b>")
-            grand_total += total
-        lines.append("")
+            summary.append(f"🏬 «{wh['name']}»: долгов нет ✅")
+            continue
+        rows, total = [], 0
+        for c in sorted(clients, key=lambda r: -r["debt"]):
+            if c["debt"] > 0:
+                rows.append([c["name"], money(c["debt"]), c["phone"] or ""])
+                total += c["debt"]
+            else:
+                rows.append([c["name"], f"переплата {money(-c['debt'])}", c["phone"] or ""])
+        sections.append({
+            "title": f"Склад «{wh['name']}»",
+            "headers": ["Клиент", "Долг", "Телефон"],
+            "rows": rows, "widths": [85, 45, 37],
+            "footer": f"Итого долгов: {money(total)} · должников: "
+                      f"{sum(1 for c in clients if c['debt'] > 0)}",
+        })
+        summary.append(f"🏬 «{wh['name']}»: {money(total)} "
+                       f"({sum(1 for c in clients if c['debt'] > 0)} должн.)")
+        grand_total += total
+    if not sections:
+        await update.message.reply_text("\n".join(summary) or "✅ Долгов нет")
+        return
+    footer = f"ВСЕГО ПО СКЛАДАМ: {money(grand_total)}" if len(sections) > 1 else ""
     if len(whs) > 1:
-        lines.append(f"💰💰 Всего по складам: <b>{money(grand_total)}</b>")
-    await send_long(update.message, "\n".join(lines))
+        summary.append(f"💰 Всего: {money(grand_total)}")
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf("ДОЛГИ КЛИЕНТОВ", f"ОсОО «ВЕТОП» · на {date_str}",
+                              sections, footer=footer)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"долги_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary))
 
 
 async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -4052,27 +4079,42 @@ async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if wh is None:
             await update.message.reply_text("У вас нет склада. Пример: /expiry Каракол")
             return
-    rows = [r for r in db.expiry_list(wh["id"]) if r["qty"] > 0]
-    if not rows:
+    rows_db = [r for r in db.expiry_list(wh["id"]) if r["qty"] > 0]
+    if not rows_db:
         await update.message.reply_text(
             f"📅 По складу «{esc(wh['name'])}» сроков годности пока нет.",
             parse_mode="HTML")
         return
     now = datetime.now(BISHKEK)
     soon = now + timedelta(days=92)
-    lines = [f"📅 <b>Сроки годности — «{esc(wh['name'])}»</b> (ближайшие сверху)", ""]
-    for r in rows:
+    rows, n_expired, n_soon = [], 0, 0
+    for r in rows_db:
         p = prices.BY_ID.get(r["product_id"])
-        label = f"{p['name'].split('(')[0].strip()} {p['volume']}" if p else f"№{r['product_id']}"
+        label = p["name"].split("(")[0].strip() if p else f"товар №{r['product_id']}"
+        volume = p["volume"] if p else ""
         d = _expiry_key_to_date(r["expiry"])
         if d and d <= now:
-            mark = " ‼️ ПРОСРОЧЕНО"
+            status = "ПРОСРОЧЕНО!"
+            n_expired += 1
         elif d and d <= soon:
-            mark = " ⚠️ скоро"
+            status = "истекает скоро"
+            n_soon += 1
         else:
-            mark = ""
-        lines.append(f"• {r['expiry']} — {esc(label)}: {r['qty']} шт{mark}")
-    await send_long(update.message, "\n".join(lines))
+            status = ""
+        rows.append([r["expiry"], label, volume, f"{r['qty']} шт", status])
+    date_str = now.strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "СРОКИ ГОДНОСТИ", f"ОсОО «ВЕТОП» · склад «{wh['name']}» · на {date_str}",
+        [{"title": "", "headers": ["Срок", "Товар", "Фасовка", "Остаток", "Статус"],
+          "rows": rows, "widths": [18, 78, 24, 20, 27],
+          "footer": f"Позиций: {len(rows)} · просрочено: {n_expired} · "
+                    f"истекает в ближайшие 3 мес: {n_soon}"}])
+    caption = (f"📅 Сроки «{wh['name']}»: {len(rows)} поз."
+               + (f" · ‼️ просрочено: {n_expired}" if n_expired else "")
+               + (f" · ⚠️ скоро: {n_soon}" if n_soon else ""))
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"сроки_{safe_filename(wh['name'])}_{date_str.replace('.', '')}.pdf"),
+        caption=caption)
 
 
 async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
