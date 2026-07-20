@@ -219,6 +219,19 @@ async def post_feed(context, wh_ids, text: str):
             log.warning("Не удалось отправить в ленту %s: %s", chat_id, e)
 
 
+async def feed_invoice_pdf(context, wh_id, client_label, p, old_debt, total):
+    """PDF проведённой накладной — в чат-ленту склада (просьба владельца:
+    накладные Каракола видны всей команде склада)."""
+    wh = db.warehouse_by_id(wh_id)
+    if not wh or not wh["feed_chat_id"]:
+        return
+    try:
+        await send_invoice_pdf(context, wh["feed_chat_id"], client_label, p,
+                               old_debt, total)
+    except Exception as e:
+        log.warning("Не удалось отправить PDF в ленту склада %s: %s", wh_id, e)
+
+
 async def feed_operation(context, op_id: int, actor_name: str, prefix: str, note: str = ""):
     op = db.get_operation(op_id)
     if op is None:
@@ -2066,6 +2079,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
                 await notify_admin(context, actor, summary)
                 await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "🧾")
+                await feed_invoice_pdf(context, p["wh_id"], client_label, p, old_debt, total)
                 await alert_low_stock(context, [
                     (p["wh_id"], it["product_id"], -it["qty"])
                     for it in p["items"] if it.get("product_id")])
@@ -2183,6 +2197,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                        f"замена накладной №{p['old_op_id']} → №{op_id}: {summary}")
                     await feed_operation(context, op_id, db.get_user(p["user_id"])["name"],
                                          "🔁", f"замена накладной №{p['old_op_id']}")
+                    await feed_invoice_pdf(context, p["wh_id"], client_label, p,
+                                           old_debt, total)
                     await alert_low_stock(context, [
                         (p["wh_id"], it["product_id"], -it["qty"])
                         for it in p["items"] if it.get("product_id")])
