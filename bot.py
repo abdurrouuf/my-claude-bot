@@ -1951,7 +1951,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         if p.get("approver_id"):
             await q.edit_message_text("❌ Заявка отклонена.")
-            if p["kind"] == "inventory":
+            if p["kind"] == "invoice":
+                what = (f"накладную новому клиенту «{esc(p.get('client_name') or '')}» "
+                        f"со стартовым долгом")
+            elif p["kind"] == "inventory":
                 what = f"инвентаризацию склада «{esc(p['wh_name'])}»"
             elif p["kind"] == "return":
                 what = f"возврат от «{esc(p.get('client_name') or '')}»"
@@ -2016,6 +2019,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "nw":  # создаём нового клиента (только накладная)
         p["client_id"] = None
         await q.answer()
+        requester = db.get_user(p["user_id"])
+        if p.get("parsed_debt") and requester["role"] != "admin":
+            # Новый клиент со стартовым долгом — только с подтверждения админа
+            # (иначе сотрудник мог бы «нарисовать» долг с нуля).
+            p["approver_id"] = ADMIN_ID
+            p["requester_name"] = requester["name"]
+            p["ttl"] = APPROVAL_TTL
+            try:
+                await context.bot.send_message(
+                    ADMIN_ID,
+                    f"⚠️ <b>{esc(requester['name'])}</b> выписывает накладную НОВОМУ "
+                    f"клиенту со стартовым долгом {money(p['parsed_debt'])} — нужно "
+                    f"ваше подтверждение.\n\n" + invoice_summary(p),
+                    parse_mode="HTML",
+                    reply_markup=InlineKeyboardMarkup([[
+                        InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
+                        InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+                    ]]))
+                await q.edit_message_text(
+                    "📨 Новый клиент со стартовым долгом — заявка ушла админу "
+                    "на подтверждение. Я сообщу результат.")
+            except Exception:
+                log.exception("Не удалось отправить заявку о новом клиенте админу")
+                await q.edit_message_text("⚠️ Не удалось отправить админу. Попробуйте позже.")
+                PENDING.pop(token, None)
+            return
         await q.edit_message_text(invoice_summary(p), parse_mode="HTML", reply_markup=confirm_kb(token))
         return
 
@@ -2026,6 +2055,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if p["kind"] == "invoice":
                 op_id, client_label, old_debt, total, summary = commit_invoice(p)
                 await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
+                if p.get("approver_id"):
+                    try:
+                        await context.bot.send_message(
+                            p["chat_id"],
+                            f"✅ Админ подтвердил накладную №{op_id} новому клиенту "
+                            f"«{esc(client_label)}».", parse_mode="HTML")
+                    except Exception:
+                        log.warning("Не удалось уведомить заявителя о накладной")
                 await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
                 await notify_admin(context, actor, summary)
                 await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "🧾")
