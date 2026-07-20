@@ -2684,6 +2684,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "",
         "📌 <b>Команды:</b>",
         "/stock — остатки склада",
+        "/stockprice — остатки с ценами и суммой по прайсу",
         "/debts — долги клиентов",
         "/report — отчёт (можно: /report неделя, /report Бишкек месяц)",
         "/olddebts — кто давно не платил (можно: /olddebts 45)",
@@ -2826,6 +2827,60 @@ async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf = generate_report_pdf("ОСТАТКИ СКЛАДОВ", f"ОсОО «ВЕТОП» · на {date_str}", sections)
     await update.message.reply_document(
         document=InputFile(pdf, filename=f"остатки_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary))
+
+
+async def show_stock_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остатки склада с продажными ценами и суммой по прайсу (/stockprice)."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if arg and arg.lower() != "all":
+        wh = db.warehouse_by_name(arg)
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    sections, summary = [], []
+    for wh in whs:
+        smap = db.stock_map(wh["id"])
+        rows, total_qty, total_sum, in_stock = [], 0, 0.0, 0
+        for p in prices.PRICE_LIST_DATA:
+            qty = smap.get(p["id"], 0)
+            sub = qty * p["price"]
+            rows.append([p["id"], p["name"], p["volume"],
+                         f"{qty} шт" if qty else "—",
+                         fmt_num(p["price"]),
+                         fmt_num(sub) if qty else "—"])
+            if qty:
+                total_qty += qty
+                total_sum += sub
+                in_stock += 1
+        if in_stock:
+            sections.append({
+                "title": f"Склад «{wh['name']}»",
+                "headers": ["№", "Товар", "Фасовка", "Остаток", "Цена", "Сумма"],
+                "rows": rows, "widths": [10, 76, 24, 19, 17, 21],
+                "footer": (f"В наличии: {in_stock} из {len(rows)} позиций прайса · "
+                           f"{fmt_num(total_qty)} шт · на {money(total_sum)}"),
+            })
+            summary.append(f"💰 «{wh['name']}»: {fmt_num(total_qty)} шт "
+                           f"на {money(total_sum)} по прайсу")
+        else:
+            summary.append(f"📦 «{wh['name']}»: пусто")
+    if not sections:
+        await update.message.reply_text("\n".join(summary))
+        return
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ОСТАТКИ С ЦЕНАМИ",
+        f"ОсОО «ВЕТОП» · продажные цены · на {date_str}", sections)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"остатки_цены_{date_str.replace('.', '')}.pdf"),
         caption="\n".join(summary))
 
 
@@ -4444,6 +4499,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("price", show_price))
     app.add_handler(CommandHandler("pricepdf", pricepdf_cmd))
     app.add_handler(CommandHandler("stock", show_stock))
+    app.add_handler(CommandHandler("stockprice", show_stock_price))
     app.add_handler(CommandHandler("debts", show_debts))
     app.add_handler(CommandHandler("payment", payment_cmd))
     app.add_handler(CommandHandler("invoice", invoice_hint))
