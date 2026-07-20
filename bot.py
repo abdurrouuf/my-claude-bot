@@ -601,6 +601,35 @@ def apply_client_prices(p):
             it["special"] = True
 
 
+def insufficient_stock(wh_id: int, items, extra_available: dict | None = None):
+    """Каких позиций не хватает на складе: [(name, volume, есть, нужно)].
+    extra_available — количества, которые вернутся на склад перед проведением
+    (например, при замене накладной)."""
+    need = {}
+    for it in items:
+        pid = it.get("product_id")
+        if pid:
+            need[pid] = need.get(pid, 0) + it["qty"]
+    lack = []
+    for pid, qty in need.items():
+        have = db.stock_qty(wh_id, pid) + (extra_available or {}).get(pid, 0)
+        if have < qty:
+            p = prices.BY_ID.get(pid)
+            lack.append((p["name"] if p else f"товар №{pid}",
+                         p["volume"] if p else "", have, qty))
+    return lack
+
+
+def lack_message(lack) -> str:
+    lines = ["⛔ Не хватает товара на складе — накладная НЕ проведена:"]
+    for name, volume, have, qty in lack:
+        lines.append(f"• {esc(name)} {esc(volume)}: на складе {have} шт, "
+                     f"в накладной {qty} шт")
+    lines.append("Уменьшите количество или пополните склад. "
+                 "Черновик выписать можно всегда.")
+    return "\n".join(lines)
+
+
 def invoice_summary(p) -> str:
     lines = ["📋 <b>Проверьте накладную</b>", f"🏬 Склад: <b>{esc(p['wh_name'])}</b>"]
     if p["client_id"]:
@@ -735,6 +764,13 @@ async def start_invoice(update, context, actor, data, draft=False):
                        "sum": it["qty"] * it["price"]} for it in items])
         return
 
+    # Реальная накладная: больше, чем есть на складе, выписать нельзя
+    # (решение владельца 21.07.2026).
+    lack = insufficient_stock(wh["id"], items)
+    if lack:
+        await update.message.reply_text(lack_message(lack), parse_mode="HTML")
+        return
+
     payload = {
         "kind": "invoice", "user_id": actor["id"], "chat_id": update.effective_chat.id,
         "wh_id": wh["id"], "wh_name": wh["name"],
@@ -863,6 +899,14 @@ async def start_amend_invoice(update, context, actor, data):
             "price_explicit": True,  # цены старой накладной не пересчитываем
         })
     old_total = sum((it["qty"] or 0) * (it["price"] or 0) for it in old_items)
+    back = {}
+    for it in old_items:
+        if it.get("product_id"):
+            back[it["product_id"]] = back.get(it["product_id"], 0) + it["qty"]
+    lack = insufficient_stock(wh["id"], old_items + new_items, extra_available=back)
+    if lack:
+        await update.message.reply_text(lack_message(lack), parse_mode="HTML")
+        return
     payload = {
         "kind": "amend_invoice", "user_id": actor["id"],
         "chat_id": update.effective_chat.id,
@@ -2066,6 +2110,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.answer()
         try:
             if p["kind"] == "invoice":
+                lack = insufficient_stock(p["wh_id"], p["items"])
+                if lack:
+                    await q.edit_message_text(lack_message(lack), parse_mode="HTML")
+                    return
                 op_id, client_label, old_debt, total, summary = commit_invoice(p)
                 await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
                 if p.get("approver_id"):
@@ -2181,6 +2229,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ Минимальные остатки для склада «{esc(p['wh_name'])}» сохранены "
                     f"({len(p['items'])} поз.). Посмотреть: /minstock", parse_mode="HTML")
             elif p["kind"] == "amend_invoice":
+                back = {}
+                for it in p["items"][:p["old_count"]]:
+                    if it.get("product_id"):
+                        back[it["product_id"]] = back.get(it["product_id"], 0) + it["qty"]
+                lack = insufficient_stock(p["wh_id"], p["items"], extra_available=back)
+                if lack:
+                    await q.edit_message_text(lack_message(lack), parse_mode="HTML")
+                    return
                 ok, why = db.cancel_operation(p["old_op_id"])
                 if not ok:
                     await q.edit_message_text(
