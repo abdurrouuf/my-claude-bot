@@ -2941,10 +2941,21 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
+    pdf, caption = build_report_pdf(whs, days_back, label)
+    if pdf is None:
+        await update.message.reply_text(caption)
+        return
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"отчёт_{date_str.replace('.', '')}.pdf"),
+        caption=caption)
+
+
+def build_report_pdf(whs, days_back: int, label: str):
+    """PDF-отчёт по складам. Возвращает (pdf, подпись) или (None, текст-пусто)."""
     data = report_data(whs, days_back)
     if all(d["empty"] for d in data):
-        await update.message.reply_text(f"📊 Операций {label} не было.")
-        return
+        return None, f"📊 Операций {label} не было."
     sections, summary = [], []
     grand_sales = grand_money = 0
     for d in data:
@@ -2980,20 +2991,18 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf = generate_report_pdf("ОТЧЁТ ПО СКЛАДАМ",
                               f"ОсОО «ВЕТОП» · {label} · на {date_str}",
                               sections, footer=footer)
-    await update.message.reply_document(
-        document=InputFile(pdf, filename=f"отчёт_{date_str.replace('.', '')}.pdf"),
-        caption="\n".join(summary)[:1000])
+    return pdf, "\n".join(summary)[:1000]
 
 
 async def send_evening_summaries(bot):
-    """Вечерняя сводка дня в каждый чат-ленту (если были операции)."""
+    """Вечерняя сводка дня в каждый чат-ленту (если были операции) — PDF."""
     by_chat = {}
     for wh in db.all_warehouses():
         if wh["feed_chat_id"]:
             by_chat.setdefault(wh["feed_chat_id"], []).append(wh)
     for chat_id, whs in by_chat.items():
-        text = build_report(whs, 0, "за сегодня")
-        if "Накладных" not in text and "Приходов" not in text:
+        pdf, caption = build_report_pdf(whs, 0, "за сегодня")
+        if pdf is None:
             continue  # день без операций — не шумим
         wh_ids = {w["id"] for w in whs}
         cash_lines = []
@@ -3003,11 +3012,16 @@ async def send_evening_summaries(bot):
                 continue
             cash = db.cash_on_hand(u["id"])
             if cash > 0:
-                cash_lines.append(f"💰 В кассе у {esc(u['name'])}: <b>{money(cash)}</b>")
+                cash_lines.append(f"💰 В кассе у {u['name']}: {money(cash)}")
+        caption = "🌆 Итоги дня\n" + caption
         if cash_lines:
-            text += "\n\n" + "\n".join(cash_lines)
+            caption += "\n" + "\n".join(cash_lines)
+        date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
         try:
-            await bot.send_message(chat_id, "🌆 Итоги дня\n\n" + text, parse_mode="HTML")
+            await bot.send_document(
+                chat_id,
+                document=InputFile(pdf, filename=f"итоги_дня_{date_str}.pdf"),
+                caption=caption[:1000])
         except Exception as e:
             log.warning("Не удалось отправить сводку в %s: %s", chat_id, e)
 
