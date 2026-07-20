@@ -109,6 +109,69 @@ def _watermark(font_bold_name):
     return draw
 
 
+def generate_report_pdf(title: str, subtitle: str, sections: list,
+                        footer: str = "") -> io.BytesIO:
+    """Универсальный фирменный PDF-отчёт (остатки, долги, сроки и т.п.).
+
+    sections: [{"title": str, "headers": [str], "rows": [[str]],
+                "footer": str (опц.), "widths": [мм] (опц.)}]
+    """
+    from reportlab.lib.pagesizes import A4
+
+    font_name, font_bold_name = _register_fonts()
+    buffer = io.BytesIO()
+    doc = SimpleDocTemplate(buffer, pagesize=A4,
+                            rightMargin=14*mm, leftMargin=14*mm,
+                            topMargin=10*mm, bottomMargin=12*mm)
+
+    HEADER_GREEN = colors.HexColor("#1b5e20")
+    LIGHT_ROW = colors.HexColor("#f1f8e9")
+
+    title_style = ParagraphStyle('title', fontName=font_bold_name, fontSize=15,
+                                 leading=19, alignment=TA_CENTER, spaceAfter=2)
+    sub_style = ParagraphStyle('sub', fontName=font_name, fontSize=9.5,
+                               leading=13, alignment=TA_CENTER,
+                               textColor=HEADER_GREEN, spaceAfter=4)
+    sec_style = ParagraphStyle('sec', fontName=font_bold_name, fontSize=11.5,
+                               leading=15, spaceBefore=5, spaceAfter=3,
+                               textColor=HEADER_GREEN)
+    cell_style = ParagraphStyle('cell', fontName=font_name, fontSize=8.5, leading=11)
+    head_style = ParagraphStyle('cellb', fontName=font_bold_name, fontSize=9,
+                                leading=12, textColor=colors.white, alignment=TA_CENTER)
+    foot_style = ParagraphStyle('foot', fontName=font_bold_name, fontSize=10,
+                                leading=14, spaceBefore=3)
+
+    story = [Paragraph(xml_escape(title), title_style),
+             Paragraph(xml_escape(subtitle), sub_style)]
+    for sec in sections:
+        if sec.get("title"):
+            story.append(Paragraph(xml_escape(sec["title"]), sec_style))
+        headers = sec["headers"]
+        data = [[Paragraph(xml_escape(h), head_style) for h in headers]]
+        for row in sec["rows"]:
+            data.append([Paragraph(xml_escape(str(c)), cell_style) for c in row])
+        widths = sec.get("widths")
+        col_widths = [w * mm for w in widths] if widths else None
+        table = Table(data, colWidths=col_widths, repeatRows=1)
+        table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), HEADER_GREEN),
+            ("ROWBACKGROUNDS", (0, 1), (-1, -1), [colors.white, LIGHT_ROW]),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.HexColor("#c8e6c9")),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("TOPPADDING", (0, 0), (-1, -1), 2.5),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 2.5),
+        ]))
+        story.append(table)
+        if sec.get("footer"):
+            story.append(Paragraph(xml_escape(sec["footer"]), foot_style))
+        story.append(Spacer(1, 3*mm))
+    if footer:
+        story.append(Paragraph(xml_escape(footer), foot_style))
+    doc.build(story)
+    buffer.seek(0)
+    return buffer
+
+
 def generate_price_pdf(price_data) -> io.BytesIO:
     """Фирменный прайс-лист для рассылки клиентам."""
     from reportlab.lib.pagesizes import A4
