@@ -357,10 +357,12 @@ def _build_static_system() -> str:
                  'на Каракол: Асан, Болот, ...», «новые клиенты: ...», или фото списка '
                  'клиентов), верни ТОЛЬКО JSON:')
     parts.append('{"action": "add_clients", "warehouse": null_или_имя_склада, '
-                 '"clients": ["Полное имя 1", "Полное имя 2"]}')
+                 '"clients": [{"name": "Полное имя", "debt": 0}]}')
     parts.append('- Имена пиши полностью, включая город/село («Джумгалбек Кара-Балта»).')
+    parts.append('- "debt": стартовый долг клиента, если указан рядом с именем '
+                 '(«Асан — 31470», «Болот долг 12000»); не указан — 0.')
     parts.append('- Выбирай этот режим только при явных словах о добавлении клиентов, '
-                 'без товаров и сумм.')
+                 'без товаров.')
     parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
@@ -672,14 +674,14 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total, d
 
 
 async def start_invoice(update, context, actor, data, draft=False):
-    if not draft and TRANSITION_MODE:
-        # Переходный период: любая накладная — и сотрудника, и админа —
-        # автоматически становится черновиком (база не меняется).
-        draft = True
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
+    if not draft and TRANSITION_MODE and not wh["full_mode"]:
+        # Переходный период: накладная автоматически становится черновиком.
+        # Склады в полном режиме (/fullmode) работают по-настоящему.
+        draft = True
     client_name = str(data.get("client") or "").strip()
     if not client_name:
         await update.message.reply_text("Не понял имя клиента — напишите ещё раз, имя обязательно.")
@@ -820,7 +822,8 @@ def commit_handover(p):
 
 
 async def start_handover(update, context, actor, data):
-    if transition_blocked(actor):
+    own = db.warehouse_of(actor["id"])
+    if transition_blocked(actor) and not (own and own["full_mode"]):
         await update.message.reply_text(TRANSITION_HINT)
         return
     try:
@@ -950,12 +953,12 @@ async def send_return_pdf(context, chat_id, client_label, p, old_debt, total):
 
 
 async def start_return(update, context, actor, data):
-    if transition_blocked(actor):
-        await update.message.reply_text(TRANSITION_HINT)
-        return
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
+        return
+    if transition_blocked(actor) and not wh["full_mode"]:
+        await update.message.reply_text(TRANSITION_HINT)
         return
     client_name = str(data.get("client") or "").strip()
     if not client_name:
@@ -1080,12 +1083,12 @@ def commit_payment(p):
 
 
 async def start_payment(update, context, actor, data):
-    if transition_blocked(actor):
-        await update.message.reply_text(TRANSITION_HINT)
-        return
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
+        return
+    if transition_blocked(actor) and not wh["full_mode"]:
+        await update.message.reply_text(TRANSITION_HINT)
         return
     client_name = str(data.get("client") or "").strip()
     try:
@@ -1182,9 +1185,6 @@ def commit_transfer(p):
 
 
 async def start_transfer(update, context, actor, data):
-    if transition_blocked(actor):
-        await update.message.reply_text(TRANSITION_HINT)
-        return
     to_name = str(data.get("to_warehouse") or "").strip()
     to_wh = db.warehouse_by_name(to_name) if to_name else None
     if to_wh is None:
@@ -1203,6 +1203,10 @@ async def start_transfer(update, context, actor, data):
         if from_wh["id"] == to_wh["id"]:
             await update.message.reply_text("Склад-источник и склад-получатель совпадают.")
             return
+    if transition_blocked(actor) and not (
+            to_wh["full_mode"] or (from_wh and from_wh["full_mode"])):
+        await update.message.reply_text(TRANSITION_HINT)
+        return
     # Приход извне (без склада-источника) — только админ или старший.
     if from_wh is None and not can_transfer(actor):
         await update.message.reply_text(
@@ -1259,17 +1263,20 @@ async def start_transfer(update, context, actor, data):
 # ---------- Спеццены ----------
 
 def add_clients_summary(p) -> str:
-    names = p["names"]
-    shown = names[:30]
+    entries = p["entries"]
+    shown = entries[:30]
+    total_debt = sum(d for _, d in entries)
     lines = [f"👥 <b>Новые клиенты</b> — склад «{esc(p['wh_name'])}» "
-             f"({len(names)} чел.)", ""]
-    lines += [f"{i}. {esc(n)}" for i, n in enumerate(shown, 1)]
-    if len(names) > 30:
-        lines.append(f"… и ещё {len(names) - 30}")
+             f"({len(entries)} чел.)", ""]
+    for i, (n, debt) in enumerate(shown, 1):
+        lines.append(f"{i}. {esc(n)}" + (f" — долг {money(debt)}" if debt else ""))
+    if len(entries) > 30:
+        lines.append(f"… и ещё {len(entries) - 30}")
     if p["skipped"]:
-        lines.append(f"\nУже есть в базе (пропущу): {len(p['skipped'])}")
-    lines.append("\nДобавить в справочник? Долги у всех будут 0 — их занесём при "
-                 "полном переходе на учёт.")
+        lines.append(f"\nУже есть в базе (пропущу, долг им не меняю): {len(p['skipped'])}")
+    if total_debt:
+        lines.append(f"\n💰 Стартовые долги, итого: <b>{money(total_debt)}</b>")
+    lines.append("\nДобавить в справочник?")
     return "\n".join(lines)
 
 
@@ -1281,17 +1288,24 @@ async def start_add_clients(update, context, actor, data):
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-    seen, names, skipped = set(), [], []
+    seen, entries, skipped = set(), [], []
     for raw in (data.get("clients") or []):
-        name = str(raw or "").strip()
+        if isinstance(raw, dict):
+            name = str(raw.get("name") or "").strip()
+            try:
+                debt = float(raw.get("debt") or 0)
+            except (TypeError, ValueError):
+                debt = 0.0
+        else:
+            name, debt = str(raw or "").strip(), 0.0
         if not name or name.lower() in seen:
             continue
         seen.add(name.lower())
         if db.client_exact(wh["id"], name):
             skipped.append(name)
         else:
-            names.append(name)
-    if not names:
+            entries.append((name, debt))
+    if not entries:
         await update.message.reply_text(
             "Все названные клиенты уже есть в базе — добавлять нечего." if skipped
             else "Не понял имена клиентов — перечислите их через запятую.")
@@ -1299,7 +1313,7 @@ async def start_add_clients(update, context, actor, data):
     payload = {"kind": "add_clients", "user_id": actor["id"],
                "chat_id": update.effective_chat.id,
                "wh_id": wh["id"], "wh_name": wh["name"],
-               "names": names, "skipped": skipped}
+               "entries": entries, "skipped": skipped}
     token = new_pending(payload)
     await update.message.reply_text(add_clients_summary(payload), parse_mode="HTML",
                                     reply_markup=confirm_kb(token))
@@ -1597,12 +1611,12 @@ def commit_inventory(p):
 
 
 async def start_inventory(update, context, actor, data):
-    if transition_blocked(actor):
-        await update.message.reply_text(TRANSITION_HINT)
-        return
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
+        return
+    if transition_blocked(actor) and not wh["full_mode"]:
+        await update.message.reply_text(TRANSITION_HINT)
         return
     items, warnings = [], []
     for it in (data.get("items") or []):
@@ -1999,10 +2013,30 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(
                     f"✅ Минимальные остатки для склада «{esc(p['wh_name'])}» сохранены "
                     f"({len(p['items'])} поз.). Посмотреть: /minstock", parse_mode="HTML")
+            elif p["kind"] == "load_karakol":
+                from karakol_stock_data import KARAKOL_STOCK
+                deltas = [(p["wh_id"], pid, qty)
+                          for pid, qty, _ in KARAKOL_STOCK if qty > 0]
+                total = sum(d[2] for d in deltas)
+                op_id, _ = db.commit_operation(
+                    p["user_id"], "inventory", p["wh_id"], None,
+                    f"Стартовая загрузка остатков Каракола: {len(deltas)} поз., {total} шт",
+                    deltas, [], {"load": "karakol"})
+                for pid, qty, exp in KARAKOL_STOCK:
+                    if qty > 0 and exp:
+                        db.set_product_expiry(p["wh_id"], pid, exp)
+                await q.edit_message_text(
+                    f"✅ Остатки Каракола загружены (операция №{op_id}): "
+                    f"{len(deltas)} позиций, {total} шт.\n"
+                    "Сроки годности сохранены — смотрите /expiry Каракол.\n"
+                    "Проверьте: /stock (у Данияра) или /report Каракол.")
             elif p["kind"] == "add_clients":
-                added, skipped = db.clients_add_bulk(p["wh_id"], p["names"])
+                added, skipped = db.clients_add_bulk(p["wh_id"], p["entries"])
+                total_debt = sum(d for _, d in p["entries"])
                 msg = (f"✅ Добавлено клиентов на склад «{esc(p['wh_name'])}»: "
                        f"{len(added)}.")
+                if total_debt:
+                    msg += f" Стартовые долги: {money(total_debt)}."
                 if skipped:
                     msg += f" Пропущено (уже были): {len(skipped)}."
                 msg += "\nТеперь голосовые будут распознавать эти имена точнее."
@@ -2458,7 +2492,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Общий прайс: «новая цена Альтопен 100мл 95» · /pricelog — история",
             "/abc — АВС-анализ: топ товаров и клиентов (можно: /abc неделя)",
             "Справочник клиентов: «добавь клиентов на Каракол: Асан, Болот...» "
-            "(можно голосом или фото списка)",
+            "(можно голосом или фото списка; с долгами: «Асан — 31470»)",
+            "/fullmode — какие склады в полном учёте (включить: /fullmode Каракол)",
+            "/expiry Склад — сроки годности товара",
             "/undo N — отменить любую операцию",
         ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
@@ -3730,6 +3766,122 @@ async def draft_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await process_text(update, context, actor, " ".join(context.args), draft=True)
 
 
+async def fullmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полный режим склада: выводит склад из переходного периода."""
+    if await _require_admin(update) is None:
+        return
+    args = list(context.args or [])
+    turn_off = False
+    if args and args[0].lower() in ("выкл", "off"):
+        turn_off = True
+        args = args[1:]
+    if not args:
+        lines = ["🏭 <b>Режимы складов:</b>"]
+        for w in db.all_warehouses():
+            mode = "🟢 полный учёт" if w["full_mode"] else "📝 черновики (переходный)"
+            lines.append(f"• {esc(w['name'])} — {mode}")
+        lines.append("")
+        lines.append("Включить: /fullmode Каракол · выключить: /fullmode выкл Каракол")
+        await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+        return
+    name = " ".join(args)
+    wh = db.warehouse_by_name(name)
+    if wh is None:
+        await update.message.reply_text(f"Склад «{esc(name)}» не найден.", parse_mode="HTML")
+        return
+    db.set_warehouse_full(wh["id"], not turn_off)
+    if turn_off:
+        await update.message.reply_text(
+            f"📝 Склад «{esc(wh['name'])}» вернулся в переходный режим (черновики).",
+            parse_mode="HTML")
+    else:
+        await update.message.reply_text(
+            f"🟢 Склад «{esc(wh['name'])}» переведён в ПОЛНЫЙ УЧЁТ:\n"
+            "• накладные проводятся по-настоящему (кнопка подтверждения, "
+            "остатки и долги меняются)\n"
+            "• оплаты, возвраты, перемещения и сдача выручки работают\n"
+            "• слово «черновик» по-прежнему делает черновик\n"
+            "Остальные склады остаются на черновиках.", parse_mode="HTML")
+
+
+async def loadkarakol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Стартовая загрузка остатков Каракола (подтверждённые данные владельца)."""
+    if await _require_admin(update) is None:
+        return
+    from karakol_stock_data import KARAKOL_STOCK
+    wh = db.warehouse_by_name("Каракол")
+    if wh is None:
+        await update.message.reply_text("Склад «Каракол» не найден.")
+        return
+    nonzero_now = sum(1 for q in db.stock_map(wh["id"]).values() if q)
+    if nonzero_now:
+        await update.message.reply_text(
+            f"⚠️ На Караколе уже есть остатки ({nonzero_now} позиций) — повторная "
+            "загрузка задвоит их. Если нужно перезаписать — сначала обнулите "
+            "инвентаризацией или напишите Джарвису.")
+        return
+    items = [(pid, qty, exp) for pid, qty, exp in KARAKOL_STOCK if qty > 0]
+    total = sum(q for _, q, _ in items)
+    payload = {"kind": "load_karakol", "user_id": update.effective_user.id,
+               "chat_id": update.effective_chat.id, "wh_id": wh["id"]}
+    token = new_pending(payload)
+    await update.message.reply_text(
+        f"📦 <b>Стартовая загрузка остатков — склад «Каракол»</b>\n\n"
+        f"Позиций с остатком: <b>{len(items)}</b> (из {len(KARAKOL_STOCK)} в прайсе)\n"
+        f"Всего: <b>{total} шт</b>\n"
+        f"Сроки годности будут сохранены ({sum(1 for _, q, e in KARAKOL_STOCK if q and e)} позиций).\n\n"
+        "Данные — из проверенной вами таблицы от 19.07.2026 "
+        "(просрочка входит, Цефти DC 10 мл). Провести?",
+        parse_mode="HTML", reply_markup=confirm_kb(token))
+
+
+def _expiry_key_to_date(exp: str):
+    try:
+        mm, yyyy = exp.split(".")
+        return datetime(int(yyyy), int(mm), 1, tzinfo=BISHKEK)
+    except (ValueError, AttributeError):
+        return None
+
+
+async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сроки годности по складу (по умолчанию — свой склад)."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    name = " ".join(context.args or [])
+    if name:
+        wh = db.warehouse_by_name(name)
+        if wh is None:
+            await update.message.reply_text(f"Склад «{esc(name)}» не найден.", parse_mode="HTML")
+            return
+    else:
+        wh = db.warehouse_of(actor["id"])
+        if wh is None:
+            await update.message.reply_text("У вас нет склада. Пример: /expiry Каракол")
+            return
+    rows = [r for r in db.expiry_list(wh["id"]) if r["qty"] > 0]
+    if not rows:
+        await update.message.reply_text(
+            f"📅 По складу «{esc(wh['name'])}» сроков годности пока нет.",
+            parse_mode="HTML")
+        return
+    now = datetime.now(BISHKEK)
+    soon = now + timedelta(days=92)
+    lines = [f"📅 <b>Сроки годности — «{esc(wh['name'])}»</b> (ближайшие сверху)", ""]
+    for r in rows:
+        p = prices.BY_ID.get(r["product_id"])
+        label = f"{p['name'].split('(')[0].strip()} {p['volume']}" if p else f"№{r['product_id']}"
+        d = _expiry_key_to_date(r["expiry"])
+        if d and d <= now:
+            mark = " ‼️ ПРОСРОЧЕНО"
+        elif d and d <= soon:
+            mark = " ⚠️ скоро"
+        else:
+            mark = ""
+        lines.append(f"• {r['expiry']} — {esc(label)}: {r['qty']} шт{mark}")
+    await send_long(update.message, "\n".join(lines))
+
+
 async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """АВС-анализ: какие товары и клиенты дают выручку. По реальным накладным;
     пока их нет (переходный период) — по черновикам."""
@@ -3863,6 +4015,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pricelog", pricelog_cmd))
     app.add_handler(CommandHandler("promises", promises_cmd))
     app.add_handler(CommandHandler("abc", abc_cmd))
+    app.add_handler(CommandHandler("fullmode", fullmode_cmd))
+    app.add_handler(CommandHandler("loadkarakol", loadkarakol_cmd))
+    app.add_handler(CommandHandler("expiry", expiry_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("undo", undo_cmd))

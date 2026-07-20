@@ -116,6 +116,12 @@ CREATE TABLE IF NOT EXISTS price_history(
     new_price  REAL NOT NULL,
     user_id    INTEGER NOT NULL
 );
+CREATE TABLE IF NOT EXISTS product_expiry(
+    warehouse_id INTEGER NOT NULL,
+    product_id   INTEGER NOT NULL,
+    expiry       TEXT NOT NULL,              -- "MM.YYYY"
+    UNIQUE(warehouse_id, product_id)
+);
 CREATE TABLE IF NOT EXISTS promises(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT NOT NULL,
@@ -200,6 +206,8 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             conn.execute("ALTER TABLE clients ADD COLUMN phone TEXT")
         if "items" not in _columns(conn, "draft_log"):
             conn.execute("ALTER TABLE draft_log ADD COLUMN items TEXT")
+        if "full_mode" not in _columns(conn, "warehouses"):
+            conn.execute("ALTER TABLE warehouses ADD COLUMN full_mode INTEGER NOT NULL DEFAULT 0")
         if "feed_chat_id" not in _columns(conn, "warehouses") and \
            "owner_id" not in _columns(conn, "warehouses"):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_id INTEGER")
@@ -354,13 +362,17 @@ def promises_close(client: str):
         return cur.rowcount
 
 
-def clients_add_bulk(wh_id: int, names: list):
-    """Создаёт клиентов справочником (долг 0). Возвращает (добавлены, пропущены)."""
+def clients_add_bulk(wh_id: int, entries: list):
+    """Создаёт клиентов справочником. entries: [(имя, долг)] или [имя].
+    Существующие пропускаются (долг им НЕ меняется). Возвращает (добавлены, пропущены)."""
     conn = connect()
     added, skipped = [], []
     with _lock, conn:
-        for raw in names:
-            name = str(raw or "").strip()
+        for raw in entries:
+            if isinstance(raw, (list, tuple)):
+                name, debt = str(raw[0] or "").strip(), float(raw[1] or 0)
+            else:
+                name, debt = str(raw or "").strip(), 0.0
             if not name:
                 continue
             row = conn.execute(
@@ -370,10 +382,38 @@ def clients_add_bulk(wh_id: int, names: list):
                 skipped.append(name)
                 continue
             conn.execute(
-                "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,0,NULL)",
-                (wh_id, name))
+                "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,?,NULL)",
+                (wh_id, name, debt))
             added.append(name)
     return added, skipped
+
+
+def set_warehouse_full(wh_id: int, on: bool):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("UPDATE warehouses SET full_mode=? WHERE id=?",
+                     (1 if on else 0, wh_id))
+
+
+def set_product_expiry(wh_id: int, product_id: int, expiry: str):
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT INTO product_expiry(warehouse_id, product_id, expiry) VALUES(?,?,?) "
+            "ON CONFLICT(warehouse_id, product_id) DO UPDATE SET expiry=excluded.expiry",
+            (wh_id, product_id, expiry))
+
+
+def expiry_list(wh_id: int):
+    """Сроки годности склада с текущими остатками, ближайшие сначала."""
+    return connect().execute(
+        "SELECT e.product_id, e.expiry, COALESCE(s.qty, 0) AS qty "
+        "FROM product_expiry e "
+        "LEFT JOIN stock s ON s.warehouse_id = e.warehouse_id "
+        "AND s.product_id = e.product_id "
+        "WHERE e.warehouse_id = ? "
+        "ORDER BY substr(e.expiry, 4) || substr(e.expiry, 1, 2)",
+        (wh_id,)).fetchall()
 
 
 def known_client_names(limit: int = 40):
