@@ -2846,13 +2846,12 @@ PERIODS = {
 }
 
 
-def build_report(warehouses, days_back: int, label: str) -> str:
-    """Отчёт по складам: продажи, деньги, долги, топ товаров."""
+def report_data(warehouses, days_back: int):
+    """Цифры отчёта по складам за период (для текста и PDF)."""
     start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
         hour=0, minute=0, second=0, microsecond=0)
     ops = db.operations_since(start.isoformat(timespec="seconds"))
-    lines = []
-    grand_sales = grand_money = 0
+    out = []
     for wh in warehouses:
         inv_data, pay_sum, transfers = [], 0.0, 0
         ret_sum, ret_count = 0.0, 0
@@ -2870,36 +2869,49 @@ def build_report(warehouses, days_back: int, label: str) -> str:
                 ret_count += 1
             elif op["type"] == "transfer" and wh["id"] in db.operation_warehouses(op):
                 transfers += 1
-        lines.append(f"📊 <b>«{esc(wh['name'])}» {esc(label)}</b>")
-        if not inv_data and not pay_sum and not transfers and not ret_count:
-            lines.append("— операций не было —")
-            lines.append("")
-            continue
         sales = sum(d.get("total", 0) for d in inv_data)
         inv_payments = sum(d.get("payment", 0) for d in inv_data)
-        money_recv = inv_payments + pay_sum
-        debt_added = sales - inv_payments
-        lines.append(f"🧾 Накладных: {len(inv_data)} на <b>{money(sales)}</b>")
-        lines.append(f"💵 Принято денег: <b>{money(money_recv)}</b>")
-        if debt_added > 0:
-            lines.append(f"📈 Выдано в долг: {money(debt_added)}")
-        if ret_count:
-            lines.append(f"🔙 Возвратов: {ret_count} на {money(ret_sum)}")
-        if transfers:
-            lines.append(f"📦 Приходов/перемещений товара: {transfers}")
         top = {}
         for d in inv_data:
             for it in d.get("items", []):
                 key = f"{it.get('name', '')} {it.get('volume', '')}".strip()
                 top[key] = top.get(key, 0) + (it.get("qty") or 0)
-        if top:
+        out.append({
+            "wh": wh, "n_inv": len(inv_data), "sales": sales,
+            "money": inv_payments + pay_sum, "debt_added": sales - inv_payments,
+            "ret_count": ret_count, "ret_sum": ret_sum, "transfers": transfers,
+            "top": sorted(top.items(), key=lambda x: -x[1]),
+            "empty": not inv_data and not pay_sum and not transfers and not ret_count,
+        })
+    return out
+
+
+def build_report(warehouses, days_back: int, label: str) -> str:
+    """Отчёт по складам: продажи, деньги, долги, топ товаров (текст)."""
+    lines = []
+    grand_sales = grand_money = 0
+    for d in report_data(warehouses, days_back):
+        wh = d["wh"]
+        lines.append(f"📊 <b>«{esc(wh['name'])}» {esc(label)}</b>")
+        if d["empty"]:
+            lines.append("— операций не было —")
+            lines.append("")
+            continue
+        lines.append(f"🧾 Накладных: {d['n_inv']} на <b>{money(d['sales'])}</b>")
+        lines.append(f"💵 Принято денег: <b>{money(d['money'])}</b>")
+        if d["debt_added"] > 0:
+            lines.append(f"📈 Выдано в долг: {money(d['debt_added'])}")
+        if d["ret_count"]:
+            lines.append(f"🔙 Возвратов: {d['ret_count']} на {money(d['ret_sum'])}")
+        if d["transfers"]:
+            lines.append(f"📦 Приходов/перемещений товара: {d['transfers']}")
+        if d["top"]:
             lines.append("🔝 Топ товаров:")
-            for i, (name, qty) in enumerate(
-                    sorted(top.items(), key=lambda x: -x[1])[:5], 1):
+            for i, (name, qty) in enumerate(d["top"][:5], 1):
                 lines.append(f"  {i}. {esc(name)} — {qty} шт")
         lines.append("")
-        grand_sales += sales
-        grand_money += money_recv
+        grand_sales += d["sales"]
+        grand_money += d["money"]
     if len(warehouses) > 1:
         lines.append(f"💰 <b>Итого {esc(label)}: продажи {money(grand_sales)}, "
                      f"деньги {money(grand_money)}</b>")
@@ -2929,7 +2941,48 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
-    await send_long(update.message, build_report(whs, days_back, label))
+    data = report_data(whs, days_back)
+    if all(d["empty"] for d in data):
+        await update.message.reply_text(f"📊 Операций {label} не было.")
+        return
+    sections, summary = [], []
+    grand_sales = grand_money = 0
+    for d in data:
+        wh = d["wh"]
+        if d["empty"]:
+            summary.append(f"📊 «{wh['name']}»: операций не было")
+            continue
+        rows = [["Накладных", f"{d['n_inv']} шт на {money(d['sales'])}"],
+                ["Принято денег", money(d["money"])]]
+        if d["debt_added"] > 0:
+            rows.append(["Выдано в долг", money(d["debt_added"])])
+        if d["ret_count"]:
+            rows.append(["Возвраты", f"{d['ret_count']} на {money(d['ret_sum'])}"])
+        if d["transfers"]:
+            rows.append(["Приходы/перемещения", str(d["transfers"])])
+        sections.append({"title": f"Склад «{wh['name']}»",
+                         "headers": ["Показатель", "Значение"],
+                         "rows": rows, "widths": [80, 87]})
+        if d["top"]:
+            sections.append({"title": f"Топ товаров — «{wh['name']}»",
+                             "headers": ["Товар", "Продано"],
+                             "rows": [[n, f"{q} шт"] for n, q in d["top"][:10]],
+                             "widths": [130, 37]})
+        summary.append(f"📊 «{wh['name']}»: продажи {money(d['sales'])}, "
+                       f"деньги {money(d['money'])}")
+        grand_sales += d["sales"]
+        grand_money += d["money"]
+    footer = ""
+    if len(whs) > 1:
+        footer = f"ИТОГО: продажи {money(grand_sales)} · деньги {money(grand_money)}"
+        summary.append(f"💰 Итого: продажи {money(grand_sales)}, деньги {money(grand_money)}")
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf("ОТЧЁТ ПО СКЛАДАМ",
+                              f"ОсОО «ВЕТОП» · {label} · на {date_str}",
+                              sections, footer=footer)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"отчёт_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary)[:1000])
 
 
 async def send_evening_summaries(bot):
@@ -3384,12 +3437,10 @@ async def monthly_deadstock_loop(app):
             log.exception("Ошибка отчёта о мёртвом товаре")
 
 
-def build_overdue(warehouses, min_days: int) -> str:
-    """Список должников, не плативших min_days и более дней."""
+def overdue_rows(warehouses, min_days: int):
+    """Должники min_days+ дней: [(склад, [(дней_или_None, клиент, платил_ли)])]."""
     now = datetime.now(BISHKEK)
-    lines = [f"⏰ <b>Давно не платили ({min_days}+ дней):</b>"]
-    found = 0
-    total = 0.0
+    out = []
     for wh in warehouses:
         rows = []
         for c, ref_ts, has_paid in db.debtors_with_age(wh["id"]):
@@ -3397,17 +3448,31 @@ def build_overdue(warehouses, min_days: int) -> str:
                 days = None  # операций нет вовсе — долг занесён вручную давно
             else:
                 try:
-                    days = (now - datetime.fromisoformat(ref_ts)).days
+                    ts = datetime.fromisoformat(ref_ts)
+                    if ts.tzinfo is None:
+                        ts = ts.replace(tzinfo=BISHKEK)
+                    days = (now - ts).days
                 except ValueError:
                     days = None
             if days is not None and days < min_days:
                 continue
             rows.append((days, c, has_paid))
-        if not rows:
-            continue
+        if rows:
+            rows.sort(key=lambda r: -(r[0] if r[0] is not None else 10**6))
+            out.append((wh, rows))
+    return out
+
+
+def build_overdue(warehouses, min_days: int) -> str:
+    """Список должников, не плативших min_days и более дней (текст)."""
+    data = overdue_rows(warehouses, min_days)
+    lines = [f"⏰ <b>Давно не платили ({min_days}+ дней):</b>"]
+    found = 0
+    total = 0.0
+    for wh, rows in data:
         lines.append("")
         lines.append(f"🏬 <b>Склад «{esc(wh['name'])}»</b>")
-        for days, c, has_paid in sorted(rows, key=lambda r: -(r[0] if r[0] is not None else 10**6)):
+        for days, c, has_paid in rows:
             age = f"{days} дн. без оплат" if days is not None else "давно (дата неизвестна)"
             mark = "" if has_paid else " — ни одной оплаты"
             phone = f" · 📞 {esc(c['phone'])}" if c["phone"] else ""
@@ -3433,12 +3498,34 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Использование: /olddebts [дней]\nПример: /olddebts 45")
             return
-    text = build_overdue(db.visible_warehouses(actor), min_days)
-    if not text:
+    data = overdue_rows(db.visible_warehouses(actor), min_days)
+    if not data:
         await update.message.reply_text(
             f"✅ Нет клиентов без оплат дольше {min_days} дней.")
         return
-    await send_long(update.message, text)
+    sections, found, total = [], 0, 0.0
+    for wh, rows in data:
+        sec_rows, sec_total = [], 0.0
+        for days, c, has_paid in rows:
+            age = f"{days} дн." if days is not None else "давно"
+            if not has_paid:
+                age += " (ни одной оплаты)"
+            sec_rows.append([c["name"], money(c["debt"]), age, c["phone"] or ""])
+            sec_total += c["debt"]
+        found += len(sec_rows)
+        total += sec_total
+        sections.append({"title": f"Склад «{wh['name']}»",
+                         "headers": ["Клиент", "Долг", "Без оплат", "Телефон"],
+                         "rows": sec_rows, "widths": [70, 38, 34, 25],
+                         "footer": f"Итого: {money(sec_total)}"})
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ДАВНО НЕ ПЛАТИЛИ", f"ОсОО «ВЕТОП» · {min_days}+ дней без оплат · на {date_str}",
+        sections, footer=f"ИТОГО ЗАВИСШИХ ДОЛГОВ: {money(total)}" if len(sections) > 1 else "")
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"старые_долги_{date_str.replace('.', '')}.pdf"),
+        caption=f"⏰ Не платили {min_days}+ дней: {found} клиентов, "
+                f"зависло {money(total)}")
 
 
 async def send_debt_alerts(bot):
@@ -4175,39 +4262,44 @@ async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "будет и анализ.")
         return
 
-    lines = [f"📊 <b>АВС-анализ {esc(label)}{esc(source)}</b>", ""]
-
+    sections = []
     prod_total = sum(prod_rev.values())
     if prod_total > 0:
-        lines.append("<b>Товары по выручке:</b>")
         groups = {"A": [], "B": [], "C": []}
         cum = 0.0
         for name, rev in sorted(prod_rev.items(), key=lambda x: -x[1]):
             g = "A" if cum < 0.8 else ("B" if cum < 0.95 else "C")
             groups[g].append((name, rev))
             cum += rev / prod_total
-        lines.append("🅰 <b>Главные (80% выручки):</b>")
-        for i, (name, rev) in enumerate(groups["A"], 1):
-            lines.append(f"  {i}. {esc(name)} — {money(rev)} "
-                         f"({rev / prod_total * 100:.0f}%)")
-        if groups["B"]:
-            lines.append("🅱 <b>Средние (ещё 15%):</b>")
-            for name, rev in groups["B"][:8]:
-                lines.append(f"  • {esc(name)} — {money(rev)}")
-            if len(groups["B"]) > 8:
-                lines.append(f"  … и ещё {len(groups['B']) - 8} поз.")
+        rows = [[name, money(rev), f"{rev / prod_total * 100:.0f}%", "A"]
+                for name, rev in groups["A"]]
+        rows += [[name, money(rev), f"{rev / prod_total * 100:.0f}%", "B"]
+                 for name, rev in groups["B"]]
         if groups["C"]:
             c_sum = sum(r for _, r in groups["C"])
-            lines.append(f"🅲 Остальные: {len(groups['C'])} поз. — {money(c_sum)} "
-                         f"({c_sum / prod_total * 100:.0f}%)")
-        lines.append("")
-
-    lines.append("<b>Топ клиентов:</b>")
-    for i, (name, rev) in enumerate(sorted(cli_rev.items(), key=lambda x: -x[1])[:10], 1):
-        lines.append(f"  {i}. {esc(name)} — {money(rev)} "
-                     f"({rev / total_rev * 100:.0f}%), {cli_n[name]} шт.")
-    lines += ["", f"💰 Итого выручка: <b>{money(total_rev)}</b>"]
-    await send_long(update.message, "\n".join(lines))
+            rows.append([f"Остальные ({len(groups['C'])} поз.)", money(c_sum),
+                         f"{c_sum / prod_total * 100:.0f}%", "C"])
+        sections.append({
+            "title": "Товары по выручке (A — главные 80%, B — ещё 15%, C — остальное)",
+            "headers": ["Товар", "Выручка", "Доля", "Группа"],
+            "rows": rows, "widths": [95, 38, 17, 17],
+            "footer": f"Группа A: {len(groups['A'])} поз. · "
+                      f"B: {len(groups['B'])} · C: {len(groups['C'])}"})
+    cli_rows = [[name, money(rev), f"{rev / total_rev * 100:.0f}%", str(cli_n[name])]
+                for name, rev in sorted(cli_rev.items(), key=lambda x: -x[1])[:10]]
+    sections.append({"title": "Топ-10 клиентов",
+                     "headers": ["Клиент", "Выручка", "Доля", "Накладных"],
+                     "rows": cli_rows, "widths": [90, 38, 17, 22]})
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf("АВС-АНАЛИЗ",
+                              f"ОсОО «ВЕТОП» · {label}{source} · на {date_str}",
+                              sections, footer=f"ИТОГО ВЫРУЧКА: {money(total_rev)}")
+    top_cli = max(cli_rev.items(), key=lambda x: x[1])
+    caption = (f"📊 АВС {label}{source}: выручка {money(total_rev)}, "
+               f"топ клиент — {top_cli[0]} ({money(top_cli[1])})")
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"АВС_{date_str.replace('.', '')}.pdf"),
+        caption=caption[:1000])
 
 
 async def _post_init(app):
