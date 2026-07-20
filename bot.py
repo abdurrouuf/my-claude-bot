@@ -2798,20 +2798,25 @@ async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
     sections, summary = [], []
     for wh in whs:
         smap = db.stock_map(wh["id"])
-        rows, total_qty = [], 0
+        rows, total_qty, in_stock = [], 0, 0
+        # Весь прайс по порядку: нулевые остатки тоже видны (прочерком).
         for p in prices.PRICE_LIST_DATA:
             qty = smap.get(p["id"], 0)
+            rows.append([p["id"], p["name"], p["volume"],
+                         f"{qty} шт" if qty else "—"])
             if qty:
-                rows.append([p["id"], p["name"], p["volume"], f"{qty} шт"])
                 total_qty += qty
-        if rows:
+                in_stock += 1
+        if in_stock:
             sections.append({
                 "title": f"Склад «{wh['name']}»",
                 "headers": ["№", "Товар", "Фасовка", "Остаток"],
                 "rows": rows, "widths": [10, 105, 28, 24],
-                "footer": f"Позиций: {len(rows)} · всего {fmt_num(total_qty)} шт",
+                "footer": (f"В наличии: {in_stock} из {len(rows)} позиций прайса · "
+                           f"всего {fmt_num(total_qty)} шт"),
             })
-            summary.append(f"📦 «{wh['name']}»: {len(rows)} поз., {fmt_num(total_qty)} шт")
+            summary.append(f"📦 «{wh['name']}»: в наличии {in_stock} из "
+                           f"{len(rows)} поз., {fmt_num(total_qty)} шт")
         else:
             summary.append(f"📦 «{wh['name']}»: пусто")
     if not sections:
