@@ -3752,6 +3752,40 @@ async def backup_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("💾 Копия отправлена админу.")
 
 
+def db_storage_persistent() -> bool:
+    """Постоянное ли хранилище: Volume в /data или явный DB_PATH."""
+    return bool(os.environ.get("DB_PATH")) or os.path.isdir("/data")
+
+
+async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Где живёт база и что в ней есть — для проверки Volume на Railway."""
+    if await _require_admin(update) is None:
+        return
+    path = db._db_path()
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        size = 0
+    conn = db.connect()
+    n_cli = conn.execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+    n_ops = conn.execute(
+        "SELECT COUNT(*) FROM operations WHERE status='done'").fetchone()[0]
+    n_stock = conn.execute(
+        "SELECT COALESCE(SUM(qty),0) FROM stock WHERE qty>0").fetchone()[0]
+    if db_storage_persistent():
+        store = "🟢 ПОСТОЯННОЕ (Volume подключён — данные переживают обновления)"
+    else:
+        store = ("🔴 ВРЕМЕННОЕ — данные СТИРАЮТСЯ при каждом обновлении бота!\n"
+                 "Нужно подключить Volume к сервису на Railway (папка /data).")
+    await update.message.reply_text(
+        f"🗄 <b>База данных</b>\n"
+        f"Файл: <code>{path}</code>\n"
+        f"Размер: {size / 1024:.0f} КБ\n"
+        f"Клиентов: {n_cli} · Операций: {n_ops} · Остатков: {fmt_num(n_stock)} шт\n\n"
+        f"Хранилище: {store}",
+        parse_mode="HTML")
+
+
 async def weekly_debt_loop(app):
     """Каждый понедельник в 10:00 по Бишкеку."""
     while True:
@@ -4373,6 +4407,18 @@ async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def _post_init(app):
+    if not db_storage_persistent():
+        try:
+            await app.bot.send_message(
+                ADMIN_ID,
+                "🔴 <b>ВНИМАНИЕ: база данных во временном хранилище!</b>\n"
+                "Volume не подключён к сервису — при каждом обновлении бота "
+                "все данные (клиенты, долги, остатки) стираются.\n\n"
+                "Пока не подключён Volume на Railway (папка /data), "
+                "ничего не заносите в базу. Проверка: /dbinfo",
+                parse_mode="HTML")
+        except Exception:
+            log.exception("Не удалось отправить предупреждение о хранилище")
     app.create_task(evening_summary_loop(app))
     app.create_task(weekly_debt_loop(app))
     app.create_task(daily_backup_loop(app))
@@ -4404,6 +4450,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("client", client_cmd))
     app.add_handler(CommandHandler("act", act_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
+    app.add_handler(CommandHandler("dbinfo", dbinfo_cmd))
     app.add_handler(CommandHandler("minstock", minstock_cmd))
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
