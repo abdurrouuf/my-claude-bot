@@ -117,7 +117,9 @@ HISTORY_LIMIT = 10  # история пересылается с каждым з
 PENDING = {}
 PENDING_TTL = 15 * 60        # обычная заявка живёт 15 минут
 APPROVAL_TTL = 24 * 60 * 60  # заявка на перемещение ждёт админа сутки
-UNDO_WINDOW = 15 * 60        # сотрудник может отменить свою операцию 15 минут
+# Сотрудник может отменить/заменить свою операцию в течение часа (просьба
+# владельца 20.07.2026; настраивается: UNDO_MINUTES)
+UNDO_WINDOW = int(os.environ.get("UNDO_MINUTES", "60")) * 60
 
 
 def esc(s) -> str:
@@ -363,6 +365,16 @@ def _build_static_system() -> str:
                  '(«Асан — 31470», «Болот долг 12000»); не указан — 0.')
     parts.append('- Выбирай этот режим только при явных словах о добавлении клиентов, '
                  'без товаров.')
+    parts.append("")
+    parts.append("=== РЕЖИМ 14: ДОБАВИТЬ ТОВАР В ПОСЛЕДНЮЮ НАКЛАДНУЮ ===")
+    parts.append('Если сотрудник дополняет уже выписанную накладную («добавь в последнюю '
+                 'накладную Мустанга: Дексатоп 50мл 5 шт», «допиши к накладной Асана ...», '
+                 '«забыл в накладную Асана добавить ...»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "amend_invoice", "client": "Имя", "warehouse": null, '
+                 '"items": [{"name": "точное название из прайса", "volume": "фасовка", '
+                 '"qty": штук, "box_qty": коробок_или_null, "price": цена}]}')
+    parts.append('- В items — ТОЛЬКО добавляемые товары; старые бот подставит сам. '
+                 'Коробки переводи в штуки как обычно.')
     parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
@@ -748,6 +760,110 @@ async def start_invoice(update, context, actor, data, draft=False):
 
 
 # ---------- Телефон клиента ----------
+
+def amend_summary(p, old_total: float) -> str:
+    c = db.client_get(p["client_id"])
+    total = sum(it["qty"] * it["price"] for it in p["items"])
+    # долг клиента без старой накладной (её сторнируем при проведении)
+    debt_before = c["debt"] - (old_total - p["payment"])
+    lines = [f"🔁 <b>Замена накладной №{p['old_op_id']}</b> — склад «{esc(p['wh_name'])}»",
+             f"👤 Клиент: <b>{esc(c['name'])}</b>",
+             f"Старая накладная на {money(old_total)} будет отменена, вместо неё:", ""]
+    for i, it in enumerate(p["items"], 1):
+        sub = it["qty"] * it["price"]
+        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        mark = " 🆕" if i > p["old_count"] else ""
+        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
+                     f"{fmt_num(it['price'])} = <b>{money(sub)}</b>{mark}")
+    lines += ["", f"🧾 Сумма новой накладной: <b>{money(total)}</b>"]
+    if p["payment"]:
+        lines.append(f"💵 Приход (из старой накладной): {money(p['payment'])}")
+    lines.append(f"📊 Итог долг клиента: <b>{money(debt_before + total - p['payment'])}</b>")
+    if p["warnings"]:
+        lines.append("")
+        lines += [f"⚠️ {esc(w)}" for w in p["warnings"]]
+    lines += ["", "Заменить накладную?"]
+    return "\n".join(lines)
+
+
+async def start_amend_invoice(update, context, actor, data):
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    if TRANSITION_MODE and not wh["full_mode"]:
+        await update.message.reply_text(
+            "На этом складе сейчас черновики — просто выпишите черновик заново "
+            "целиком, старый PDF выбросьте.")
+        return
+    client_name = str(data.get("client") or "").strip()
+    if not client_name:
+        await update.message.reply_text("Не понял, чью накладную дополнить.")
+        return
+    c = db.client_exact(wh["id"], client_name)
+    if c is None:
+        cand = db.fuzzy_clients(wh["id"], client_name)
+        if len(cand) == 1:
+            c = cand[0]
+        else:
+            await update.message.reply_text(
+                f"Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}»."
+                + (" Похожие: " + ", ".join(x["name"] for x in cand) if cand else ""),
+                parse_mode="HTML")
+            return
+    op = db.last_invoice_for_client(c["id"])
+    if op is None:
+        await update.message.reply_text(
+            f"У клиента «{esc(c['name'])}» нет проведённых накладных — "
+            "выпишите обычную накладную.", parse_mode="HTML")
+        return
+    if not is_admin(actor):
+        if op["user_id"] != actor["id"]:
+            await update.message.reply_text(
+                "⛔ Эту накладную выписал другой сотрудник — заменить её может только админ.")
+            return
+        try:
+            ts = datetime.fromisoformat(op["ts"])
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=BISHKEK)
+            age = (datetime.now(BISHKEK) - ts).total_seconds()
+        except ValueError:
+            age = 0
+        if age > UNDO_WINDOW:
+            await update.message.reply_text(
+                "⛔ С момента накладной прошло больше часа — заменить её может "
+                "только админ. Либо выпишите забытый товар отдельной накладной.")
+            return
+    try:
+        new_items, warnings = parse_items(data.get("items") or [])
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    old = json.loads(op["data"])
+    old_items = []
+    for it in old.get("items", []):
+        product = prices.match_product(str(it.get("name") or ""), str(it.get("volume") or ""))
+        old_items.append({
+            "name": it.get("name"), "volume": it.get("volume"), "qty": it.get("qty"),
+            "price": it.get("price"), "box_qty": it.get("box_qty"),
+            "product_id": product["id"] if product else None,
+            "price_explicit": True,  # цены старой накладной не пересчитываем
+        })
+    old_total = sum((it["qty"] or 0) * (it["price"] or 0) for it in old_items)
+    payload = {
+        "kind": "amend_invoice", "user_id": actor["id"],
+        "chat_id": update.effective_chat.id,
+        "wh_id": wh["id"], "wh_name": wh["name"],
+        "client_name": c["name"], "client_id": c["id"],
+        "items": old_items + new_items, "warnings": warnings,
+        "payment": float(old.get("payment") or 0), "parsed_debt": 0, "phone": None,
+        "old_op_id": op["id"], "old_count": len(old_items),
+    }
+    apply_client_prices(payload)
+    token = new_pending(payload)
+    await update.message.reply_text(amend_summary(payload, old_total),
+                                    parse_mode="HTML", reply_markup=confirm_kb(token))
+
 
 def _clean_phone(raw: str):
     phone = re.sub(r"[^\d+]", "", str(raw or ""))
@@ -2013,6 +2129,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text(
                     f"✅ Минимальные остатки для склада «{esc(p['wh_name'])}» сохранены "
                     f"({len(p['items'])} поз.). Посмотреть: /minstock", parse_mode="HTML")
+            elif p["kind"] == "amend_invoice":
+                ok, why = db.cancel_operation(p["old_op_id"])
+                if not ok:
+                    await q.edit_message_text(
+                        f"⚠️ Не удалось отменить накладную №{p['old_op_id']}: {esc(why)}",
+                        parse_mode="HTML")
+                else:
+                    op_id, client_label, old_debt, total, summary = commit_invoice(p)
+                    await q.edit_message_text(
+                        f"✅ Накладная №{p['old_op_id']} отменена, вместо неё проведена "
+                        f"№{op_id}.")
+                    await send_invoice_pdf(context, p["chat_id"], client_label, p,
+                                           old_debt, total)
+                    await notify_admin(context, actor,
+                                       f"замена накладной №{p['old_op_id']} → №{op_id}: {summary}")
+                    await feed_operation(context, op_id, db.get_user(p["user_id"])["name"],
+                                         "🔁", f"замена накладной №{p['old_op_id']}")
+                    await alert_low_stock(context, [
+                        (p["wh_id"], it["product_id"], -it["qty"])
+                        for it in p["items"] if it.get("product_id")])
             elif p["kind"] == "load_karakol":
                 from karakol_stock_data import KARAKOL_STOCK
                 deltas = [(p["wh_id"], pid, qty)
@@ -2104,6 +2240,8 @@ async def dispatch_action(update, context, actor, reply, draft=False):
             await start_change_price(update, context, actor, data)
         elif action == "add_clients":
             await start_add_clients(update, context, actor, data)
+        elif action == "amend_invoice":
+            await start_amend_invoice(update, context, actor, data)
         elif action == "promise":
             await start_promise(update, context, actor, data)
         elif action == "promise_done":
@@ -2446,7 +2584,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/price — прайс-лист",
         "/pricepdf — красивый PDF-прайс для отправки клиентам",
         "/log — последние операции",
-        "/undo — отменить свою последнюю операцию (15 минут)",
+        "/undo — отменить свою последнюю операцию (в течение часа)",
+        "➕ <b>Дополнить накладную</b>: <i>добавь в последнюю накладную Мустанга: "
+        "Дексатоп 50мл 5 шт</i>",
         "/clear — очистить историю разговора",
     ]
     lines += [
@@ -3449,7 +3589,7 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 age = UNDO_WINDOW + 1
             if age > UNDO_WINDOW:
                 await update.message.reply_text(
-                    "⛔ Отменить операцию можно только в течение 15 минут. "
+                    "⛔ Отменить операцию можно только в течение часа. "
                     "Обратитесь к администратору.")
                 return
     ok, msg = db.cancel_operation(op["id"])

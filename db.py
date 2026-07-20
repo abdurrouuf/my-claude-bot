@@ -852,6 +852,13 @@ def last_done_operation(user_id: int):
     ).fetchone()
 
 
+def last_invoice_for_client(client_id: int):
+    """Последняя проведённая накладная клиента (для дополнения товаром)."""
+    return connect().execute(
+        "SELECT * FROM operations WHERE type='invoice' AND status='done' "
+        "AND client_id=? ORDER BY id DESC LIMIT 1", (client_id,)).fetchone()
+
+
 def operations_since(start_iso: str):
     """Проведённые операции начиная с даты (ISO), по возрастанию."""
     return connect().execute(
