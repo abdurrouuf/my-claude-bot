@@ -191,6 +191,44 @@ def _migrate_owner_warehouses(conn):
         log.info("Миграция складов: пустая база, склады пересозданы")
 
 
+def _migrate_price_order(conn):
+    """Перенумерация прайса под фирменный порядок владельца (прайс от 10.06.2026).
+
+    ГАБИВИТ/КАЛЬФОТОН/СУРФАГОН были в конце (№101–104), в настоящем прайсе они
+    идут сразу после БУТАСТИМА (№58–61), остальное сдвигается на +4. Номера
+    меняются во всех таблицах и в журнале операций, чтобы /undo и отчёты
+    продолжали работать. Выполняется один раз (флаг в settings)."""
+    if conn.execute("SELECT 1 FROM settings WHERE key='price_order_v2'").fetchone():
+        return
+    from prices import RENUMBER_2026_07
+    row = conn.execute("SELECT name FROM products WHERE id=101").fetchone()
+    if row and row["name"].startswith("ГАБИВИТ"):
+        tables = (("products", "id"), ("stock", "product_id"),
+                  ("client_prices", "product_id"), ("min_stock", "product_id"),
+                  ("price_history", "product_id"), ("product_expiry", "product_id"))
+        for table, col in tables:
+            # Двухфазно через +1000, чтобы старые и новые номера не столкнулись.
+            conn.execute(f"UPDATE {table} SET {col} = {col} + 1000 "
+                         f"WHERE {col} BETWEEN 58 AND 104")
+            for old, new in RENUMBER_2026_07.items():
+                conn.execute(f"UPDATE {table} SET {col} = ? WHERE {col} = ?",
+                             (new, old + 1000))
+        for op in conn.execute("SELECT id, data FROM operations").fetchall():
+            try:
+                data = json.loads(op["data"])
+            except (TypeError, ValueError):
+                continue
+            deltas = data.get("stock_deltas")
+            if not deltas:
+                continue
+            data["stock_deltas"] = [
+                [wh, RENUMBER_2026_07.get(pid, pid), d] for wh, pid, d in deltas]
+            conn.execute("UPDATE operations SET data=? WHERE id=?",
+                         (json.dumps(data, ensure_ascii=False), op["id"]))
+    conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                 "VALUES('price_order_v2', '1')")
+
+
 def init(admin_id: int, warehouse_names: list, staff: dict):
     """Создаёт схему, склады и постоянных сотрудников.
 
@@ -213,6 +251,7 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_id INTEGER")
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_title TEXT")
         _migrate_owner_warehouses(conn)
+        _migrate_price_order(conn)
 
         for wname in warehouse_names:
             if conn.execute("SELECT 1 FROM warehouses WHERE name=?", (wname,)).fetchone() is None:
