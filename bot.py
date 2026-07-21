@@ -2587,6 +2587,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"{len(deltas)} позиций, {total} шт.\n"
                     "Сроки годности сохранены — смотрите /expiry Каракол.\n"
                     "Проверьте: /stock (у Данияра) или /report Каракол.")
+            elif p["kind"] == "reset_wh":
+                stats = db.reset_warehouse(p["wh_id"])
+                _KNOWN_CLIENTS_CACHE["ts"] = 0.0  # имена стёртых клиентов — вон из подсказок
+                await q.edit_message_text(
+                    f"🗑 Склад «{esc(p['wh_name'])}» очищен полностью:\n"
+                    f"• операций удалено: {stats['ops']}\n"
+                    f"• остатков списано: {stats['stock_positions']} поз., "
+                    f"{fmt_num(stats['stock_qty'])} шт\n"
+                    f"• клиентов удалено: {stats['clients']} "
+                    f"(долгов было {money(stats['debt'])})\n\n"
+                    "Загрузка заново:\n"
+                    "1. Остатки: /loadkarakol (для Каракола) или инвентаризацией\n"
+                    "2. Клиенты: «добавь клиентов на "
+                    f"{esc(p['wh_name'])}: Имя — долг, Имя — долг, ...»",
+                    parse_mode="HTML")
             elif p["kind"] == "add_clients":
                 added, skipped = db.clients_add_bulk(p["wh_id"], p["entries"])
                 total_debt = sum(d for _, d in p["entries"])
@@ -4910,6 +4925,49 @@ async def loadkarakol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML", reply_markup=confirm_kb(token))
 
 
+async def resetwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """ПОЛНЫЙ сброс склада (только админ): журнал, остатки, клиенты с долгами.
+
+    Для случая «загрузили с ошибками — стереть и загрузить заново»."""
+    if await _require_admin(update) is None:
+        return
+    name = " ".join(context.args or [])
+    if not name:
+        await update.message.reply_text(
+            "Укажите склад: /resetwh Каракол\n\n"
+            "⚠️ Команда стирает по складу ВСЁ: операции из журнала, остатки, "
+            "клиентов с долгами и сроки годности — чтобы загрузить склад "
+            "заново с нуля. Перед удалением покажу, что будет стёрто.")
+        return
+    wh = db.warehouse_by_name(name)
+    if wh is None:
+        await update.message.reply_text(f"Склад «{esc(name)}» не найден.",
+                                        parse_mode="HTML")
+        return
+    pv = db.reset_warehouse_preview(wh["id"])
+    if not (pv["ops"] or pv["stock_positions"] or pv["clients"]):
+        await update.message.reply_text(
+            f"Склад «{esc(wh['name'])}» и так пуст — сбрасывать нечего.",
+            parse_mode="HTML")
+        return
+    payload = {"kind": "reset_wh", "user_id": update.effective_user.id,
+               "chat_id": update.effective_chat.id,
+               "wh_id": wh["id"], "wh_name": wh["name"]}
+    token = new_pending(payload)
+    await update.message.reply_text(
+        f"🗑 <b>ПОЛНЫЙ СБРОС склада «{esc(wh['name'])}»</b>\n\n"
+        "Будет удалено безвозвратно:\n"
+        f"• операций из журнала: <b>{pv['ops']}</b>\n"
+        f"• остатки: <b>{pv['stock_positions']}</b> позиций, "
+        f"{fmt_num(pv['stock_qty'])} шт\n"
+        f"• клиентов: <b>{pv['clients']}</b> "
+        f"(долгов на {money(pv['debt'])})\n"
+        "• сроки годности склада\n\n"
+        "Кассы сотрудников пересчитаются автоматически.\n"
+        "⚠️ Отменить сброс будет НЕЛЬЗЯ — /undo не поможет. Стереть?",
+        parse_mode="HTML", reply_markup=confirm_kb(token))
+
+
 def _expiry_key_to_date(exp: str):
     try:
         mm, yyyy = exp.split(".")
@@ -5133,6 +5191,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("abc", abc_cmd))
     app.add_handler(CommandHandler("fullmode", fullmode_cmd))
     app.add_handler(CommandHandler("loadkarakol", loadkarakol_cmd))
+    app.add_handler(CommandHandler("resetwh", resetwh_cmd))
     app.add_handler(CommandHandler("expiry", expiry_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))

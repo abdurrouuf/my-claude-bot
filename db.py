@@ -1060,3 +1060,76 @@ def cancel_operation(op_id: int):
             conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?", (d, cid))
         conn.execute("UPDATE operations SET status='cancelled' WHERE id=?", (op_id,))
         return True, op["summary"]
+
+
+def _reset_wh_doomed(conn, wh_id: int, client_ids: set):
+    """Операции, которые заденет полный сброс склада: по складу (включая
+    перемещения, где он одной из сторон) или по его клиентам."""
+    return [op for op in conn.execute("SELECT * FROM operations").fetchall()
+            if wh_id in operation_warehouses(op) or op["client_id"] in client_ids]
+
+
+def reset_warehouse_preview(wh_id: int) -> dict:
+    """Что именно удалит полный сброс склада (для карточки подтверждения)."""
+    conn = connect()
+    client_ids = {r["id"] for r in conn.execute(
+        "SELECT id FROM clients WHERE warehouse_id=?", (wh_id,))}
+    ops = _reset_wh_doomed(conn, wh_id, client_ids)
+    stock = conn.execute(
+        "SELECT COUNT(*), COALESCE(SUM(qty), 0) FROM stock "
+        "WHERE warehouse_id=? AND qty != 0", (wh_id,)).fetchone()
+    debt = conn.execute(
+        "SELECT COALESCE(SUM(debt), 0) FROM clients WHERE warehouse_id=?",
+        (wh_id,)).fetchone()[0]
+    return {"ops": len(ops), "stock_positions": stock[0], "stock_qty": stock[1],
+            "clients": len(client_ids), "debt": debt}
+
+
+def reset_warehouse(wh_id: int) -> dict:
+    """ПОЛНЫЙ сброс склада: операции журнала, остатки, сроки годности и все
+    клиенты с долгами удаляются безвозвратно — для перезагрузки с нуля.
+
+    Операции именно удаляются (не сторно) — журнал склада начинается заново
+    (нумерация операций продолжается, id не переиспользуются). Если операция
+    задела и другой склад (перемещение), чужие дельты откатываются, чтобы
+    остатки того склада не исказились. Кассы сотрудников пересчитаются сами —
+    они считаются по журналу."""
+    conn = connect()
+    with _lock, conn:
+        client_ids = {r["id"] for r in conn.execute(
+            "SELECT id FROM clients WHERE warehouse_id=?", (wh_id,))}
+        doomed = _reset_wh_doomed(conn, wh_id, client_ids)
+        for op in doomed:
+            if op["status"] != "done":
+                continue
+            try:
+                data = json.loads(op["data"])
+            except (ValueError, TypeError):
+                continue
+            for wh, pid, d in data.get("stock_deltas", []):
+                if wh != wh_id:
+                    _apply_stock(conn, wh, pid, -d)
+            for cid, d in data.get("debt_deltas", []):
+                if cid not in client_ids:
+                    conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?",
+                                 (d, cid))
+        conn.executemany("DELETE FROM operations WHERE id=?",
+                         [(op["id"],) for op in doomed])
+        stock = conn.execute(
+            "SELECT COUNT(*), COALESCE(SUM(qty), 0) FROM stock "
+            "WHERE warehouse_id=? AND qty != 0", (wh_id,)).fetchone()
+        debt = conn.execute(
+            "SELECT COALESCE(SUM(debt), 0) FROM clients WHERE warehouse_id=?",
+            (wh_id,)).fetchone()[0]
+        conn.execute("DELETE FROM stock WHERE warehouse_id=?", (wh_id,))
+        conn.execute("DELETE FROM product_expiry WHERE warehouse_id=?", (wh_id,))
+        if client_ids:
+            marks = ",".join("?" * len(client_ids))
+            ids = tuple(client_ids)
+            conn.execute(
+                f"DELETE FROM client_aliases WHERE client_id IN ({marks})", ids)
+            conn.execute(
+                f"DELETE FROM client_prices WHERE client_id IN ({marks})", ids)
+        conn.execute("DELETE FROM clients WHERE warehouse_id=?", (wh_id,))
+        return {"ops": len(doomed), "stock_positions": stock[0],
+                "stock_qty": stock[1], "clients": len(client_ids), "debt": debt}
