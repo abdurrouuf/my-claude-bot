@@ -2066,6 +2066,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             draft=p.get("draft", False))
         return
 
+    if kind == "ps":  # выбран склад для отчёта об остатках
+        PENDING.pop(token, None)
+        await q.answer()
+        owner_row = db.get_user(p["user_id"])
+        if owner_row is None:
+            return
+        if len(parts) > 2 and parts[2] == "all":
+            whs = db.visible_warehouses(owner_row)
+            label = "все склады"
+        else:
+            try:
+                wh = db.warehouse_by_id(int(parts[2]))
+            except (ValueError, IndexError):
+                wh = None
+            if wh is None or not db.can_use_warehouse(owner_row, wh["id"]):
+                await q.edit_message_text("Склад не найден или нет доступа.")
+                return
+            whs = [wh]
+            label = f"«{wh['name']}»"
+        try:
+            await q.edit_message_text(f"📦 Остатки: {esc(label)}", parse_mode="HTML")
+        except Exception:
+            pass
+        shim = SimpleNamespace(message=q.message,
+                               effective_chat=q.message.chat,
+                               effective_user=q.from_user)
+        await _stock_report(shim, context, owner_row, whs,
+                            p.get("with_prices", False))
+        return
+
     if kind == "pk":  # выбран существующий клиент
         p["client_id"] = int(parts[2])
         await q.answer()
@@ -2869,85 +2899,33 @@ async def pricepdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="📋 Прайс-лист ВЕТОП — можно переслать клиенту")
 
 
-async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    actor = await get_actor(update)
-    if actor is None:
-        return
-    arg = " ".join(context.args).strip() if context.args else ""
-    if arg and arg.lower() != "all":
-        wh = db.warehouse_by_name(arg)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
-            await update.message.reply_text(
-                f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
-            return
-        whs = [wh]
-    else:
-        whs = db.visible_warehouses(actor)
-    sections, summary = [], []
-    for wh in whs:
-        smap = db.stock_map(wh["id"])
-        rows, total_qty, in_stock = [], 0, 0
-        # Весь прайс по порядку: нулевые остатки тоже видны (прочерком).
-        for p in prices.PRICE_LIST_DATA:
-            qty = smap.get(p["id"], 0)
-            rows.append([p["id"], p["name"], p["volume"],
-                         f"{qty} шт" if qty else "—"])
-            if qty:
-                total_qty += qty
-                in_stock += 1
-        if in_stock:
-            sections.append({
-                "title": f"Склад «{wh['name']}»",
-                "headers": ["№", "Товар", "Фасовка", "Остаток"],
-                "rows": rows, "widths": [10, 105, 28, 24],
-                "footer": (f"В наличии: {in_stock} из {len(rows)} позиций прайса · "
-                           f"всего {fmt_num(total_qty)} шт"),
-            })
-            summary.append(f"📦 «{wh['name']}»: в наличии {in_stock} из "
-                           f"{len(rows)} поз., {fmt_num(total_qty)} шт")
-        else:
-            summary.append(f"📦 «{wh['name']}»: пусто")
-    if not sections:
-        await update.message.reply_text("\n".join(summary))
-        return
-    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
-    pdf = generate_report_pdf("ОСТАТКИ СКЛАДОВ", f"ОсОО «ВЕТОП» · на {date_str}", sections)
-    await update.message.reply_document(
-        document=InputFile(pdf, filename=f"остатки_{date_str.replace('.', '')}.pdf"),
-        caption="\n".join(summary))
+async def _stock_report(update, context, actor, whs, with_prices=False):
+    """Собирает и шлёт PDF остатков по списку складов.
 
-
-async def show_stock_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Остатки склада с продажными ценами и суммой по прайсу (/stockprice)."""
-    actor = await get_actor(update)
-    if actor is None:
-        return
-    arg = " ".join(context.args).strip() if context.args else ""
-    if arg and arg.lower() != "all":
-        wh = db.warehouse_by_name(arg)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
-            await update.message.reply_text(
-                f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
-            return
-        whs = [wh]
-    else:
-        whs = db.visible_warehouses(actor)
+    Весь прайс по порядку: нулевые остатки тоже видны (прочерком)."""
     sections, summary = [], []
     for wh in whs:
         smap = db.stock_map(wh["id"])
         rows, total_qty, total_sum, in_stock = [], 0, 0.0, 0
         for p in prices.PRICE_LIST_DATA:
             qty = smap.get(p["id"], 0)
-            sub = qty * p["price"]
-            rows.append([p["id"], p["name"], p["volume"],
-                         f"{qty} шт" if qty else "—",
-                         fmt_num(p["price"]),
-                         fmt_num(sub) if qty else "—"])
+            if with_prices:
+                sub = qty * p["price"]
+                total_sum += sub
+                rows.append([p["id"], p["name"], p["volume"],
+                             f"{qty} шт" if qty else "—",
+                             fmt_num(p["price"]),
+                             fmt_num(sub) if qty else "—"])
+            else:
+                rows.append([p["id"], p["name"], p["volume"],
+                             f"{qty} шт" if qty else "—"])
             if qty:
                 total_qty += qty
-                total_sum += sub
                 in_stock += 1
-        if in_stock:
+        if not in_stock:
+            summary.append(f"📦 «{wh['name']}»: пусто")
+            continue
+        if with_prices:
             sections.append({
                 "title": f"Склад «{wh['name']}»",
                 "headers": ["№", "Товар", "Фасовка", "Остаток", "Цена", "Сумма"],
@@ -2958,17 +2936,74 @@ async def show_stock_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
             summary.append(f"💰 «{wh['name']}»: {fmt_num(total_qty)} шт "
                            f"на {money(total_sum)} по прайсу")
         else:
-            summary.append(f"📦 «{wh['name']}»: пусто")
+            sections.append({
+                "title": f"Склад «{wh['name']}»",
+                "headers": ["№", "Товар", "Фасовка", "Остаток"],
+                "rows": rows, "widths": [10, 105, 28, 24],
+                "footer": (f"В наличии: {in_stock} из {len(rows)} позиций прайса · "
+                           f"всего {fmt_num(total_qty)} шт"),
+            })
+            summary.append(f"📦 «{wh['name']}»: в наличии {in_stock} из "
+                           f"{len(rows)} поз., {fmt_num(total_qty)} шт")
     if not sections:
-        await update.message.reply_text("\n".join(summary))
+        await update.message.reply_text("\n".join(summary) or "Складов нет.")
         return
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
-    pdf = generate_report_pdf(
-        "ОСТАТКИ С ЦЕНАМИ",
-        f"ОсОО «ВЕТОП» · продажные цены · на {date_str}", sections)
+    if with_prices:
+        pdf = generate_report_pdf(
+            "ОСТАТКИ С ЦЕНАМИ",
+            f"ОсОО «ВЕТОП» · продажные цены · на {date_str}", sections)
+        filename = f"остатки_цены_{date_str.replace('.', '')}.pdf"
+    else:
+        pdf = generate_report_pdf(
+            "ОСТАТКИ СКЛАДОВ", f"ОсОО «ВЕТОП» · на {date_str}", sections)
+        filename = f"остатки_{date_str.replace('.', '')}.pdf"
     await update.message.reply_document(
-        document=InputFile(pdf, filename=f"остатки_цены_{date_str.replace('.', '')}.pdf"),
-        caption="\n".join(summary))
+        document=InputFile(pdf, filename=filename), caption="\n".join(summary))
+
+
+async def _stock_cmd(update, context, with_prices):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if arg and arg.lower() != "all":
+        wh = db.warehouse_by_name(arg)
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+        if not whs:
+            await update.message.reply_text("У вас нет склада — обратитесь к администратору.")
+            return
+        if not arg and len(whs) > 1:
+            # Несколько складов — спрашиваем кнопками, какой показать
+            # (просьба владельца 21.07.2026). «Все сразу» — кнопкой или /stock all.
+            payload = {"kind": "pick_stock", "user_id": actor["id"],
+                       "chat_id": update.effective_chat.id,
+                       "with_prices": with_prices}
+            token = new_pending(payload)
+            kb = [[InlineKeyboardButton(f"📦 {w['name']}",
+                                        callback_data=f"ps:{token}:{w['id']}")]
+                  for w in whs]
+            kb.append([InlineKeyboardButton("🗂 Все склады сразу",
+                                            callback_data=f"ps:{token}:all")])
+            await update.message.reply_text("Остатки какого склада показать?",
+                                            reply_markup=InlineKeyboardMarkup(kb))
+            return
+    await _stock_report(update, context, actor, whs, with_prices)
+
+
+async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await _stock_cmd(update, context, with_prices=False)
+
+
+async def show_stock_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остатки склада с продажными ценами и суммой по прайсу (/stockprice)."""
+    await _stock_cmd(update, context, with_prices=True)
 
 
 async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
