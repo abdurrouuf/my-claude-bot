@@ -206,13 +206,17 @@ async def notify_admin(context, actor_row, text: str):
         log.warning("Не удалось уведомить админа: %s", e)
 
 
-async def post_feed(context, wh_ids, text: str):
-    """Постит сводку операции в чаты-ленты складов, которых она коснулась."""
+async def post_feed(context, wh_ids, text: str, exclude_chat_id=None):
+    """Постит сводку операции в чаты-ленты складов, которых она коснулась.
+
+    exclude_chat_id — чат, где операцию и так уже видели (операция сделана
+    прямо в чате склада), туда дубль не шлём."""
     chats = set()
     for wh_id in wh_ids:
         wh = db.warehouse_by_id(wh_id)
         if wh and wh["feed_chat_id"]:
             chats.add(wh["feed_chat_id"])
+    chats.discard(exclude_chat_id)
     for chat_id in chats:
         try:
             await context.bot.send_message(chat_id, text, parse_mode="HTML")
@@ -221,12 +225,12 @@ async def post_feed(context, wh_ids, text: str):
 
 
 async def feed_invoice_pdf(context, wh_id, client_label, p, old_debt, total,
-                           caption=None):
+                           caption=None, exclude_chat_id=None):
     """PDF проведённой накладной — в чат-ленту склада (просьба владельца:
     накладные Каракола видны всей команде склада). Сводка операции идёт
     подписью к файлу — отдельное текстовое сообщение не шлём (дубль)."""
     wh = db.warehouse_by_id(wh_id)
-    if not wh or not wh["feed_chat_id"]:
+    if not wh or not wh["feed_chat_id"] or wh["feed_chat_id"] == exclude_chat_id:
         return
     try:
         await send_invoice_pdf(context, wh["feed_chat_id"], client_label, p,
@@ -235,14 +239,16 @@ async def feed_invoice_pdf(context, wh_id, client_label, p, old_debt, total,
         log.warning("Не удалось отправить PDF в ленту склада %s: %s", wh_id, e)
 
 
-async def feed_operation(context, op_id: int, actor_name: str, prefix: str, note: str = ""):
+async def feed_operation(context, op_id: int, actor_name: str, prefix: str,
+                         note: str = "", exclude_chat_id=None):
     op = db.get_operation(op_id)
     if op is None:
         return
     text = f"{prefix} <b>{esc(actor_name)}</b> — {esc(op['summary'])}"
     if note:
         text += f"\n{esc(note)}"
-    await post_feed(context, db.operation_warehouses(op), text)
+    await post_feed(context, db.operation_warehouses(op), text,
+                    exclude_chat_id=exclude_chat_id)
 
 
 # ---------- Системный промпт ----------
@@ -2198,7 +2204,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 actor_name = db.get_user(p["user_id"])["name"]
                 await feed_invoice_pdf(
                     context, p["wh_id"], client_label, p, old_debt, total,
-                    caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}")
+                    caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}",
+                    exclude_chat_id=p["chat_id"])
                 await alert_low_stock(context, [
                     (p["wh_id"], it["product_id"], -it["qty"])
                     for it in p["items"] if it.get("product_id")])
@@ -2209,7 +2216,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     + payment_receipt(client_label, old_debt, p["amount"]),
                     parse_mode="HTML")
                 await notify_admin(context, actor, summary)
-                await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "💵")
+                await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "💵",
+                                     exclude_chat_id=p["chat_id"])
             elif p["kind"] == "transfer":
                 op_id, summary = commit_transfer(p)
                 await q.edit_message_text(f"✅ {esc(summary)} — проведено (операция №{op_id}).",
@@ -2227,7 +2235,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await notify_admin(context, actor, summary)
                 actor_name = db.get_user(p["user_id"])["name"]
-                await feed_operation(context, op_id, actor_name, "📦", note)
+                await feed_operation(context, op_id, actor_name, "📦", note,
+                                     exclude_chat_id=p["chat_id"])
                 if p["from_wh_id"]:
                     await alert_low_stock(context, [
                         (p["from_wh_id"], it["product_id"], -it["qty"])
@@ -2247,7 +2256,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     except Exception:
                         log.warning("Не удалось уведомить заявителя")
                 actor_name = db.get_user(p["user_id"])["name"]
-                await feed_operation(context, op_id, actor_name, "💰")
+                await feed_operation(context, op_id, actor_name, "💰",
+                                     exclude_chat_id=p["chat_id"])
             elif p["kind"] == "return":
                 op_id, client_label, old_debt, total, summary = commit_return(p)
                 await q.edit_message_text(f"✅ Возврат №{op_id} проведён.")
@@ -2262,7 +2272,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         log.warning("Не удалось уведомить заявителя")
                 actor_name = db.get_user(p["user_id"])["name"]
                 note = "Подтвердил админ" if p.get("approver_id") else ""
-                await feed_operation(context, op_id, actor_name, "🔙", note)
+                await feed_operation(context, op_id, actor_name, "🔙", note,
+                                     exclude_chat_id=p["chat_id"])
             elif p["kind"] == "inventory":
                 op_id, summary = commit_inventory(p)
                 if op_id is None:
@@ -2283,7 +2294,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await notify_admin(context, actor, summary)
                     actor_name = db.get_user(p["user_id"])["name"]
                     note = "Подтвердил админ" if p.get("approver_id") else ""
-                    await feed_operation(context, op_id, actor_name, "📋", note)
+                    await feed_operation(context, op_id, actor_name, "📋", note,
+                                         exclude_chat_id=p["chat_id"])
             elif p["kind"] == "set_price":
                 c = db.client_get(p["client_id"])
                 for it in p["items"]:
@@ -2326,7 +2338,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await feed_invoice_pdf(
                         context, p["wh_id"], client_label, p, old_debt, total,
                         caption=(f"🔁 <b>{esc(actor_name)}</b> — {esc(summary)}\n"
-                                 f"Замена накладной №{p['old_op_id']}"))
+                                 f"Замена накладной №{p['old_op_id']}"),
+                        exclude_chat_id=p["chat_id"])
                     await alert_low_stock(context, [
                         (p["wh_id"], it["product_id"], -it["qty"])
                         for it in p["items"] if it.get("product_id")])
@@ -2373,7 +2386,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         await post_feed(
                             context, db.operation_warehouses(cancelled),
                             f"↩️ <b>{esc(actor['name'])}</b> отменил операцию "
-                            f"№{p['op_id']}: {esc(msg)}")
+                            f"№{p['op_id']}: {esc(msg)}",
+                            exclude_chat_id=p.get("chat_id"))
             elif p["kind"] == "change_price":
                 for it in p["items"]:
                     db.product_set_price(it["product_id"], it["price"], p["user_id"])
@@ -2395,23 +2409,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Сообщения ----------
 
-async def process_text(update, context, actor, text, draft=False):
+async def process_text(update, context, actor, text, draft=False, quiet=False):
     chat_id = update.effective_chat.id
     history = chat_histories.setdefault(chat_id, [])
     history.append({"role": "user", "content": text})
     chat_histories[chat_id] = history[-HISTORY_LIMIT:]
 
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    if not quiet:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
         reply = await ask_claude(chat_histories[chat_id], actor)
     except Exception as e:
         log.exception("Claude API error")
-        await update.message.reply_text(f"⚠️ Ошибка при обращении к ИИ: {e}")
+        if not quiet:
+            await update.message.reply_text(f"⚠️ Ошибка при обращении к ИИ: {e}")
         return
     chat_histories[chat_id].append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = chat_histories[chat_id][-HISTORY_LIMIT:]
 
-    await dispatch_action(update, context, actor, reply, draft)
+    await dispatch_action(update, context, actor, reply, draft, quiet=quiet)
 
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
@@ -2419,11 +2435,22 @@ WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory",
                      "amend_invoice", "set_min", "set_phone", "set_price"}
 
 
-async def dispatch_action(update, context, actor, reply, draft=False):
+async def dispatch_action(update, context, actor, reply, draft=False, quiet=False):
     data = extract_action(reply)
     if data is None:
-        await update.message.reply_text(reply)
+        # В чате склада (quiet) на обычные разговоры не отвечаем —
+        # бот вмешивается только когда видит операцию.
+        if not quiet:
+            await update.message.reply_text(reply)
         return
+    # Сообщение в чате-ленте склада без указания склада: операция идёт
+    # на склад этого чата (если чат привязан ровно к одному складу).
+    if (data.get("action") in WAREHOUSE_ACTIONS
+            and not str(data.get("warehouse") or "").strip()
+            and update.effective_chat is not None):
+        feed_whs = db.warehouses_of_feed(update.effective_chat.id)
+        if len(feed_whs) == 1:
+            data["warehouse"] = feed_whs[0]["name"]
     # Сотрудник с доступом к нескольким складам не указал склад — уточняем
     # кнопками, чтобы операция случайно не ушла на «родной» склад
     # (просьба владельца 21.07.2026). Админа не трогаем: у него все склады,
@@ -2676,12 +2703,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Голосовое сообщение -> текст (Whisper) -> обычная обработка."""
     if update.message is None:
         return
+    quiet = False
     if update.effective_chat.type != "private":
-        return
-    actor = await get_actor(update)
-    if actor is None:
-        return
+        # В чате-ленте склада голосовые сотрудников тоже обрабатываем,
+        # но молча: бот вмешается, только если услышит операцию.
+        actor = _feed_chat_actor(update)
+        if actor is None:
+            return
+        quiet = True
+    else:
+        actor = await get_actor(update)
+        if actor is None:
+            return
     if not STT_API_KEY and not ELEVENLABS_API_KEY:
+        if quiet:
+            return
         if is_admin(actor):
             await update.message.reply_text(
                 "🎤 Распознавание голосовых пока не настроено.\n\n"
@@ -2700,18 +2736,21 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     duration = tg_obj.duration or 0
     if duration > MAX_VOICE_SECONDS:
-        await update.message.reply_text(
-            f"⚠️ Голосовое слишком длинное ({duration // 60} мин {duration % 60} сек). "
-            f"Максимум — {MAX_VOICE_SECONDS // 60} мин.")
+        if not quiet:
+            await update.message.reply_text(
+                f"⚠️ Голосовое слишком длинное ({duration // 60} мин {duration % 60} сек). "
+                f"Максимум — {MAX_VOICE_SECONDS // 60} мин.")
         return
     chat_id = update.effective_chat.id
-    await context.bot.send_chat_action(chat_id=chat_id, action="typing")
+    if not quiet:
+        await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
         tg_file = await tg_obj.get_file()
         raw = bytes(await tg_file.download_as_bytearray())
     except Exception as e:
         log.exception("Не удалось скачать голосовое")
-        await update.message.reply_text(f"⚠️ Не удалось загрузить голосовое: {e}")
+        if not quiet:
+            await update.message.reply_text(f"⚠️ Не удалось загрузить голосовое: {e}")
         return
     if voice is not None:
         filename, mime = "voice.ogg", "audio/ogg"
@@ -2722,34 +2761,63 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text = await transcribe_audio(raw, filename, mime)
     except Exception as e:
         log.exception("Ошибка распознавания голосового")
-        await update.message.reply_text(f"⚠️ Не удалось распознать голосовое: {e}")
+        if not quiet:
+            await update.message.reply_text(f"⚠️ Не удалось распознать голосовое: {e}")
         return
     if not text:
-        await update.message.reply_text(
-            "⚠️ Не разобрал речь — попробуйте ещё раз или напишите текстом.")
+        if not quiet:
+            await update.message.reply_text(
+                "⚠️ Не разобрал речь — попробуйте ещё раз или напишите текстом.")
         return
-    await update.message.reply_text(f"🎤 Распознал: «{text}»")
+    if not quiet:
+        # В чате склада эхо «Распознал» не шлём — бот отзовётся только
+        # заявкой, если услышал операцию.
+        await update.message.reply_text(f"🎤 Распознал: «{text}»")
     draft = False
     m = DRAFT_RE.match(text)
     if m:
         draft = True
         text = text[m.end():].strip()
         if not text:
-            await update.message.reply_text(
-                "После слова «черновик» продиктуйте накладную.")
+            if not quiet:
+                await update.message.reply_text(
+                    "После слова «черновик» продиктуйте накладную.")
             return
-    await process_text(update, context, actor, text, draft=draft)
+    await process_text(update, context, actor, text, draft=draft, quiet=quiet)
+
+
+def _feed_chat_actor(update):
+    """Сотрудник в чате-ленте склада: обрабатываем его сообщения как операции.
+
+    Возвращает строку users или None (чужой чат / не сотрудник) — без ответов,
+    чтобы бот не встревал в разговоры."""
+    if not db.warehouses_of_feed(update.effective_chat.id):
+        return None
+    user = update.effective_user
+    if user is None:
+        return None
+    row = db.get_user(user.id)
+    if row is None or not row["active"]:
+        return None
+    return row
 
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or not update.message.text:
         return
-    # В группах бот только публикует ленту операций — сообщения не обрабатывает.
+    quiet = False
     if update.effective_chat.type != "private":
-        return
-    actor = await get_actor(update)
-    if actor is None:
-        return
+        # В группах работаем только в чатах-лентах складов и только с
+        # сотрудниками; отвечаем только на операции (просьба владельца
+        # 21.07.2026: «Асан приход 5000» можно писать прямо в чат склада).
+        actor = _feed_chat_actor(update)
+        if actor is None:
+            return
+        quiet = True
+    else:
+        actor = await get_actor(update)
+        if actor is None:
+            return
     text = update.message.text.strip()
     draft = False
     m = DRAFT_RE.match(text)
@@ -2761,7 +2829,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "После слова «черновик» напишите накладную.\n"
                 "Пример: черновик: Асан, Албенивер 200мл 1к")
             return
-    await process_text(update, context, actor, text, draft=draft)
+    await process_text(update, context, actor, text, draft=draft, quiet=quiet)
 
 
 # ---------- Команды ----------
