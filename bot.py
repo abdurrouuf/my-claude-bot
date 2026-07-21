@@ -3548,6 +3548,60 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="\n".join(summary))
 
 
+async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Полный справочник клиентов склада (включая нулевые долги) — PDF."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if arg and arg.lower() != "all":
+        wh = db.warehouse_by_name(arg)
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    sections, summary = [], []
+    for wh in whs:
+        clients = db.clients_of(wh["id"])
+        if not clients:
+            summary.append(f"🏬 «{wh['name']}»: клиентов пока нет")
+            continue
+        rows, total_debt, debtors = [], 0.0, 0
+        for c in sorted(clients, key=lambda r: r["name"].lower()):
+            aliases = db.client_aliases_list(c["id"])
+            name = c["name"] + (f" ({', '.join(aliases)})" if aliases else "")
+            if c["debt"] > 0:
+                debt_cell = money(c["debt"])
+                total_debt += c["debt"]
+                debtors += 1
+            elif c["debt"] < 0:
+                debt_cell = f"переплата {money(-c['debt'])}"
+            else:
+                debt_cell = "—"
+            rows.append([name, debt_cell, c["phone"] or ""])
+        sections.append({
+            "title": f"Склад «{wh['name']}»",
+            "headers": ["Клиент", "Долг", "Телефон"],
+            "rows": rows, "widths": [85, 45, 37], "numbered": True,
+            "footer": f"Клиентов: {len(rows)} · должников: {debtors} · "
+                      f"долгов: {money(total_debt)}",
+        })
+        summary.append(f"🏬 «{wh['name']}»: {len(rows)} клиентов, "
+                       f"долгов {money(total_debt)}")
+    if not sections:
+        await update.message.reply_text("\n".join(summary) or "Клиентов пока нет.")
+        return
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf("СПРАВОЧНИК КЛИЕНТОВ",
+                              f"ОсОО «ВЕТОП» · на {date_str}", sections)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"клиенты_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary) + "\nКарточка клиента: /client Имя")
+
+
 async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
@@ -5206,6 +5260,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stock", show_stock))
     app.add_handler(CommandHandler("stockprice", show_stock_price))
     app.add_handler(CommandHandler("debts", show_debts))
+    app.add_handler(CommandHandler("clients", clients_cmd))
     app.add_handler(CommandHandler("payment", payment_cmd))
     app.add_handler(CommandHandler("invoice", invoice_hint))
     app.add_handler(CommandHandler("draft", draft_cmd))
