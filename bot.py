@@ -2715,9 +2715,11 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         actor = await get_actor(update)
         if actor is None:
             return
+    if quiet and not STT_API_KEY:
+        # В чате склада слушаем голосовые только через бесплатный Groq —
+        # квоту платного ElevenLabs на разговоры в группах не тратим.
+        return
     if not STT_API_KEY and not ELEVENLABS_API_KEY:
-        if quiet:
-            return
         if is_admin(actor):
             await update.message.reply_text(
                 "🎤 Распознавание голосовых пока не настроено.\n\n"
@@ -2758,7 +2760,12 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         filename = audio.file_name or "audio.mp3"
         mime = audio.mime_type or "audio/mpeg"
     try:
-        text = await transcribe_audio(raw, filename, mime)
+        if quiet:
+            # Чат склада: всегда бесплатный Groq/Whisper (русский).
+            # ElevenLabs (кыргызский) — только в личке, чтобы беречь квоту.
+            text = await _transcribe_whisper(raw, filename, mime)
+        else:
+            text = await transcribe_audio(raw, filename, mime)
     except Exception as e:
         log.exception("Ошибка распознавания голосового")
         if not quiet:
