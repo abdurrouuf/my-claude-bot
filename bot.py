@@ -147,7 +147,9 @@ async def get_actor(update: Update):
     row = db.get_user(tg_user.id)
     if row is None or not row["active"]:
         msg = update.effective_message
-        if msg:
+        chat = update.effective_chat
+        # В группах не отвечаем чужим — не шумим в чатах-лентах складов.
+        if msg and chat and chat.type == "private":
             await msg.reply_text("⛔ У вас нет доступа к этому боту.")
         return None
     return row
@@ -164,6 +166,22 @@ async def send_long(message, text: str):
             chunk = f"{chunk}\n{line}" if chunk else line
     if chunk:
         await message.reply_text(chunk, parse_mode="HTML")
+
+
+async def send_long_bot(bot, chat_id, text: str):
+    """То же, что send_long, но для фоновых рассылок (bot.send_message).
+
+    Лимит Telegram — 4096 символов: длинное напоминание о должниках раньше
+    просто не доходило (BadRequest глотался логом)."""
+    chunk = ""
+    for line in text.split("\n"):
+        if len(chunk) + len(line) + 1 > 4000:
+            await bot.send_message(chat_id, chunk, parse_mode="HTML")
+            chunk = line
+        else:
+            chunk = f"{chunk}\n{line}" if chunk else line
+    if chunk:
+        await bot.send_message(chat_id, chunk, parse_mode="HTML")
 
 
 def new_pending(payload: dict, ttl: int = PENDING_TTL) -> str:
@@ -436,6 +454,19 @@ def _refresh_price_dependents():
     STT_PROMPT = _build_stt_prompt()
 
 
+# Известные клиенты дёргаются на каждое сообщение (фильтр чатов складов,
+# динамический промпт) — а данные меняются редко. Кэш на 2 минуты.
+_KNOWN_CLIENTS_CACHE = {"ts": 0.0, "names": []}
+
+
+def known_clients_cached(limit: int) -> list:
+    now = time.monotonic()
+    if not _KNOWN_CLIENTS_CACHE["names"] or now - _KNOWN_CLIENTS_CACHE["ts"] > 120:
+        _KNOWN_CLIENTS_CACHE["names"] = db.known_client_names(300)
+        _KNOWN_CLIENTS_CACHE["ts"] = now
+    return _KNOWN_CLIENTS_CACHE["names"][:limit]
+
+
 def build_dynamic_system(actor) -> str:
     """Маленький изменяемый блок: дата, сотрудник, склады."""
     own = db.warehouse_of(actor["id"])
@@ -454,7 +485,7 @@ def build_dynamic_system(actor) -> str:
         if w:
             lines.append(f"- {u['name']} → склад «{w['name']}»")
     lines.append("Все склады: " + ", ".join(f"«{w['name']}»" for w in db.all_warehouses()))
-    known = db.known_client_names(40)
+    known = known_clients_cached(40)
     if known:
         lines.append(
             "Известные клиенты (сообщения часто приходят из распознавания голоса "
@@ -693,13 +724,21 @@ def invoice_summary(p) -> str:
     return "\n".join(lines)
 
 
-def commit_invoice(p):
-    """Проводит накладную: клиент, остатки, долг, журнал. Возвращает детали для PDF."""
+def commit_invoice(p, replace_op_id=None):
+    """Проводит накладную: клиент, остатки, долг, журнал. Возвращает детали для PDF.
+
+    replace_op_id — замена накладной (amend): сторно старой и проведение новой
+    идут одной транзакцией в базе, чтобы сбой между ними не оставил учёт
+    со снятой накладной без замены."""
     total = sum(it["qty"] * it["price"] for it in p["items"])
     cid = p["client_id"]
     create = None
+    debt_delta = total - p["payment"]
     if cid is None:
-        create = (p["wh_id"], p["client_name"], p["parsed_debt"], p.get("phone"))
+        # Клиент создаётся с долгом 0, а стартовый долг входит в дельту
+        # операции: тогда /undo снимает и его, и долг восстановим из журнала.
+        create = (p["wh_id"], p["client_name"], 0, p.get("phone"))
+        debt_delta += p["parsed_debt"]
         old_debt = p["parsed_debt"]
         client_label = p["client_name"]
     else:
@@ -710,7 +749,6 @@ def commit_invoice(p):
             db.client_set_phone(cid, p["phone"])
     stock_deltas = [(p["wh_id"], it["product_id"], -it["qty"])
                     for it in p["items"] if it.get("product_id")]
-    debt_delta = total - p["payment"]
     summary = f"Накладная: {client_label} — {fmt_num(total)} сом (склад {p['wh_name']})"
     if p["payment"]:
         summary += f", приход {fmt_num(p['payment'])} сом"
@@ -718,10 +756,16 @@ def commit_invoice(p):
         "items": [{k: it[k] for k in ("name", "volume", "qty", "price", "box_qty")} for it in p["items"]],
         "total": total, "payment": p["payment"], "old_debt": old_debt,
     }
-    op_id, _ = db.commit_operation(
-        p["user_id"], "invoice", p["wh_id"], cid, summary,
-        stock_deltas, [(cid, debt_delta)], extra, create_client=create,
-    )
+    if replace_op_id:
+        op_id, _ = db.replace_operation(
+            replace_op_id, p.get("op_user_id") or p["user_id"], "invoice",
+            p["wh_id"], cid, summary, stock_deltas, [(cid, debt_delta)], extra,
+        )
+    else:
+        op_id, _ = db.commit_operation(
+            p["user_id"], "invoice", p["wh_id"], cid, summary,
+            stock_deltas, [(cid, debt_delta)], extra, create_client=create,
+        )
     return op_id, client_label, old_debt, total, summary
 
 
@@ -898,7 +942,7 @@ async def start_amend_invoice(update, context, actor, data):
                 ts = ts.replace(tzinfo=BISHKEK)
             age = (datetime.now(BISHKEK) - ts).total_seconds()
         except ValueError:
-            age = 0
+            age = UNDO_WINDOW + 1  # непонятная дата — считаем, что окно вышло
         if age > UNDO_WINDOW:
             await update.message.reply_text(
                 "⛔ С момента накладной прошло больше часа — заменить её может "
@@ -930,6 +974,9 @@ async def start_amend_invoice(update, context, actor, data):
         return
     payload = {
         "kind": "amend_invoice", "user_id": actor["id"],
+        # Новая накладная проводится от имени АВТОРА старой (иначе при замене
+        # админом приход «переехал» бы из кассы сотрудника в кассу админа).
+        "op_user_id": op["user_id"],
         "chat_id": update.effective_chat.id,
         "wh_id": wh["id"], "wh_name": wh["name"],
         "client_name": c["name"], "client_id": c["id"],
@@ -1612,7 +1659,11 @@ async def promise_reminder_loop(app):
             # Админу — всё, каждому сотруднику — записанные им
             text = "\n".join([header, ""] +
                              [_promise_line(r, today, with_author=True) for r in rows] + [tail])
-            await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+            try:
+                await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+            except Exception:
+                # Сбой отправки админу не должен срывать рассылку сотрудникам
+                log.warning("Не удалось отправить напоминание об обещаниях админу")
             by_author = {}
             for r in rows:
                 if r["user_id"] != ADMIN_ID:
@@ -2193,6 +2244,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if lack:
                     await q.edit_message_text(lack_message(lack), parse_mode="HTML")
                     return
+                if p.get("client_id") is None:
+                    # Клиент мог появиться, пока заявка ждала кнопки (вторая
+                    # накладная, add_clients) — иначе INSERT упадёт по UNIQUE.
+                    existing = db.client_exact(p["wh_id"], p.get("client_name") or "")
+                    if existing is not None:
+                        p["client_id"] = existing["id"]
                 op_id, client_label, old_debt, total, summary = commit_invoice(p)
                 await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
                 if p.get("approver_id"):
@@ -2326,13 +2383,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if lack:
                     await q.edit_message_text(lack_message(lack), parse_mode="HTML")
                     return
-                ok, why = db.cancel_operation(p["old_op_id"])
-                if not ok:
+                try:
+                    # Сторно старой и проведение новой — одна транзакция в базе.
+                    op_id, client_label, old_debt, total, summary = commit_invoice(
+                        p, replace_op_id=p["old_op_id"])
+                except ValueError as e:
                     await q.edit_message_text(
-                        f"⚠️ Не удалось отменить накладную №{p['old_op_id']}: {esc(why)}",
+                        f"⚠️ Не удалось заменить накладную №{p['old_op_id']}: {esc(str(e))}",
                         parse_mode="HTML")
                 else:
-                    op_id, client_label, old_debt, total, summary = commit_invoice(p)
                     await q.edit_message_text(
                         f"✅ Накладная №{p['old_op_id']} отменена, вместо неё проведена "
                         f"№{op_id}.")
@@ -2340,7 +2399,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                            old_debt, total)
                     await notify_admin(context, actor,
                                        f"замена накладной №{p['old_op_id']} → №{op_id}: {summary}")
-                    actor_name = db.get_user(p["user_id"])["name"]
+                    actor_name = db.get_user(p.get("op_user_id") or p["user_id"])["name"]
                     await feed_invoice_pdf(
                         context, p["wh_id"], client_label, p, old_debt, total,
                         caption=(f"🔁 <b>{esc(actor_name)}</b> — {esc(summary)}\n"
@@ -2351,6 +2410,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         for it in p["items"] if it.get("product_id")])
             elif p["kind"] == "load_karakol":
                 from karakol_stock_data import KARAKOL_STOCK
+                # Перепроверка на кнопке: две заявки подряд задвоили бы остатки
+                nonzero_now = sum(1 for q_ in db.stock_map(p["wh_id"]).values() if q_)
+                if nonzero_now:
+                    await q.edit_message_text(
+                        f"⚠️ На складе уже есть остатки ({nonzero_now} позиций) — "
+                        "повторная загрузка отменена, ничего не изменено.")
+                    return
                 deltas = [(p["wh_id"], pid, qty)
                           for pid, qty, _ in KARAKOL_STOCK if qty > 0]
                 total = sum(d[2] for d in deltas)
@@ -2407,7 +2473,18 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await q.edit_message_text("\n".join(lines), parse_mode="HTML")
         except Exception as e:
             log.exception("Ошибка проведения операции")
-            await context.bot.send_message(p["chat_id"], f"⚠️ Ошибка при проведении: {e}")
+            # Сообщаем и нажавшему кнопку (иначе админ-подтверждающий не видит
+            # сбой заявки), и заявителю в его чат.
+            try:
+                await q.edit_message_text(f"⚠️ Ошибка при проведении: {e}")
+            except Exception:
+                pass
+            try:
+                if q.message is None or p.get("chat_id") != q.message.chat.id:
+                    await context.bot.send_message(
+                        p["chat_id"], f"⚠️ Ошибка при проведении: {e}")
+            except Exception:
+                log.warning("Не удалось сообщить заявителю об ошибке")
         return
 
     await q.answer()
@@ -2427,8 +2504,10 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
         reply = await ask_claude(chat_histories[chat_id], actor)
     except Exception as e:
         log.exception("Claude API error")
-        if not quiet:
-            await update.message.reply_text(f"⚠️ Ошибка при обращении к ИИ: {e}")
+        # Отвечаем и в чате склада: сюда попадает только похожее на операцию
+        # (фильтр), молчание = сотрудник уверен, что оплата записана.
+        await update.message.reply_text(
+            f"⚠️ Не получилось обработать: {e}\nПопробуйте ещё раз или напишите боту в личку.")
         return
     chat_histories[chat_id].append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = chat_histories[chat_id][-HISTORY_LIMIT:]
@@ -2444,10 +2523,11 @@ WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory",
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False):
     data = extract_action(reply)
     if data is None:
-        # В чате склада (quiet) на обычные разговоры не отвечаем —
-        # бот вмешивается только когда видит операцию.
-        if not quiet:
-            await update.message.reply_text(reply)
+        # Отвечаем и в чате склада: сюда доходят только сообщения, похожие
+        # на операцию (бесплатный фильтр), и ответ модели — обычно уточняющий
+        # вопрос («какой Асан?»). Молчать нельзя — сотрудник решит, что
+        # операция записана.
+        await update.message.reply_text(reply)
         return
     # Сообщение в чате-ленте склада без указания склада: операция идёт
     # на склад этого чата (если чат привязан ровно к одному складу).
@@ -2512,7 +2592,7 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
         elif action == "set_phone":
             await start_set_phone(update, context, actor, data)
         else:
-            await update.message.reply_text(reply)
+            await update.message.reply_text(reply or "⚠️ Не понял действие — напишите ещё раз.")
     except Exception as e:
         log.exception("Ошибка обработки действия %s", action)
         await update.message.reply_text(f"⚠️ Ошибка: {e}")
@@ -2623,7 +2703,11 @@ def _build_stt_prompt() -> str:
     return head + body + tail
 
 
-STT_PROMPT_BUDGET = 420  # ~210 токенов кириллицы — с запасом до лимита 224
+# Лимит подсказки Whisper — 224 токена. Кириллические имена собственные могут
+# токенизироваться тяжелее 2 симв/токен, поэтому бюджет консервативный:
+# 380 символов ≈ 190–220 токенов. Превышение = 400 от Groq и повтор без
+# подсказки вовсе (тогда препараты снова коверкаются).
+STT_PROMPT_BUDGET = 380
 
 
 def _stt_prompt_full() -> str:
@@ -2691,6 +2775,12 @@ async def _transcribe_whisper(raw: bytes, filename: str, mime: str) -> str:
             # Скорее всего сервису не понравилась подсказка — пробуем без неё.
             log.warning("STT 400, повтор без подсказки: %s", resp.text[:500])
             data.pop("prompt", None)
+            resp = await cl.post(url, headers=headers, data=data,
+                                 files={"file": (filename, raw, mime)})
+        elif resp.status_code == 429:
+            # Лимит запросов Groq — одна повторная попытка после паузы.
+            log.warning("STT 429, повтор через 3 сек")
+            await asyncio.sleep(3)
             resp = await cl.post(url, headers=headers, data=data,
                                  files={"file": (filename, raw, mime)})
         if resp.status_code >= 400:
@@ -2839,7 +2929,7 @@ def _looks_like_operation(text: str) -> bool:
         if p["name"].split()[0].split("-")[0].lower() in t:
             return True
     words = set(re.findall(r"[а-яёa-z]+", t))
-    for name in db.known_client_names(300):
+    for name in known_clients_cached(300):
         w = name.split()[0].lower()
         if len(w) >= 3 and w in words:
             return True
@@ -2871,9 +2961,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         draft = True
         text = text[m.end():].strip()
         if not text:
-            await update.message.reply_text(
-                "После слова «черновик» напишите накладную.\n"
-                "Пример: черновик: Асан, Албенивер 200мл 1к")
+            if not quiet:
+                await update.message.reply_text(
+                    "После слова «черновик» напишите накладную.\n"
+                    "Пример: черновик: Асан, Албенивер 200мл 1к")
             return
     await process_text(update, context, actor, text, draft=draft, quiet=quiet)
 
@@ -3105,6 +3196,7 @@ async def _stock_cmd(update, context, with_prices):
                   for w in whs]
             kb.append([InlineKeyboardButton("🗂 Все склады сразу",
                                             callback_data=f"ps:{token}:all")])
+            kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
             await update.message.reply_text("Остатки какого склада показать?",
                                             reply_markup=InlineKeyboardMarkup(kb))
             return
@@ -3198,10 +3290,16 @@ PERIODS = {
 }
 
 
-def report_data(warehouses, days_back: int):
-    """Цифры отчёта по складам за период (для текста и PDF)."""
-    start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
-        hour=0, minute=0, second=0, microsecond=0)
+def report_data(warehouses, days_back: int, last_hours: int = None):
+    """Цифры отчёта по складам за период (для текста и PDF).
+
+    last_hours — скользящее окно «последние N часов» (для вечерней сводки:
+    окно «с полуночи» теряло операции после часа отправки)."""
+    if last_hours:
+        start = datetime.now(BISHKEK) - timedelta(hours=last_hours)
+    else:
+        start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
     ops = db.operations_since(start.isoformat(timespec="seconds"))
     out = []
     for wh in warehouses:
@@ -3238,38 +3336,6 @@ def report_data(warehouses, days_back: int):
     return out
 
 
-def build_report(warehouses, days_back: int, label: str) -> str:
-    """Отчёт по складам: продажи, деньги, долги, топ товаров (текст)."""
-    lines = []
-    grand_sales = grand_money = 0
-    for d in report_data(warehouses, days_back):
-        wh = d["wh"]
-        lines.append(f"📊 <b>«{esc(wh['name'])}» {esc(label)}</b>")
-        if d["empty"]:
-            lines.append("— операций не было —")
-            lines.append("")
-            continue
-        lines.append(f"🧾 Накладных: {d['n_inv']} на <b>{money(d['sales'])}</b>")
-        lines.append(f"💵 Принято денег: <b>{money(d['money'])}</b>")
-        if d["debt_added"] > 0:
-            lines.append(f"📈 Выдано в долг: {money(d['debt_added'])}")
-        if d["ret_count"]:
-            lines.append(f"🔙 Возвратов: {d['ret_count']} на {money(d['ret_sum'])}")
-        if d["transfers"]:
-            lines.append(f"📦 Приходов/перемещений товара: {d['transfers']}")
-        if d["top"]:
-            lines.append("🔝 Топ товаров:")
-            for i, (name, qty) in enumerate(d["top"][:5], 1):
-                lines.append(f"  {i}. {esc(name)} — {qty} шт")
-        lines.append("")
-        grand_sales += d["sales"]
-        grand_money += d["money"]
-    if len(warehouses) > 1:
-        lines.append(f"💰 <b>Итого {esc(label)}: продажи {money(grand_sales)}, "
-                     f"деньги {money(grand_money)}</b>")
-    return "\n".join(lines).strip()
-
-
 async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
@@ -3303,9 +3369,9 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=caption)
 
 
-def build_report_pdf(whs, days_back: int, label: str):
+def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
     """PDF-отчёт по складам. Возвращает (pdf, подпись) или (None, текст-пусто)."""
-    data = report_data(whs, days_back)
+    data = report_data(whs, days_back, last_hours=last_hours)
     if all(d["empty"] for d in data):
         return None, f"📊 Операций {label} не было."
     sections, summary = [], []
@@ -3353,7 +3419,9 @@ async def send_evening_summaries(bot):
         if wh["feed_chat_id"]:
             by_chat.setdefault(wh["feed_chat_id"], []).append(wh)
     for chat_id, whs in by_chat.items():
-        pdf, caption = build_report_pdf(whs, 0, "за сегодня")
+        # Скользящие сутки: окно «с полуночи» теряло операции после 20:00 —
+        # они не попадали ни в сегодняшнюю сводку, ни в завтрашнюю.
+        pdf, caption = build_report_pdf(whs, 0, "за сутки", last_hours=24)
         if pdf is None:
             continue  # день без операций — не шумим
         wh_ids = {w["id"] for w in whs}
@@ -3378,13 +3446,22 @@ async def send_evening_summaries(bot):
             log.warning("Не удалось отправить сводку в %s: %s", chat_id, e)
 
 
-def build_draft_summary() -> str | None:
-    """Сводка по черновикам за сегодня; None, если черновиков не было."""
-    today = datetime.now(BISHKEK).replace(hour=0, minute=0, second=0, microsecond=0)
-    rows = db.drafts_since(today.isoformat(timespec="seconds"))
+def build_draft_summary(last_hours: int = None) -> str | None:
+    """Сводка по черновикам; None, если черновиков не было.
+
+    last_hours — скользящее окно для вечерней рассылки (окно «с полуночи»
+    навсегда теряло черновики, выписанные после часа отправки)."""
+    now = datetime.now(BISHKEK)
+    if last_hours:
+        since = now - timedelta(hours=last_hours)
+        title = f"📝 <b>Черновики за сутки (к {now.strftime('%H:%M %d.%m.%Y')})</b>"
+    else:
+        since = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        title = f"📝 <b>Черновики за {since.strftime('%d.%m.%Y')}</b>"
+    rows = db.drafts_since(since.isoformat(timespec="seconds"))
     if not rows:
         return None
-    lines = [f"📝 <b>Черновики за {today.strftime('%d.%m.%Y')}</b>", ""]
+    lines = [title, ""]
     total_n, total_sum = 0, 0.0
     for r in rows:
         lines.append(f"• {esc(r['name'])}: {r['n']} шт. — <b>{money(r['total'])}</b>")
@@ -3403,7 +3480,7 @@ async def draft_summary_loop(app):
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
         try:
-            text = build_draft_summary()
+            text = build_draft_summary(last_hours=24)
             if text:
                 await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
         except Exception:
@@ -3798,7 +3875,7 @@ async def monthly_deadstock_loop(app):
         try:
             text = build_deadstock(db.all_warehouses(), DEADSTOCK_DAYS)
             if text:
-                await app.bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+                await send_long_bot(app.bot, ADMIN_ID, text)
         except Exception:
             log.exception("Ошибка отчёта о мёртвом товаре")
 
@@ -3899,7 +3976,7 @@ async def send_debt_alerts(bot):
     admin_text = build_overdue(db.all_warehouses(), DEBT_ALERT_DAYS)
     if admin_text:
         try:
-            await bot.send_message(ADMIN_ID, admin_text, parse_mode="HTML")
+            await send_long_bot(bot, ADMIN_ID, admin_text)
         except Exception as e:
             log.warning("Не удалось отправить напоминание админу: %s", e)
     for u in db.list_users():
@@ -3909,8 +3986,8 @@ async def send_debt_alerts(bot):
         if not text:
             continue
         try:
-            await bot.send_message(u["id"], text + "\n\nПора напомнить клиентам об оплате 📞",
-                                   parse_mode="HTML")
+            await send_long_bot(bot, u["id"],
+                                text + "\n\nПора напомнить клиентам об оплате 📞")
         except Exception as e:
             log.warning("Не удалось отправить напоминание %s: %s", u["name"], e)
 
@@ -4127,6 +4204,11 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    if context.args and not is_admin(actor):
+        await update.message.reply_text(
+            "⛔ Отменять операцию по номеру может только админ.\n"
+            "Просто /undo (без номера) отменяет вашу последнюю операцию.")
+        return
     if context.args and is_admin(actor):
         try:
             op = db.get_operation(int(context.args[0]))
@@ -4171,13 +4253,33 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ts = op["ts"]
     u = db.get_user(op["user_id"])
     who = u["name"] if u else str(op["user_id"])
+    # Если сторно уведёт остатки в минус (после отмены успели продать) —
+    # предупреждаем прямо в карточке подтверждения.
+    minus = []
+    try:
+        deltas = json.loads(op["data"]).get("stock_deltas", [])
+    except (ValueError, TypeError):
+        deltas = []
+    for wh_id2, pid, d in deltas:
+        if d > 0:
+            left = db.stock_qty(wh_id2, pid) - d
+            if left < 0:
+                pr = prices.BY_ID.get(pid)
+                label = pr["name"].split("(")[0].strip() if pr else f"товар №{pid}"
+                minus.append(f"{label}: станет {left} шт")
+    warn = ""
+    if minus:
+        shown = "\n".join(f"• {esc(m)}" for m in minus[:8])
+        if len(minus) > 8:
+            shown += f"\n… и ещё {len(minus) - 8} поз."
+        warn = f"\n\n⚠️ <b>После отмены остатки уйдут в минус:</b>\n{shown}"
     payload = {"kind": "undo_op", "user_id": actor["id"],
                "chat_id": update.effective_chat.id, "op_id": op["id"]}
     token = new_pending(payload)
     await update.message.reply_text(
         "↩️ <b>Отмена операции — проверьте:</b>\n\n"
         f"№{op['id']} · {ts} · {esc(who)}:\n{esc(op['summary'])}\n\n"
-        "Остатки и долги вернутся как до этой операции.",
+        "Остатки и долги вернутся как до этой операции." + warn,
         parse_mode="HTML",
         reply_markup=InlineKeyboardMarkup([[
             InlineKeyboardButton("↩️ Да, отменить операцию", callback_data=f"ok:{token}"),
