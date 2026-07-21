@@ -805,6 +805,33 @@ def cash_on_hand(user_id: int) -> float:
     return received - handed
 
 
+def cash_movements(user_id: int, limit: int = 10):
+    """Последние движения кассы сотрудника: [(операция, сумма со знаком)].
+
+    Плюс — принял деньги (оплата, приход по накладной), минус — сдал выручку."""
+    rows = connect().execute(
+        "SELECT * FROM operations WHERE user_id=? AND status='done' "
+        "AND type IN ('payment', 'invoice', 'handover') ORDER BY id DESC LIMIT ?",
+        (user_id, limit * 3)).fetchall()
+    out = []
+    for op in rows:
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        if op["type"] == "payment":
+            amt = data.get("amount") or 0
+        elif op["type"] == "invoice":
+            amt = data.get("payment") or 0
+        else:  # handover
+            amt = -(data.get("amount") or 0)
+        if amt:
+            out.append((op, amt))
+        if len(out) >= limit:
+            break
+    return out
+
+
 def client_operations(cid: int):
     """Все проведённые операции клиента по порядку."""
     return connect().execute(

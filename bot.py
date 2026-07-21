@@ -1118,23 +1118,62 @@ async def start_handover(update, context, actor, data):
         f"Касса уменьшится, когда он подтвердит приём денег.", parse_mode="HTML")
 
 
+def _cash_all_text() -> str:
+    lines = ["💰 <b>Наличные на руках у сотрудников:</b>"]
+    total = 0.0
+    for u in db.list_users():
+        cash = db.cash_on_hand(u["id"])
+        if not cash:
+            continue
+        mark = " 👑" if u["role"] == "admin" else ""
+        lines.append(f"👤 {esc(u['name'])}{mark}: <b>{money(cash)}</b>")
+        total += cash
+    if len(lines) == 1:
+        return "💰 Кассы пусты — вся выручка сдана."
+    lines.append("")
+    lines.append(f"💰 Всего в кассах: <b>{money(total)}</b>")
+    return "\n".join(lines)
+
+
+def _cash_employee_text(u) -> str:
+    cash = db.cash_on_hand(u["id"])
+    lines = [f"💰 Касса — <b>{esc(u['name'])}</b>: <b>{money(cash)}</b>", ""]
+    moves = db.cash_movements(u["id"], 10)
+    if moves:
+        lines.append("Последние движения:")
+        for op, amt in moves:
+            try:
+                d = datetime.fromisoformat(op["ts"]).strftime("%d.%m %H:%M")
+            except ValueError:
+                d = op["ts"]
+            sign = "+" if amt > 0 else "−"
+            lines.append(f"• {d} · <b>{sign}{fmt_num(abs(amt))}</b> · {esc(op['summary'])}")
+    else:
+        lines.append("Движений по кассе ещё не было.")
+    return "\n".join(lines)
+
+
 async def cash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
     if is_admin(actor):
-        lines = ["💰 <b>Наличные на руках у сотрудников:</b>"]
-        total = 0.0
-        for u in db.list_users():
-            cash = db.cash_on_hand(u["id"])
-            if not cash and u["id"] != actor["id"]:
-                continue
-            mark = " 👑" if u["role"] == "admin" else ""
-            lines.append(f"👤 {esc(u['name'])}{mark}: <b>{money(cash)}</b>")
-            total += cash
-        lines.append("")
-        lines.append(f"💰 Всего в кассах: <b>{money(total)}</b>")
-        await send_long(update.message, "\n".join(lines))
+        # Кнопки: каждый сотрудник по отдельности + все сразу
+        # (просьба владельца 21.07.2026).
+        employees = [u for u in db.list_users() if u["role"] != "admin"]
+        if not employees:
+            await send_long(update.message, _cash_all_text())
+            return
+        payload = {"kind": "pick_cash", "user_id": actor["id"],
+                   "chat_id": update.effective_chat.id}
+        token = new_pending(payload)
+        kb = [[InlineKeyboardButton(f"👤 {u['name']}",
+                                    callback_data=f"pc:{token}:{u['id']}")]
+              for u in employees]
+        kb.append([InlineKeyboardButton("👥 Все сразу", callback_data=f"pc:{token}:all")])
+        kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+        await update.message.reply_text("Чью кассу показать?",
+                                        reply_markup=InlineKeyboardMarkup(kb))
         return
     cash = db.cash_on_hand(actor["id"])
     await update.message.reply_text(
@@ -2243,6 +2282,23 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                effective_user=q.from_user)
         await _stock_report(shim, context, owner_row, whs,
                             p.get("with_prices", False))
+        return
+
+    if kind == "pc":  # выбор кассы: сотрудник или все сразу
+        PENDING.pop(token, None)
+        await q.answer()
+        if len(parts) > 2 and parts[2] == "all":
+            text = _cash_all_text()
+        else:
+            try:
+                u = db.get_user(int(parts[2]))
+            except (ValueError, IndexError):
+                u = None
+            if u is None:
+                await q.edit_message_text("Сотрудник не найден.")
+                return
+            text = _cash_employee_text(u)
+        await q.edit_message_text(text, parse_mode="HTML")
         return
 
     if kind == "pk":  # выбран существующий клиент
