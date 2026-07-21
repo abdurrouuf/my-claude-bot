@@ -8,6 +8,7 @@ import re
 import secrets
 import time
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 
 from anthropic import AsyncAnthropic
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Update
@@ -2037,6 +2038,34 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.edit_message_text("❌ Отменено. Ничего не изменено.")
         return
 
+    if kind == "pw":  # выбран склад для операции, где склад не был указан
+        PENDING.pop(token, None)
+        await q.answer()
+        try:
+            wh = db.warehouse_by_id(int(parts[2]))
+        except (ValueError, IndexError):
+            wh = None
+        owner_row = db.get_user(p["user_id"])
+        if wh is None or owner_row is None or \
+                not db.can_use_warehouse(owner_row, wh["id"]):
+            await q.edit_message_text("Склад не найден или нет доступа.")
+            return
+        data = p["action_data"]
+        data["warehouse"] = wh["name"]
+        try:
+            await q.edit_message_text(f"📦 Склад: «{esc(wh['name'])}»",
+                                      parse_mode="HTML")
+        except Exception:
+            pass
+        # Продолжаем операцию от имени сотрудника, отправившего сообщение;
+        # шим вместо Update — у callback нет своего update.message.
+        shim = SimpleNamespace(message=q.message,
+                               effective_chat=q.message.chat,
+                               effective_user=q.from_user)
+        await dispatch_data(shim, context, owner_row, data,
+                            draft=p.get("draft", False))
+        return
+
     if kind == "pk":  # выбран существующий клиент
         p["client_id"] = int(parts[2])
         await q.answer()
@@ -2355,11 +2384,40 @@ async def process_text(update, context, actor, text, draft=False):
     await dispatch_action(update, context, actor, reply, draft)
 
 
+# Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
+WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory",
+                     "amend_invoice", "set_min", "set_phone", "set_price"}
+
+
 async def dispatch_action(update, context, actor, reply, draft=False):
     data = extract_action(reply)
     if data is None:
         await update.message.reply_text(reply)
         return
+    # Сотрудник с доступом к нескольким складам не указал склад — уточняем
+    # кнопками, чтобы операция случайно не ушла на «родной» склад
+    # (просьба владельца 21.07.2026). Админа не трогаем: у него все склады,
+    # и он работает со своего Бишкека.
+    if (data.get("action") in WAREHOUSE_ACTIONS and not is_admin(actor)
+            and not str(data.get("warehouse") or "").strip()):
+        whs = db.visible_warehouses(actor)
+        if len(whs) > 1:
+            payload = {"kind": "pick_wh", "user_id": actor["id"],
+                       "chat_id": update.effective_chat.id,
+                       "action_data": data, "draft": draft}
+            token = new_pending(payload)
+            kb = [[InlineKeyboardButton(f"📦 {w['name']}",
+                                        callback_data=f"pw:{token}:{w['id']}")]
+                  for w in whs]
+            kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+            await update.message.reply_text(
+                "У вас доступ к нескольким складам — уточните, на каком провести:",
+                reply_markup=InlineKeyboardMarkup(kb))
+            return
+    await dispatch_data(update, context, actor, data, reply, draft)
+
+
+async def dispatch_data(update, context, actor, data, reply="", draft=False):
     action = data.get("action")
     try:
         if action == "invoice":
