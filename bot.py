@@ -4936,7 +4936,7 @@ async def loadkarakol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Позиций с остатком: <b>{len(items)}</b> (из {len(KARAKOL_STOCK)} в прайсе)\n"
         f"Всего: <b>{total} шт</b>\n"
         f"Сроки годности будут сохранены ({sum(1 for _, q, e in KARAKOL_STOCK if q and e)} позиций).\n\n"
-        "Данные — из проверенной вами таблицы от 19.07.2026 "
+        "Данные — из проверенной вами таблицы от 22.07.2026 "
         "(просрочка входит, Цефти DC 10 мл). Провести?",
         parse_mode="HTML", reply_markup=confirm_kb(token))
 
