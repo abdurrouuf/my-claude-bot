@@ -432,6 +432,8 @@ def _build_static_system() -> str:
                  '"client": "основное имя клиента", "warehouse": null, '
                  '"aliases": ["Имя1", "Имя2"]}')
     parts.append('- client — имя из справочника; aliases — дополнительные имена. '
+                 'Если в сообщении назван склад («склад Каракол», «на Караколе») — '
+                 'заполни warehouse; иначе null (бот сам найдёт клиента по складам). '
                  'Несколько клиентов за раз — несколько сообщений, обработай первого '
                  'и попроси прислать остальных отдельно.')
     parts.append("")
@@ -1697,27 +1699,47 @@ async def start_client_alias(update, context, actor, data):
     if not is_admin(actor):
         await update.message.reply_text("⛔ Псевдонимы клиентов настраивает только админ.")
         return
-    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
-    if err:
-        await update.message.reply_text(err, parse_mode="HTML")
-        return
     name = str(data.get("client") or "").strip()
     aliases = [str(a).strip() for a in (data.get("aliases") or []) if str(a).strip()]
     if not name or not aliases:
         await update.message.reply_text(
             "Пример: «Вика Уманец — она же Виктория, Виктория Уманец»")
         return
-    c = db.client_exact(wh["id"], name)
-    if c is None:
-        cand = db.fuzzy_clients(wh["id"], name)
-        if len(cand) == 1:
-            c = cand[0]
-        else:
-            await update.message.reply_text(
-                f"Клиент «{esc(name)}» не найден на складе «{esc(wh['name'])}»."
-                + (" Похожие: " + ", ".join(x["name"] for x in cand) if cand else ""),
-                parse_mode="HTML")
+    wh_name = str(data.get("warehouse") or "").strip()
+    if wh_name:
+        wh, err = resolve_warehouse(actor, wh_name)
+        if err:
+            await update.message.reply_text(err, parse_mode="HTML")
             return
+        search_whs = [wh]
+    else:
+        # Склад не указан — ищем клиента по всем доступным складам:
+        # у админа он обычно один и тот же человек только на одном складе.
+        search_whs = db.visible_warehouses(actor)
+    hits = []
+    for w in search_whs:
+        c_ = db.client_exact(w["id"], name)
+        if c_ is not None:
+            hits.append((w, c_))
+    if not hits and len(search_whs) == 1:
+        cand = db.fuzzy_clients(search_whs[0]["id"], name)
+        if len(cand) == 1:
+            hits = [(search_whs[0], cand[0])]
+    if not hits:
+        where = (f"на складе «{esc(search_whs[0]['name'])}»" if len(search_whs) == 1
+                 else "ни на одном складе")
+        await update.message.reply_text(
+            f"Клиент «{esc(name)}» не найден {where}. Проверьте имя: /debts",
+            parse_mode="HTML")
+        return
+    if len(hits) > 1:
+        await update.message.reply_text(
+            f"Клиент «{esc(name)}» есть на нескольких складах: "
+            + ", ".join(f"«{esc(w['name'])}»" for w, _ in hits)
+            + ". Укажите склад: «склад Каракол: Барахан — он же …»",
+            parse_mode="HTML")
+        return
+    wh, c = hits[0]
     aliases = [a for a in aliases if a.lower() != c["name"].lower()]
     clash = []
     for a in aliases:
