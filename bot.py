@@ -431,6 +431,10 @@ def _build_static_system() -> str:
     parts.append("- Если товар не найден — напиши текстом что не нашёл")
     parts.append("- Если что-то неясно — уточни у сотрудника текстом")
     parts.append("- Имя контрагента обязательно для накладной и прихода денег")
+    parts.append('- Если сообщение начинается с «проведи за <Имя>:» или «за <Имя>:», '
+                 'где <Имя> — имя СОТРУДНИКА (из списка сотрудников в динамическом '
+                 'блоке), добавь в JSON действия поле "as_employee": "<Имя>". '
+                 'В остальных случаях это поле не добавляй.')
     parts.append("")
     parts.append("ПРАЙС-ЛИСТ (формат: №. Название | Фасовка | шт/кор | цена):")
     parts.append(prices.PRICE_LIST_TEXT)
@@ -2522,6 +2526,19 @@ WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory",
 
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False):
     data = extract_action(reply)
+    if data is not None:
+        # «Проведи за Данияра: Валя приход 1490» — операция от имени сотрудника:
+        # запишется на него в журнал, деньги лягут в ЕГО кассу. Только админ.
+        as_emp = str(data.pop("as_employee", "") or "").strip()
+        if as_emp and is_admin(actor):
+            emp = db.user_by_ref(as_emp)
+            if emp is None or not emp["active"]:
+                await update.message.reply_text(
+                    f"Сотрудник «{esc(as_emp)}» не найден. Сотрудники: "
+                    + ", ".join(u["name"] for u in db.list_users()),
+                    parse_mode="HTML")
+                return
+            actor = emp
     if data is None:
         # Отвечаем и в чате склада: сюда доходят только сообщения, похожие
         # на операцию (бесплатный фильтр), и ответ модели — обычно уточняющий
@@ -3043,6 +3060,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += [
             "",
             "👑 <b>Админ:</b>",
+            "<i>проведи за Данияра: Валя приход 1490</i> — операция от имени "
+            "сотрудника (деньги в его кассу)",
             "/users — сотрудники и склады",
             "/warehouses — склады, сотрудники, ленты",
             "/add ID Имя — добавить сотрудника",
