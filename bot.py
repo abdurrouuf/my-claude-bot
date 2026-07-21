@@ -4414,57 +4414,64 @@ def _expiry_key_to_date(exp: str):
 
 
 async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Сроки годности по складу (по умолчанию — свой склад)."""
+    """Сроки годности: без аргумента — все доступные склады (как /stock)."""
     actor = await get_actor(update)
     if actor is None:
         return
     name = " ".join(context.args or [])
-    if name:
+    if name and name.lower() != "all":
         wh = db.warehouse_by_name(name)
-        if wh is None:
-            await update.message.reply_text(f"Склад «{esc(name)}» не найден.", parse_mode="HTML")
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(name)}» не найден или нет доступа.", parse_mode="HTML")
             return
+        whs = [wh]
     else:
-        wh = db.warehouse_of(actor["id"])
-        if wh is None:
+        whs = db.visible_warehouses(actor)
+        if not whs:
             await update.message.reply_text("У вас нет склада. Пример: /expiry Каракол")
             return
-    rows_db = [r for r in db.expiry_list(wh["id"]) if r["qty"] > 0]
-    if not rows_db:
-        await update.message.reply_text(
-            f"📅 По складу «{esc(wh['name'])}» сроков годности пока нет.",
-            parse_mode="HTML")
-        return
     now = datetime.now(BISHKEK)
     soon = now + timedelta(days=92)
-    rows, n_expired, n_soon = [], 0, 0
-    for r in rows_db:
-        p = prices.BY_ID.get(r["product_id"])
-        label = p["name"].split("(")[0].strip() if p else f"товар №{r['product_id']}"
-        volume = p["volume"] if p else ""
-        d = _expiry_key_to_date(r["expiry"])
-        if d and d <= now:
-            status = "ПРОСРОЧЕНО!"
-            n_expired += 1
-        elif d and d <= soon:
-            status = "истекает скоро"
-            n_soon += 1
-        else:
-            status = ""
-        rows.append([r["expiry"], label, volume, f"{r['qty']} шт", status])
+    sections, summary = [], []
+    for wh in whs:
+        rows_db = [r for r in db.expiry_list(wh["id"]) if r["qty"] > 0]
+        if not rows_db:
+            summary.append(f"📅 «{wh['name']}»: сроков годности пока нет")
+            continue
+        rows, n_expired, n_soon = [], 0, 0
+        for r in rows_db:
+            p = prices.BY_ID.get(r["product_id"])
+            label = p["name"].split("(")[0].strip() if p else f"товар №{r['product_id']}"
+            volume = p["volume"] if p else ""
+            d = _expiry_key_to_date(r["expiry"])
+            if d and d <= now:
+                status = "ПРОСРОЧЕНО!"
+                n_expired += 1
+            elif d and d <= soon:
+                status = "истекает скоро"
+                n_soon += 1
+            else:
+                status = ""
+            rows.append([r["expiry"], label, volume, f"{r['qty']} шт", status])
+        sections.append(
+            {"title": f"Склад «{wh['name']}»",
+             "headers": ["Срок", "Товар", "Фасовка", "Остаток", "Статус"],
+             "rows": rows, "widths": [18, 78, 24, 20, 27],
+             "footer": f"Позиций: {len(rows)} · просрочено: {n_expired} · "
+                       f"истекает в ближайшие 3 мес: {n_soon}"})
+        summary.append(f"📅 «{wh['name']}»: {len(rows)} поз."
+                       + (f" · ‼️ просрочено: {n_expired}" if n_expired else "")
+                       + (f" · ⚠️ скоро: {n_soon}" if n_soon else ""))
+    if not sections:
+        await update.message.reply_text("\n".join(summary))
+        return
     date_str = now.strftime("%d.%m.%Y")
     pdf = generate_report_pdf(
-        "СРОКИ ГОДНОСТИ", f"ОсОО «ВЕТОП» · склад «{wh['name']}» · на {date_str}",
-        [{"title": "", "headers": ["Срок", "Товар", "Фасовка", "Остаток", "Статус"],
-          "rows": rows, "widths": [18, 78, 24, 20, 27],
-          "footer": f"Позиций: {len(rows)} · просрочено: {n_expired} · "
-                    f"истекает в ближайшие 3 мес: {n_soon}"}])
-    caption = (f"📅 Сроки «{wh['name']}»: {len(rows)} поз."
-               + (f" · ‼️ просрочено: {n_expired}" if n_expired else "")
-               + (f" · ⚠️ скоро: {n_soon}" if n_soon else ""))
+        "СРОКИ ГОДНОСТИ", f"ОсОО «ВЕТОП» · на {date_str}", sections)
     await update.message.reply_document(
-        document=InputFile(pdf, filename=f"сроки_{safe_filename(wh['name'])}_{date_str.replace('.', '')}.pdf"),
-        caption=caption)
+        document=InputFile(pdf, filename=f"сроки_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary))
 
 
 async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
