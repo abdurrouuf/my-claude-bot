@@ -2286,6 +2286,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg += f" Пропущено (уже были): {len(skipped)}."
                 msg += "\nТеперь голосовые будут распознавать эти имена точнее."
                 await q.edit_message_text(msg, parse_mode="HTML")
+            elif p["kind"] == "undo_op":
+                ok, msg = db.cancel_operation(p["op_id"])
+                if not ok:
+                    await q.edit_message_text(f"⚠️ {esc(msg)}", parse_mode="HTML")
+                else:
+                    await q.edit_message_text(
+                        f"↩️ Операция №{p['op_id']} отменена: {esc(msg)}\n"
+                        f"Остатки и долги возвращены как было.", parse_mode="HTML")
+                    await notify_admin(context, actor,
+                                       f"отменил операцию №{p['op_id']}: {msg}")
+                    cancelled = db.get_operation(p["op_id"])
+                    if cancelled:
+                        await post_feed(
+                            context, db.operation_warehouses(cancelled),
+                            f"↩️ <b>{esc(actor['name'])}</b> отменил операцию "
+                            f"№{p['op_id']}: {esc(msg)}")
             elif p["kind"] == "change_price":
                 for it in p["items"]:
                     db.product_set_price(it["product_id"], it["price"], p["user_id"])
@@ -3923,19 +3939,30 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "⛔ Отменить операцию можно только в течение часа. "
                     "Обратитесь к администратору.")
                 return
-    ok, msg = db.cancel_operation(op["id"])
-    if not ok:
-        await update.message.reply_text(f"⚠️ {msg}")
+    if op["status"] != "done":
+        await update.message.reply_text(f"⚠️ Операция №{op['id']} уже отменена.")
         return
+    # Сначала показываем, ЧТО будет отменено, и просим подтвердить кнопкой —
+    # защита от случайного /undo (случай 21.07.2026: админ голым /undo
+    # откатил стартовую загрузку Каракола).
+    try:
+        ts = datetime.fromisoformat(op["ts"]).strftime("%d.%m %H:%M")
+    except ValueError:
+        ts = op["ts"]
+    u = db.get_user(op["user_id"])
+    who = u["name"] if u else str(op["user_id"])
+    payload = {"kind": "undo_op", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id, "op_id": op["id"]}
+    token = new_pending(payload)
     await update.message.reply_text(
-        f"↩️ Операция №{op['id']} отменена: {esc(msg)}\n"
-        f"Остатки и долги возвращены как было.", parse_mode="HTML")
-    await notify_admin(context, actor, f"отменил операцию №{op['id']}: {msg}")
-    cancelled = db.get_operation(op["id"])
-    if cancelled:
-        await post_feed(context, db.operation_warehouses(cancelled),
-                        f"↩️ <b>{esc(actor['name'])}</b> отменил операцию №{op['id']}: "
-                        f"{esc(msg)}")
+        "↩️ <b>Отмена операции — проверьте:</b>\n\n"
+        f"№{op['id']} · {ts} · {esc(who)}:\n{esc(op['summary'])}\n\n"
+        "Остатки и долги вернутся как до этой операции.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("↩️ Да, отменить операцию", callback_data=f"ok:{token}"),
+            InlineKeyboardButton("❌ Нет", callback_data=f"no:{token}"),
+        ]]))
 
 
 # ---------- Админ-команды ----------
