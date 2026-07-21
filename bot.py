@@ -185,10 +185,28 @@ async def send_long_bot(bot, chat_id, text: str):
         await bot.send_message(chat_id, chunk, parse_mode="HTML")
 
 
+def _pending_key(payload: dict):
+    """Смысловой отпечаток заявки (без служебных полей) для дедупликации."""
+    try:
+        return json.dumps({k: v for k, v in payload.items()
+                           if k not in ("created", "ttl")},
+                          sort_keys=True, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return None
+
+
 def new_pending(payload: dict, ttl: int = PENDING_TTL) -> str:
     now = time.monotonic()
     for k in [k for k, v in PENDING.items() if now - v["created"] > v.get("ttl", PENDING_TTL)]:
         PENDING.pop(k, None)
+    # Одинаковое сообщение, отправленное дважды (двойное касание, повтор
+    # голосового), создавало ДВЕ живые карточки — нажатие обеих задваивало
+    # операцию. Новая идентичная заявка гасит старую: её кнопка ответит
+    # «Заявка устарела».
+    key = _pending_key(payload)
+    if key is not None:
+        for k in [k for k, v in PENDING.items() if _pending_key(v) == key]:
+            PENDING.pop(k, None)
     token = secrets.token_hex(6)
     payload["created"] = now
     payload["ttl"] = ttl
@@ -1684,7 +1702,9 @@ async def start_promise_done(update, context, actor, data):
     if not client:
         await update.message.reply_text("Не понял имя клиента — скажите ещё раз.")
         return
-    n = db.promises_close(client)
+    # Сотрудник закрывает только СВОИ записи об обещаниях (чужие мог бы
+    # закрыть случайной фразой); админ — любые.
+    n = db.promises_close(client, None if is_admin(actor) else actor["id"])
     if n:
         await update.message.reply_text(
             f"✅ Отметил: {esc(client)} выполнил обещание. Молодец!", parse_mode="HTML")
@@ -1692,7 +1712,9 @@ async def start_promise_done(update, context, actor, data):
             await notify_admin(context, actor, f"{client} выполнил обещание оплаты")
     else:
         await update.message.reply_text(
-            f"У клиента «{esc(client)}» нет открытых обещаний. Список: /promises",
+            f"У клиента «{esc(client)}» нет открытых обещаний"
+            + ("" if is_admin(actor) else ", записанных вами")
+            + ". Список: /promises",
             parse_mode="HTML")
 
 
@@ -2462,9 +2484,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "💵",
                                      exclude_chat_id=p["chat_id"])
             elif p["kind"] == "transfer":
+                # Перепроверка остатка на кнопке: заявка могла ждать до суток,
+                # товар за это время могли продать (у накладных такая
+                # перепроверка уже есть; минус для перемещений допустим,
+                # но подтверждающий должен его увидеть).
+                warn = ""
+                if p.get("from_wh_id"):
+                    smap = db.stock_map(p["from_wh_id"])
+                    minus = [
+                        f"{it['name']} {it['volume']}: на складе "
+                        f"{smap.get(it['product_id'], 0)}, забираем {it['qty']}"
+                        for it in p["items"]
+                        if it.get("product_id")
+                        and smap.get(it["product_id"], 0) < it["qty"]]
+                    if minus:
+                        warn = ("\n\n⚠️ Остаток изменился со времени заявки — "
+                                "уйдёт в минус:\n• " + "\n• ".join(minus) +
+                                "\nЕсли это неверно — отмените: /undo")
                 op_id, summary = commit_transfer(p)
-                await q.edit_message_text(f"✅ {esc(summary)} — проведено (операция №{op_id}).",
-                                          parse_mode="HTML")
+                await q.edit_message_text(
+                    f"✅ {esc(summary)} — проведено (операция №{op_id})."
+                    + esc(warn),
+                    parse_mode="HTML")
                 note = ""
                 if p.get("approver_id"):
                     note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
@@ -2613,6 +2654,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Сроки годности сохранены — смотрите /expiry Каракол.\n"
                     "Проверьте: /stock (у Данияра) или /report Каракол.")
             elif p["kind"] == "reset_wh":
+                # Первая кнопка — не стираем, а показываем ВТОРОЕ подтверждение
+                # с отдельной кнопкой (защита от «одним нажатием», просьба
+                # владельца 22.07.2026).
+                token2 = new_pending({**{k: p[k] for k in
+                                         ("kind", "user_id", "chat_id",
+                                          "wh_id", "wh_name")},
+                                      "kind": "reset_wh2"})
+                kb2 = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🗑 Да, стереть безвозвратно",
+                                          callback_data=f"ok:{token2}")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token2}")],
+                ])
+                await q.edit_message_text(
+                    f"⚠️ <b>Последняя проверка</b>\n\n"
+                    f"Склад «{esc(p['wh_name'])}» будет стёрт БЕЗВОЗВРАТНО "
+                    "(операции, остатки, клиенты с долгами, сроки).\n"
+                    "Перед стиранием пришлю вам свежую копию базы — по ней "
+                    "всё можно восстановить.",
+                    parse_mode="HTML", reply_markup=kb2)
+            elif p["kind"] == "reset_wh2":
+                # Автобэкап перед необратимым удалением: если копия не
+                # отправилась — сброс не выполняем.
+                try:
+                    await send_backup(context.bot)
+                except Exception as e:
+                    log.exception("Бэкап перед сбросом склада не удался")
+                    await q.edit_message_text(
+                        f"⛔ Сброс НЕ выполнен: не удалось снять резервную "
+                        f"копию базы ({esc(str(e))}). Попробуйте ещё раз: "
+                        f"/resetwh {esc(p['wh_name'])}", parse_mode="HTML")
+                    return
                 stats = db.reset_warehouse(p["wh_id"])
                 _KNOWN_CLIENTS_CACHE["ts"] = 0.0  # имена стёртых клиентов — вон из подсказок
                 await q.edit_message_text(

@@ -400,13 +400,20 @@ def promises_due(today: str):
         (today,)).fetchall()
 
 
-def promises_close(client: str):
-    """Закрывает все открытые обещания клиента. Возвращает, сколько закрыто."""
+def promises_close(client: str, user_id=None):
+    """Закрывает открытые обещания клиента. user_id — только записанные этим
+    сотрудником (None — все, для админа). Возвращает, сколько закрыто."""
     conn = connect()
     with _lock, conn:
-        cur = conn.execute(
-            "UPDATE promises SET status='done' "
-            "WHERE status='open' AND client = ? COLLATE NOCASEU", (client,))
+        if user_id is None:
+            cur = conn.execute(
+                "UPDATE promises SET status='done' "
+                "WHERE status='open' AND client = ? COLLATE NOCASEU", (client,))
+        else:
+            cur = conn.execute(
+                "UPDATE promises SET status='done' "
+                "WHERE status='open' AND client = ? COLLATE NOCASEU "
+                "AND user_id = ?", (client, user_id))
         return cur.rowcount
 
 
