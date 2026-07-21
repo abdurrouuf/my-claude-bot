@@ -468,9 +468,15 @@ def build_dynamic_system(actor) -> str:
 
 
 def system_blocks(actor) -> list:
-    """Системный промпт с кэшированием статичной части (~90% скидка на чтениях)."""
+    """Системный промпт с кэшированием статичной части (~90% скидка на чтениях).
+
+    TTL 1 час (а не 5 минут по умолчанию): сообщения приходят с перерывами
+    больше 5 минут, и короткий кэш почти всегда протухал — каждый запрос
+    платил за запись. Часовой кэш пишется один раз (2x вместо 1.25x), дальше
+    чтения по 0.1x, и каждое обращение продлевает его ещё на час."""
     return [
-        {"type": "text", "text": STATIC_SYSTEM, "cache_control": {"type": "ephemeral"}},
+        {"type": "text", "text": STATIC_SYSTEM,
+         "cache_control": {"type": "ephemeral", "ttl": "1h"}},
         {"type": "text", "text": build_dynamic_system(actor)},
     ]
 
@@ -491,7 +497,7 @@ def extract_action(reply: str):
 
 
 # Цены Anthropic, $ за миллион токенов: (вход, выход).
-# Кэш: чтение = 10% от входа, запись = 125% от входа.
+# Кэш: чтение = 10% от входа, запись часового кэша = 200% от входа.
 MODEL_PRICES_USD = {
     "claude-sonnet-5": (2.0, 10.0),    # акция до 31.08.2026, потом (3.0, 15.0)
     "claude-sonnet-4-5": (3.0, 15.0),
@@ -505,7 +511,7 @@ def _request_cost_usd(model: str, input_tokens: int, output_tokens: int,
                       cache_read: int, cache_write: int) -> float:
     p_in, p_out = MODEL_PRICES_USD.get(model, (3.0, 15.0))
     return (input_tokens * p_in + output_tokens * p_out
-            + cache_read * p_in * 0.1 + cache_write * p_in * 1.25) / 1_000_000
+            + cache_read * p_in * 0.1 + cache_write * p_in * 2.0) / 1_000_000
 
 
 def track_usage(resp):
