@@ -1,5 +1,6 @@
 # Телеграм-бот ВЕТОП: накладные, склады по регионам, долги клиентов.
 import asyncio
+import difflib
 import html
 import json
 import logging
@@ -2871,7 +2872,7 @@ def _build_stt_prompt() -> str:
         if word not in seen:
             seen.add(word)
             names.append(word)
-    head = "Накладная ветаптеки ВЕТОП: "
+    head = "Джарвис! Накладная ветаптеки ВЕТОП: "
     tail = "; черновик, коробка, штук, долг, приход, сом."
     body = ""
     for n in names:
@@ -2990,8 +2991,9 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if actor is None:
             return
     if quiet and not STT_API_KEY:
-        # В чате склада слушаем голосовые только через бесплатный Groq —
-        # квоту платного ElevenLabs на разговоры в группах не тратим.
+        # В чате склада обращение «Джарвис» ищем бесплатным Groq — без него
+        # голосовые в группах не слушаем вовсе (платный ElevenLabs не должен
+        # расшифровывать каждый разговор ради поиска обращения).
         return
     if not STT_API_KEY and not ELEVENLABS_API_KEY:
         if is_admin(actor):
@@ -3035,8 +3037,7 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         mime = audio.mime_type or "audio/mpeg"
     try:
         if quiet:
-            # Чат склада: всегда бесплатный Groq/Whisper (русский).
-            # ElevenLabs (кыргызский) — только в личке, чтобы беречь квоту.
+            # Чат склада: обращение ищем бесплатным Groq/Whisper (русский).
             text = await _transcribe_whisper(raw, filename, mime)
         else:
             text = await transcribe_audio(raw, filename, mime)
@@ -3051,13 +3052,32 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "⚠️ Не разобрал речь — попробуйте ещё раз или напишите текстом.")
         return
     if quiet:
-        # В чате склада: распознали бесплатно (Groq), но в ИИ шлём только
-        # похожее на операцию — разговоры расход не создают.
-        if not _looks_like_operation(text):
+        # В чате склада бот слушает только голосовые, начинающиеся с
+        # обращения «Джарвис» — остальные разговоры игнорирует молча.
+        rest = _strip_wake_word(text)
+        if rest is None:
             return
+        if ELEVENLABS_API_KEY:
+            # К боту обратились явно — можно потратить платный ElevenLabs,
+            # чтобы правильно разобрать кыргызскую или смешанную речь.
+            try:
+                text2 = await _transcribe_elevenlabs(raw, filename, mime)
+                if text2:
+                    rest2 = _strip_wake_word(text2)
+                    rest = rest2 if rest2 is not None else text2
+            except Exception:
+                log.exception("ElevenLabs в чате склада не сработал — "
+                              "остаёмся на распознавании Whisper")
+        text = rest
+        if not text:
+            await update.message.reply_text(
+                "🎤 Слушаю! После «Джарвис» продиктуйте операцию, например: "
+                "«Джарвис, Асель приход 5000».")
+            return
+        await update.message.reply_text(f"🎤 Распознал: «{text}»")
     else:
-        # Эхо «Распознал» — только в личке; в чате склада бот отзовётся
-        # сразу заявкой, если услышал операцию.
+        # Эхо «Распознал» — в личке всегда; в чате склада — выше, только
+        # после обращения «Джарвис».
         await update.message.reply_text(f"🎤 Распознал: «{text}»")
     draft = False
     m = DRAFT_RE.match(text)
@@ -3086,6 +3106,31 @@ def _feed_chat_actor(update):
     if row is None or not row["active"]:
         return None
     return row
+
+
+# Обращение «Джарвис» в начале сообщения в чате склада: голосовые без него
+# игнорируются, с ним — обрабатываются как явная команда боту (просьба
+# владельца 21.07.2026). Распознавание может исказить имя, поэтому кроме
+# точных вариантов допускаем нечёткое совпадение первого слова.
+_WAKE_WORDS = ("джарвис", "жарвис", "jarvis")
+_WAKE_RE = re.compile(
+    r"^\W*(джарвис|жарвис|джервис|жервис|джарбис|jarvis|jarvis'?s)\b[\s,.!:—–-]*",
+    re.IGNORECASE)
+_FIRST_WORD_RE = re.compile(r"^\W*([а-яёa-z]+)[\s,.!:—–-]*", re.IGNORECASE)
+
+
+def _strip_wake_word(text: str):
+    """«Джарвис, Асель приход 5000» -> «Асель приход 5000»; None — обращения нет."""
+    m = _WAKE_RE.match(text)
+    if m is None:
+        m = _FIRST_WORD_RE.match(text)
+        if m is None:
+            return None
+        w = m.group(1).lower()
+        if max(difflib.SequenceMatcher(None, w, wk).ratio()
+               for wk in _WAKE_WORDS) < 0.7:
+            return None
+    return text[m.end():].strip()
 
 
 # Слова-приметы операций: если ни одной приметы нет, сообщение в чате склада
@@ -3125,7 +3170,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         actor = _feed_chat_actor(update)
         if actor is None:
             return
-        if not _looks_like_operation(update.message.text):
+        # «Джарвис, …» — явное обращение, обрабатываем без фильтра примет.
+        rest = _strip_wake_word(update.message.text)
+        if rest is None and not _looks_like_operation(update.message.text):
             return
         quiet = True
     else:
@@ -3133,6 +3180,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if actor is None:
             return
     text = update.message.text.strip()
+    if quiet and rest is not None:
+        text = rest
+        if not text:
+            await update.message.reply_text(
+                "Слушаю! После «Джарвис» напишите операцию, например: "
+                "«Джарвис, Асель приход 5000».")
+            return
     draft = False
     m = DRAFT_RE.match(text)
     if m:
