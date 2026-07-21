@@ -4290,6 +4290,10 @@ async def weekly_debt_loop(app):
             log.exception("Ошибка напоминания о долгах")
 
 
+LOG_TYPE_ICONS = {"invoice": "🧾", "payment": "💵", "transfer": "📦",
+                  "inventory": "📋", "return": "🔙", "handover": "💰"}
+
+
 async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
@@ -4302,16 +4306,29 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ops:
         await update.message.reply_text("Журнал пуст.")
         return
-    lines = ["🗒 <b>Последние операции:</b>"]
+    lines = ["🗒 <b>Последние операции</b> (новые сверху)"]
+    last_day = None
     for op in ops:
         try:
-            ts = datetime.fromisoformat(op["ts"]).strftime("%d.%m %H:%M")
+            dt = datetime.fromisoformat(op["ts"])
+            day, tm = dt.strftime("%d.%m.%Y"), dt.strftime("%H:%M")
         except ValueError:
-            ts = op["ts"]
+            day, tm = "", op["ts"]
+        if day != last_day:
+            lines.append(f"\n📅 <b>{day}</b>")
+            last_day = day
         u = db.get_user(op["user_id"])
         who = u["name"] if u else str(op["user_id"])
-        cancelled = " ❌ <i>отменена</i>" if op["status"] == "cancelled" else ""
-        lines.append(f"№{op['id']} · {ts} · {esc(who)}: {esc(op['summary'])}{cancelled}")
+        icon = LOG_TYPE_ICONS.get(op["type"], "▫️")
+        summary = esc(op["summary"])
+        if op["status"] == "cancelled":
+            lines.append(f"❌ <b>№{op['id']}</b> · {tm} · {esc(who)} — <i>отменена</i>")
+            lines.append(f"<s>{summary}</s>")
+        else:
+            lines.append(f"{icon} <b>№{op['id']}</b> · {tm} · {esc(who)}")
+            lines.append(summary)
+        lines.append("")
+    lines.append("Отменить: /undo Номер (только админ) · Больше: /log 30")
     await send_long(update.message, "\n".join(lines))
 
 
