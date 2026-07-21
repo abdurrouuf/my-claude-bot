@@ -1135,21 +1135,33 @@ def _cash_all_text() -> str:
     return "\n".join(lines)
 
 
+_AMOUNT_IN_SUMMARY_RE = re.compile(r"\s*(?:[—–-]|\+)?\s*[\d'’]+\s*сом")
+
+
 def _cash_employee_text(u) -> str:
+    """Касса сотрудника: движения хронологически (последнее — внизу), итог в конце."""
     cash = db.cash_on_hand(u["id"])
-    lines = [f"💰 Касса — <b>{esc(u['name'])}</b>: <b>{money(cash)}</b>", ""]
     moves = db.cash_movements(u["id"], 10)
+    lines = [f"💰 <b>Касса — {esc(u['name'])}</b>"]
     if moves:
-        lines.append("Последние движения:")
-        for op, amt in moves:
+        lines.append("")
+        lines.append("Движения (последнее — внизу):")
+        for op, amt in reversed(moves):
             try:
                 d = datetime.fromisoformat(op["ts"]).strftime("%d.%m %H:%M")
             except ValueError:
                 d = op["ts"]
             sign = "+" if amt > 0 else "−"
-            lines.append(f"• {d} · <b>{sign}{fmt_num(abs(amt))}</b> · {esc(op['summary'])}")
+            # Сумму из описания убираем — она уже показана крупно в строке выше
+            what = _AMOUNT_IN_SUMMARY_RE.sub("", op["summary"], count=1).strip()
+            lines.append("")
+            lines.append(f"<b>{sign}{fmt_num(abs(amt))}</b> · {d}")
+            lines.append(esc(what))
     else:
+        lines.append("")
         lines.append("Движений по кассе ещё не было.")
+    lines.append("")
+    lines.append(f"💰 Итого сейчас на руках: <b>{money(cash)}</b>")
     return "\n".join(lines)
 
 
