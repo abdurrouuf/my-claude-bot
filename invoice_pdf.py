@@ -114,7 +114,8 @@ def generate_report_pdf(title: str, subtitle: str, sections: list,
     """Универсальный фирменный PDF-отчёт (остатки, долги, сроки и т.п.).
 
     sections: [{"title": str, "headers": [str], "rows": [[str]],
-                "footer": str (опц.), "widths": [мм] (опц.)}]
+                "footer": str (опц.), "widths": [мм] (опц.),
+                "numbered": bool (опц.) — добавить колонку «№» с 1..N}]
     """
     from reportlab.lib.pagesizes import A4
 
@@ -147,10 +148,16 @@ def generate_report_pdf(title: str, subtitle: str, sections: list,
         if sec.get("title"):
             story.append(Paragraph(xml_escape(sec["title"]), sec_style))
         headers = sec["headers"]
-        data = [[Paragraph(xml_escape(h), head_style) for h in headers]]
-        for row in sec["rows"]:
-            data.append([Paragraph(xml_escape(str(c)), cell_style) for c in row])
+        rows = sec["rows"]
         widths = sec.get("widths")
+        if sec.get("numbered"):
+            headers = ["№"] + list(headers)
+            rows = [[str(i)] + list(r) for i, r in enumerate(rows, 1)]
+            if widths:
+                widths = [10] + list(widths)
+        data = [[Paragraph(xml_escape(h), head_style) for h in headers]]
+        for row in rows:
+            data.append([Paragraph(xml_escape(str(c)), cell_style) for c in row])
         col_widths = [w * mm for w in widths] if widths else None
         table = Table(data, colWidths=col_widths, repeatRows=1)
         table.setStyle(TableStyle([

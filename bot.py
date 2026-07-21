@@ -3527,7 +3527,7 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sections.append({
             "title": f"Склад «{wh['name']}»",
             "headers": ["Клиент", "Долг", "Телефон"],
-            "rows": rows, "widths": [85, 45, 37],
+            "rows": rows, "widths": [85, 45, 37], "numbered": True,
             "footer": f"Итого долгов: {money(total)} · должников: "
                       f"{sum(1 for c in clients if c['debt'] > 0)}",
         })
@@ -4247,6 +4247,7 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sections.append({"title": f"Склад «{wh['name']}»",
                          "headers": ["Клиент", "Долг", "Без оплат", "Телефон"],
                          "rows": sec_rows, "widths": [70, 38, 34, 25],
+                         "numbered": True,
                          "footer": f"Итого: {money(sec_total)}"})
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
     pdf = generate_report_pdf(
@@ -5055,7 +5056,7 @@ async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sections.append(
             {"title": f"Склад «{wh['name']}»",
              "headers": ["Срок", "Товар", "Фасовка", "Остаток", "Статус"],
-             "rows": rows, "widths": [18, 78, 24, 20, 27],
+             "rows": rows, "widths": [18, 78, 24, 20, 27], "numbered": True,
              "footer": f"Позиций: {len(rows)} · просрочено: {n_expired} · "
                        f"истекает в ближайшие 3 мес: {n_soon}"})
         summary.append(f"📅 «{wh['name']}»: {len(rows)} поз."
