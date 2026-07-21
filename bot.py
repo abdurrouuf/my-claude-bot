@@ -2769,9 +2769,14 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "⚠️ Не разобрал речь — попробуйте ещё раз или напишите текстом.")
         return
-    if not quiet:
-        # В чате склада эхо «Распознал» не шлём — бот отзовётся только
-        # заявкой, если услышал операцию.
+    if quiet:
+        # В чате склада: распознали бесплатно (Groq), но в ИИ шлём только
+        # похожее на операцию — разговоры расход не создают.
+        if not _looks_like_operation(text):
+            return
+    else:
+        # Эхо «Распознал» — только в личке; в чате склада бот отзовётся
+        # сразу заявкой, если услышал операцию.
         await update.message.reply_text(f"🎤 Распознал: «{text}»")
     draft = False
     m = DRAFT_RE.match(text)
@@ -2802,6 +2807,32 @@ def _feed_chat_actor(update):
     return row
 
 
+# Слова-приметы операций: если ни одной приметы нет, сообщение в чате склада
+# в ИИ не отправляется (экономия API — болтовня до Claude не доходит).
+OP_KEYWORDS = ("приход", "оплат", "заплат", "наклад", "черновик", "возврат",
+               "перемещ", "инвентариз", "сдал", "сдаю", "обещал", "обеща",
+               "минимал", "минимум", "телефон", "спеццен", "добавь", "долг")
+
+
+def _looks_like_operation(text: str) -> bool:
+    """Бесплатная проверка «похоже на операцию» для чатов складов."""
+    t = text.lower()
+    if any(k in t for k in OP_KEYWORDS):
+        return True
+    # Товар из прайса или известный клиент + числа — похоже на накладную/оплату
+    if not any(ch.isdigit() for ch in t):
+        return False
+    for p in prices.PRICE_LIST_DATA:
+        if p["name"].split()[0].split("-")[0].lower() in t:
+            return True
+    words = set(re.findall(r"[а-яёa-z]+", t))
+    for name in db.known_client_names(300):
+        w = name.split()[0].lower()
+        if len(w) >= 3 and w in words:
+            return True
+    return False
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or not update.message.text:
         return
@@ -2812,6 +2843,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # 21.07.2026: «Асан приход 5000» можно писать прямо в чат склада).
         actor = _feed_chat_actor(update)
         if actor is None:
+            return
+        if not _looks_like_operation(update.message.text):
             return
         quiet = True
     else:
