@@ -1018,7 +1018,8 @@ def _clean_phone(raw: str):
 
 
 async def start_set_phone(update, context, actor, data):
-    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    wh_name = str(data.get("warehouse") or "").strip()
+    wh, err = resolve_warehouse(actor, wh_name)
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
@@ -1029,6 +1030,24 @@ async def start_set_phone(update, context, actor, data):
             "Не понял клиента или номер. Пример: «телефон Асана: 0700 12 34 56»")
         return
     exact = db.client_exact(wh["id"], client_name)
+    if exact is None and not wh_name:
+        # Склад не указан, и на складе по умолчанию клиента нет — ищем точное
+        # имя по всем доступным складам (как у псевдонимов: «телефон Туратбека»
+        # из лички админа должен найти клиента Каракола).
+        hits = []
+        for w in db.visible_warehouses(actor):
+            c_ = db.client_exact(w["id"], client_name)
+            if c_ is not None:
+                hits.append((w, c_))
+        if len(hits) > 1:
+            await update.message.reply_text(
+                f"Клиент «{esc(client_name)}» есть на нескольких складах: "
+                + ", ".join(f"«{esc(w['name'])}»" for w, _ in hits)
+                + ". Укажите склад: «Каракол: телефон Асана 0700 12 34 56»",
+                parse_mode="HTML")
+            return
+        if hits:
+            wh, exact = hits[0]
     if exact:
         db.client_set_phone(exact["id"], phone)
         await update.message.reply_text(
