@@ -4091,7 +4091,8 @@ async def access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Склад не найден. Склады: " + ", ".join(f"«{esc(w['name'])}»" for w in db.all_warehouses()),
             parse_mode="HTML")
         return
-    if wh["owner_id"] == u["id"]:
+    own = db.warehouse_of(u["id"])
+    if own and own["id"] == wh["id"]:
         await update.message.reply_text("Это его собственный склад — доступ уже есть.")
         return
     db.grant_access(u["id"], wh["id"])
