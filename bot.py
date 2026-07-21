@@ -426,6 +426,15 @@ def _build_static_system() -> str:
     parts.append('- "Дексатоп 50мл 10 шт" → qty: 10, box_qty: null (просто штуки, без пересчёта)')
     parts.append('Другие обозначения коробок: "к", "кор", "коробка", "коробок", "box"')
     parts.append("")
+    parts.append("=== РЕЖИМ: ПСЕВДОНИМЫ КЛИЕНТОВ (только админ) ===")
+    parts.append('«Вика Уманец — она же Виктория» / «запомни: Валя это Валентина и Валя '
+                 'Липатова» → верни ТОЛЬКО JSON: {"action": "client_alias", '
+                 '"client": "основное имя клиента", "warehouse": null, '
+                 '"aliases": ["Имя1", "Имя2"]}')
+    parts.append('- client — имя из справочника; aliases — дополнительные имена. '
+                 'Несколько клиентов за раз — несколько сообщений, обработай первого '
+                 'и попроси прислать остальных отдельно.')
+    parts.append("")
     parts.append("=== ДРУГИЕ ПРАВИЛА ===")
     parts.append("- Цены бери СТРОГО из прайса")
     parts.append("- Если товар не найден — напиши текстом что не нашёл")
@@ -1683,6 +1692,57 @@ async def promise_reminder_loop(app):
             log.exception("Ошибка напоминания об обещаниях")
 
 
+async def start_client_alias(update, context, actor, data):
+    """«Вика Уманец — она же Виктория»: дополнительные имена клиента (админ)."""
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Псевдонимы клиентов настраивает только админ.")
+        return
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    name = str(data.get("client") or "").strip()
+    aliases = [str(a).strip() for a in (data.get("aliases") or []) if str(a).strip()]
+    if not name or not aliases:
+        await update.message.reply_text(
+            "Пример: «Вика Уманец — она же Виктория, Виктория Уманец»")
+        return
+    c = db.client_exact(wh["id"], name)
+    if c is None:
+        cand = db.fuzzy_clients(wh["id"], name)
+        if len(cand) == 1:
+            c = cand[0]
+        else:
+            await update.message.reply_text(
+                f"Клиент «{esc(name)}» не найден на складе «{esc(wh['name'])}»."
+                + (" Похожие: " + ", ".join(x["name"] for x in cand) if cand else ""),
+                parse_mode="HTML")
+            return
+    aliases = [a for a in aliases if a.lower() != c["name"].lower()]
+    clash = []
+    for a in aliases:
+        other = db.client_exact(wh["id"], a)
+        if other is not None and other["id"] != c["id"]:
+            clash.append(f"«{a}» — уже клиент «{other['name']}»")
+    if clash:
+        await update.message.reply_text(
+            "⚠️ Эти имена уже заняты, псевдонимы не сохранены:\n"
+            + "\n".join(clash) + "\nУберите занятые имена и отправьте снова.")
+        return
+    if not aliases:
+        await update.message.reply_text("Новых имён не осталось — нечего сохранять.")
+        return
+    payload = {"kind": "client_alias", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id, "client_id": c["id"],
+               "client_name": c["name"], "aliases": aliases, "wh_name": wh["name"]}
+    token = new_pending(payload)
+    await update.message.reply_text(
+        f"🏷 Клиент «{esc(c['name'])}» (склад «{esc(wh['name'])}») получит "
+        f"дополнительные имена: {esc(', '.join(aliases))}.\n"
+        "Бот будет понимать эти имена в оплатах, накладных и голосовых. Сохранить?",
+        parse_mode="HTML", reply_markup=confirm_kb(token))
+
+
 def change_price_summary(p) -> str:
     lines = [f"🏷 <b>Изменение прайса</b> ({len(p['items'])} поз.)", ""]
     for i, it in enumerate(p["items"], 1):
@@ -2447,6 +2507,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg += f" Пропущено (уже были): {len(skipped)}."
                 msg += "\nТеперь голосовые будут распознавать эти имена точнее."
                 await q.edit_message_text(msg, parse_mode="HTML")
+            elif p["kind"] == "client_alias":
+                for a in p["aliases"]:
+                    db.add_client_alias(p["client_id"], a)
+                _KNOWN_CLIENTS_CACHE["ts"] = 0.0  # чтобы имена сразу попали в подсказки
+                await q.edit_message_text(
+                    f"✅ Запомнил: {esc(', '.join(p['aliases']))} — это "
+                    f"«{esc(p['client_name'])}» (склад «{esc(p['wh_name'])}»).",
+                    parse_mode="HTML")
             elif p["kind"] == "undo_op":
                 ok, msg = db.cancel_operation(p["op_id"])
                 if not ok:
@@ -2521,7 +2589,8 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
 WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory",
-                     "amend_invoice", "set_min", "set_phone", "set_price"}
+                     "amend_invoice", "set_min", "set_phone", "set_price",
+                     "client_alias"}
 
 
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False):
@@ -2596,6 +2665,8 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             await start_change_price(update, context, actor, data)
         elif action == "add_clients":
             await start_add_clients(update, context, actor, data)
+        elif action == "client_alias":
+            await start_client_alias(update, context, actor, data)
         elif action == "amend_invoice":
             await start_amend_invoice(update, context, actor, data)
         elif action == "promise":
@@ -3632,6 +3703,9 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rows, start_debt = client_statement(c["id"])
     now = datetime.now(BISHKEK)
     lines = [f"👤 <b>{esc(c['name'])}</b> · склад «{esc(wh['name'])}»"]
+    aliases = db.client_aliases_list(c["id"])
+    if aliases:
+        lines.append(f"🏷 Также известен как: {esc(', '.join(aliases))}")
     if c["phone"]:
         lines.append(f"📞 {esc(c['phone'])}")
     else:
