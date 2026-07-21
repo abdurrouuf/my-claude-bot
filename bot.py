@@ -219,15 +219,17 @@ async def post_feed(context, wh_ids, text: str):
             log.warning("Не удалось отправить в ленту %s: %s", chat_id, e)
 
 
-async def feed_invoice_pdf(context, wh_id, client_label, p, old_debt, total):
+async def feed_invoice_pdf(context, wh_id, client_label, p, old_debt, total,
+                           caption=None):
     """PDF проведённой накладной — в чат-ленту склада (просьба владельца:
-    накладные Каракола видны всей команде склада)."""
+    накладные Каракола видны всей команде склада). Сводка операции идёт
+    подписью к файлу — отдельное текстовое сообщение не шлём (дубль)."""
     wh = db.warehouse_by_id(wh_id)
     if not wh or not wh["feed_chat_id"]:
         return
     try:
         await send_invoice_pdf(context, wh["feed_chat_id"], client_label, p,
-                               old_debt, total)
+                               old_debt, total, caption=caption)
     except Exception as e:
         log.warning("Не удалось отправить PDF в ленту склада %s: %s", wh_id, e)
 
@@ -710,7 +712,8 @@ def commit_invoice(p):
     return op_id, client_label, old_debt, total, summary
 
 
-async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total, draft=False):
+async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total,
+                           draft=False, caption=None):
     pdf = generate_pdf_invoice(
         client_label, p["items"], total,
         prev_debt=old_debt, payment=p["payment"], is_payment=p["payment"] > 0,
@@ -720,10 +723,15 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total, d
     marked = draft and DRAFT_WATERMARK
     prefix = "черновик" if marked else "накладная"
     filename = f"{prefix}_{safe_filename(client_label)}_{date_str}.pdf"
-    caption = ("📝 Черновик — не проведено, остатки и долги не изменены"
-               if draft else f"📄 Накладная для {client_label}")
+    if caption is None:
+        caption = ("📝 Черновик — не проведено, остатки и долги не изменены"
+                   if draft else f"📄 Накладная для {client_label}")
+        parse_mode = None
+    else:
+        parse_mode = "HTML"  # подпись ленты приходит уже с разметкой
     await context.bot.send_document(
-        chat_id=chat_id, document=InputFile(pdf, filename=filename), caption=caption
+        chat_id=chat_id, document=InputFile(pdf, filename=filename),
+        caption=caption, parse_mode=parse_mode,
     )
 
 
@@ -2126,8 +2134,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         log.warning("Не удалось уведомить заявителя о накладной")
                 await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
                 await notify_admin(context, actor, summary)
-                await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "🧾")
-                await feed_invoice_pdf(context, p["wh_id"], client_label, p, old_debt, total)
+                # В ленту склада — только PDF со сводкой в подписи (без
+                # отдельного текстового сообщения, просьба владельца 21.07.2026).
+                actor_name = db.get_user(p["user_id"])["name"]
+                await feed_invoice_pdf(
+                    context, p["wh_id"], client_label, p, old_debt, total,
+                    caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}")
                 await alert_low_stock(context, [
                     (p["wh_id"], it["product_id"], -it["qty"])
                     for it in p["items"] if it.get("product_id")])
@@ -2251,10 +2263,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                            old_debt, total)
                     await notify_admin(context, actor,
                                        f"замена накладной №{p['old_op_id']} → №{op_id}: {summary}")
-                    await feed_operation(context, op_id, db.get_user(p["user_id"])["name"],
-                                         "🔁", f"замена накладной №{p['old_op_id']}")
-                    await feed_invoice_pdf(context, p["wh_id"], client_label, p,
-                                           old_debt, total)
+                    actor_name = db.get_user(p["user_id"])["name"]
+                    await feed_invoice_pdf(
+                        context, p["wh_id"], client_label, p, old_debt, total,
+                        caption=(f"🔁 <b>{esc(actor_name)}</b> — {esc(summary)}\n"
+                                 f"Замена накладной №{p['old_op_id']}"))
                     await alert_low_stock(context, [
                         (p["wh_id"], it["product_id"], -it["qty"])
                         for it in p["items"] if it.get("product_id")])
