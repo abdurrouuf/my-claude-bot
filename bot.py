@@ -581,10 +581,16 @@ def _response_text(resp) -> str:
     return next((b.text for b in resp.content if b.type == "text"), "").strip()
 
 
+# Лимит длины ответа. Оплачиваются только реально сгенерированные токены,
+# поэтому запас ничего не стоит; 2500 не хватало на длинные списки с фото
+# (21.07.2026 ответ обрезался на середине JSON — бот показал сырой JSON).
+CLAUDE_MAX_TOKENS = 8000
+
+
 async def ask_claude(history: list, actor) -> str:
     resp = await anthropic_client.messages.create(
         model=CLAUDE_MODEL,
-        max_tokens=2500,  # запас на размышления Sonnet 5 + длинный JSON
+        max_tokens=CLAUDE_MAX_TOKENS,
         system=system_blocks(actor),
         messages=history,
     )
@@ -2715,6 +2721,16 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
                 return
             actor = emp
     if data is None:
+        if "{" in reply and '"action"' in reply:
+            # Модель начала выдавать JSON операции, но он не разобрался —
+            # обычно ответ обрезан по лимиту токенов (очень длинный список).
+            # Сырой JSON пользователю не показываем.
+            log.warning("JSON операции не разобрался (обрезан?): %.500s", reply)
+            await update.message.reply_text(
+                "⚠️ Список получился слишком длинным — ответ оборвался, и я "
+                "не смог его разобрать. Разбейте список на 2–3 части и "
+                "отправьте по очереди, пожалуйста.")
+            return
         # Отвечаем и в чате склада: сюда доходят только сообщения, похожие
         # на операцию (бесплатный фильтр), и ответ модели — обычно уточняющий
         # вопрос («какой Асан?»). Молчать нельзя — сотрудник решит, что
@@ -2857,7 +2873,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     messages = history[-HISTORY_LIMIT:] + [{"role": "user", "content": content}]
     try:
         resp = await anthropic_client.messages.create(
-            model=CLAUDE_MODEL, max_tokens=2500,
+            model=CLAUDE_MODEL, max_tokens=CLAUDE_MAX_TOKENS,
             system=system_blocks(actor), messages=messages)
         track_usage(resp)
         reply = _response_text(resp)
