@@ -149,6 +149,10 @@ CREATE TABLE IF NOT EXISTS operations(
     data         TEXT NOT NULL,               -- JSON: дельты и детали
     status       TEXT NOT NULL DEFAULT 'done' -- done | cancelled
 );
+CREATE INDEX IF NOT EXISTS idx_operations_client ON operations(client_id);
+CREATE INDEX IF NOT EXISTS idx_operations_user   ON operations(user_id);
+CREATE INDEX IF NOT EXISTS idx_operations_ts     ON operations(ts);
+CREATE INDEX IF NOT EXISTS idx_draft_log_ts      ON draft_log(ts);
 """
 
 
@@ -838,6 +842,41 @@ def fuzzy_clients(wh_id: int, name: str, n: int = 3):
 
 # ---------- Операции (журнал + атомарное применение) ----------
 
+def _commit_op(conn, user_id: int, op_type: str, warehouse_id, client_id,
+               summary: str, stock_deltas: list, debt_deltas: list,
+               extra: dict = None, create_client: tuple = None):
+    """Тело проведения операции — вызывается только под _lock и открытой транзакцией."""
+    new_cid = None
+    if create_client:
+        c_wh, c_name, c_debt = create_client[:3]
+        c_phone = create_client[3] if len(create_client) > 3 else None
+        cur = conn.execute(
+            "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,?,?)",
+            (c_wh, c_name.strip(), c_debt, c_phone or None),
+        )
+        new_cid = cur.lastrowid
+    if client_id is None:
+        client_id = new_cid
+    debt_deltas = [(cid if cid is not None else new_cid, d) for cid, d in debt_deltas]
+
+    for wh, pid, d in stock_deltas:
+        _apply_stock(conn, wh, pid, d)
+    for cid, d in debt_deltas:
+        conn.execute("UPDATE clients SET debt = debt + ? WHERE id=?", (d, cid))
+
+    data = json.dumps(
+        {"stock_deltas": stock_deltas, "debt_deltas": debt_deltas, **(extra or {})},
+        ensure_ascii=False,
+    )
+    cur = conn.execute(
+        "INSERT INTO operations(ts, user_id, type, warehouse_id, client_id, summary, data, status) "
+        "VALUES(?,?,?,?,?,?,?, 'done')",
+        (datetime.now(BISHKEK).isoformat(timespec="seconds"),
+         user_id, op_type, warehouse_id, client_id, summary, data),
+    )
+    return cur.lastrowid, client_id
+
+
 def commit_operation(user_id: int, op_type: str, warehouse_id, client_id,
                      summary: str, stock_deltas: list, debt_deltas: list,
                      extra: dict = None, create_client: tuple = None):
@@ -849,35 +888,32 @@ def commit_operation(user_id: int, op_type: str, warehouse_id, client_id,
     """
     conn = connect()
     with _lock, conn:
-        new_cid = None
-        if create_client:
-            c_wh, c_name, c_debt = create_client[:3]
-            c_phone = create_client[3] if len(create_client) > 3 else None
-            cur = conn.execute(
-                "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,?,?)",
-                (c_wh, c_name.strip(), c_debt, c_phone or None),
-            )
-            new_cid = cur.lastrowid
-        if client_id is None:
-            client_id = new_cid
-        debt_deltas = [(cid if cid is not None else new_cid, d) for cid, d in debt_deltas]
+        return _commit_op(conn, user_id, op_type, warehouse_id, client_id,
+                          summary, stock_deltas, debt_deltas, extra, create_client)
 
-        for wh, pid, d in stock_deltas:
-            _apply_stock(conn, wh, pid, d)
-        for cid, d in debt_deltas:
-            conn.execute("UPDATE clients SET debt = debt + ? WHERE id=?", (d, cid))
 
-        data = json.dumps(
-            {"stock_deltas": stock_deltas, "debt_deltas": debt_deltas, **(extra or {})},
-            ensure_ascii=False,
-        )
-        cur = conn.execute(
-            "INSERT INTO operations(ts, user_id, type, warehouse_id, client_id, summary, data, status) "
-            "VALUES(?,?,?,?,?,?,?, 'done')",
-            (datetime.now(BISHKEK).isoformat(timespec="seconds"),
-             user_id, op_type, warehouse_id, client_id, summary, data),
-        )
-        return cur.lastrowid, client_id
+def replace_operation(old_op_id: int, user_id: int, op_type: str, warehouse_id,
+                      client_id, summary: str, stock_deltas: list,
+                      debt_deltas: list, extra: dict = None):
+    """Сторно старой операции + проведение новой ОДНОЙ транзакцией (замена
+    накладной). Раньше это были два отдельных коммита: если второй падал,
+    старая накладная оставалась отменённой без замены — учёт расходился.
+    Бросает ValueError, если старую операцию отменить нельзя."""
+    conn = connect()
+    with _lock, conn:
+        op = conn.execute("SELECT * FROM operations WHERE id=?", (old_op_id,)).fetchone()
+        if op is None:
+            raise ValueError(f"операция №{old_op_id} не найдена")
+        if op["status"] != "done":
+            raise ValueError(f"операция №{old_op_id} уже отменена")
+        data = json.loads(op["data"])
+        for wh, pid, d in data.get("stock_deltas", []):
+            _apply_stock(conn, wh, pid, -d)
+        for cid, d in data.get("debt_deltas", []):
+            conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?", (d, cid))
+        conn.execute("UPDATE operations SET status='cancelled' WHERE id=?", (old_op_id,))
+        return _commit_op(conn, user_id, op_type, warehouse_id, client_id,
+                          summary, stock_deltas, debt_deltas, extra)
 
 
 def get_operation(op_id: int):
