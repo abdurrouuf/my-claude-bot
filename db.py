@@ -74,6 +74,11 @@ CREATE TABLE IF NOT EXISTS clients(
     phone        TEXT,
     UNIQUE(warehouse_id, name)
 );
+CREATE TABLE IF NOT EXISTS client_aliases(
+    client_id INTEGER NOT NULL,
+    alias     TEXT NOT NULL COLLATE NOCASEU,
+    UNIQUE(client_id, alias)
+);
 CREATE TABLE IF NOT EXISTS client_prices(
     client_id  INTEGER NOT NULL,
     product_id INTEGER NOT NULL,
@@ -477,6 +482,12 @@ def known_client_names(limit: int = 40):
         if k not in seen:
             seen.add(k)
             out.append(r["name"])
+    # Псевдонимы — их сотрудники и произносят («Виктория» вместо «Вика Уманец»)
+    for r in conn.execute("SELECT alias FROM client_aliases ORDER BY alias"):
+        k = r["alias"].lower()
+        if k not in seen:
+            seen.add(k)
+            out.append(r["alias"])
     return out[:limit]
 
 
@@ -747,9 +758,30 @@ def client_get(cid: int):
 
 
 def client_exact(wh_id: int, name: str):
-    return connect().execute(
-        "SELECT * FROM clients WHERE warehouse_id=? AND name=?", (wh_id, name.strip())
+    """Клиент по точному имени ИЛИ псевдониму («Виктория» → «Вика Уманец»)."""
+    name = name.strip()
+    conn = connect()
+    row = conn.execute(
+        "SELECT * FROM clients WHERE warehouse_id=? AND name=?", (wh_id, name)
     ).fetchone()
+    if row is not None:
+        return row
+    return conn.execute(
+        "SELECT c.* FROM client_aliases a JOIN clients c ON c.id = a.client_id "
+        "WHERE c.warehouse_id=? AND a.alias=?", (wh_id, name)
+    ).fetchone()
+
+
+def add_client_alias(client_id: int, alias: str):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("INSERT OR IGNORE INTO client_aliases(client_id, alias) VALUES(?,?)",
+                     (client_id, alias.strip()))
+
+
+def client_aliases_list(client_id: int) -> list:
+    return [r["alias"] for r in connect().execute(
+        "SELECT alias FROM client_aliases WHERE client_id=? ORDER BY alias", (client_id,))]
 
 
 def cash_on_hand(user_id: int) -> float:
@@ -831,13 +863,23 @@ def client_set_phone(cid: int, phone):
 
 
 def fuzzy_clients(wh_id: int, name: str, n: int = 3):
-    """Похожие клиенты внутри склада (региона)."""
+    """Похожие клиенты внутри склада (региона), включая псевдонимы."""
     rows = clients_of(wh_id)
     mapping = {}
     for r in rows:
         mapping.setdefault(r["name"].lower(), r)
+    for r in connect().execute(
+            "SELECT a.alias, c.* FROM client_aliases a "
+            "JOIN clients c ON c.id = a.client_id WHERE c.warehouse_id=?", (wh_id,)):
+        mapping.setdefault(r["alias"].lower(), r)
     matches = difflib.get_close_matches(name.strip().lower(), list(mapping), n=n, cutoff=0.6)
-    return [mapping[m] for m in matches]
+    out, seen = [], set()
+    for m in matches:
+        r = mapping[m]
+        if r["id"] not in seen:
+            seen.add(r["id"])
+            out.append(r)
+    return out
 
 
 # ---------- Операции (журнал + атомарное применение) ----------
