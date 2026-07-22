@@ -787,6 +787,19 @@ def commit_invoice(p, replace_op_id=None):
         client_label = c["name"]
         if p.get("phone"):
             db.client_set_phone(cid, p["phone"])
+        if replace_op_id:
+            # Долг «до» для PDF/подписей — БЕЗ заменяемой накладной: её
+            # сторно происходит внутри replace_operation, а c["debt"] здесь
+            # ещё содержит старую накладную. Иначе итог на бумаге завышен
+            # на её сумму (жалоба владельца 22.07.2026), хотя база верна.
+            old = db.get_operation(replace_op_id)
+            if old:
+                try:
+                    for ocid, d in json.loads(old["data"]).get("debt_deltas", []):
+                        if ocid == cid:
+                            old_debt -= d
+                except (ValueError, TypeError):
+                    pass
     stock_deltas = [(p["wh_id"], it["product_id"], -it["qty"])
                     for it in p["items"] if it.get("product_id")]
     summary = f"Накладная: {client_label} — {fmt_num(total)} сом (склад {p['wh_name']})"
