@@ -4777,16 +4777,27 @@ async def remove_user_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def list_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if await _require_admin(update) is None:
         return
-    lines = ["👥 <b>Сотрудники:</b>"]
+    lines = ["👥 <b>Команда:</b>"]
     role_icons = {"admin": "👑", "senior": "⭐", "employee": "👤"}
+    role_names = {"admin": "админ", "senior": "старший", "employee": "сотрудник"}
     for u in db.list_users():
         wh = db.warehouse_of(u["id"])
-        extra_access = db.access_warehouses(u["id"])
-        line = (f"{role_icons.get(u['role'], '👤')} <b>{esc(u['name'])}</b> "
-                f"(<code>{u['id']}</code>) — склад «{esc(wh['name']) if wh else '⚠️ не назначен'}»")
-        if extra_access:
-            line += " + доступ: " + ", ".join(f"«{esc(w['name'])}»" for w in extra_access)
+        wh_label = esc(wh["name"]) if wh else "⚠️ не назначен"
+        if u["role"] == "admin":
+            line = (f"{role_icons['admin']} <b>{esc(u['name'])}</b> "
+                    f"(<code>{u['id']}</code>) — админ, доступ ко ВСЕМ складам "
+                    f"(родной: «{wh_label}»)")
+        else:
+            extra_access = db.access_warehouses(u["id"])
+            line = (f"{role_icons.get(u['role'], '👤')} <b>{esc(u['name'])}</b> "
+                    f"(<code>{u['id']}</code>) — {role_names.get(u['role'], 'сотрудник')}, "
+                    f"склад «{wh_label}»")
+            if extra_access:
+                line += " + доступ: " + ", ".join(f"«{esc(w['name'])}»" for w in extra_access)
         lines.append(line)
+    lines.append("")
+    lines.append("Родной склад — куда идут операции, если склад не указан "
+                 "в сообщении.")
     await send_long(update.message, "\n".join(lines))
 
 
