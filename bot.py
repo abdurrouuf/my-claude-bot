@@ -2686,6 +2686,46 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     "Перед стиранием пришлю вам свежую копию базы — по ней "
                     "всё можно восстановить.",
                     parse_mode="HTML", reply_markup=kb2)
+            elif p["kind"] == "restore_db":
+                # Второе подтверждение отдельной кнопкой — как у /resetwh.
+                token2 = new_pending({**{k: p[k] for k in
+                                         ("kind", "user_id", "chat_id",
+                                          "path", "fname")},
+                                      "kind": "restore_db2"})
+                kb2 = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("💾 Да, заменить базу",
+                                          callback_data=f"ok:{token2}")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token2}")],
+                ])
+                await q.edit_message_text(
+                    "⚠️ <b>Последняя проверка</b>\n\n"
+                    "Рабочая база будет заменена файлом "
+                    f"{esc(p['fname'])} безвозвратно. Сначала пришлю копию "
+                    "текущей базы, затем заменю и перезапущусь.",
+                    parse_mode="HTML", reply_markup=kb2)
+            elif p["kind"] == "restore_db2":
+                if not os.path.exists(p["path"]):
+                    await q.edit_message_text(
+                        "⌛ Файл бэкапа уже удалён с сервера (перезапуск?). "
+                        "Отправьте файл ещё раз.")
+                    return
+                try:
+                    await send_backup(context.bot)
+                except Exception as e:
+                    log.exception("Бэкап перед восстановлением не удался")
+                    await q.edit_message_text(
+                        f"⛔ Восстановление НЕ выполнено: не удалось снять "
+                        f"копию текущей базы ({esc(str(e))}). Попробуйте ещё раз.",
+                        parse_mode="HTML")
+                    return
+                db.restore_from(p["path"])
+                await q.edit_message_text(
+                    "✅ База заменена файлом бэкапа.\n"
+                    "🔄 Перезапускаюсь, чтобы всё перечиталось начисто — "
+                    "буду в строю примерно через полминуты. Потом проверьте: "
+                    "/dbinfo и /stock.")
+                log.warning("База восстановлена из бэкапа %s — перезапуск", p["fname"])
+                asyncio.get_running_loop().call_later(1.5, os._exit, 1)
             elif p["kind"] == "reset_wh2":
                 # Автобэкап перед необратимым удалением: если копия не
                 # отправилась — сброс не выполняем.
@@ -5111,6 +5151,67 @@ async def loadkarakol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML", reply_markup=confirm_kb(token))
 
 
+def _stats_line(s) -> str:
+    try:
+        last = datetime.fromisoformat(s["last_op_ts"]).strftime("%d.%m.%Y %H:%M") \
+            if s["last_op_ts"] else "—"
+    except ValueError:
+        last = s["last_op_ts"]
+    return (f"операций {s['operations']}, клиентов {s['clients']}, "
+            f"долгов {money(s['debt'])}, последняя операция: {last}")
+
+
+async def handle_db_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Файл *.db в личке от админа — восстановление базы из бэкапа."""
+    import tempfile
+    if update.message is None or update.effective_chat.type != "private":
+        return
+    doc = update.message.document
+    if doc is None or not (doc.file_name or "").lower().endswith(".db"):
+        return
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Восстановление базы — только для админа.")
+        return
+    if (doc.file_size or 0) > 45_000_000:
+        await update.message.reply_text("⚠️ Файл слишком большой для Telegram-бота.")
+        return
+    path = os.path.join(tempfile.gettempdir(),
+                        f"restore_{secrets.token_hex(4)}.db")
+    try:
+        tg_file = await doc.get_file()
+        await tg_file.download_to_drive(path)
+        info = db.inspect_backup(path)
+    except ValueError as e:
+        await update.message.reply_text(f"⛔ Это не похоже на бэкап нашей базы: {esc(str(e))}",
+                                        parse_mode="HTML")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        return
+    except Exception as e:
+        log.exception("Не удалось скачать/проверить файл бэкапа")
+        await update.message.reply_text(f"⚠️ Не удалось обработать файл: {e}")
+        return
+    cur = db.current_stats()
+    payload = {"kind": "restore_db", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id, "path": path,
+               "fname": doc.file_name}
+    token = new_pending(payload)
+    await update.message.reply_text(
+        f"💾 <b>Восстановление базы из бэкапа</b>\n"
+        f"Файл: {esc(doc.file_name)}\n\n"
+        f"📂 В файле: {esc(_stats_line(info))}\n"
+        f"🗄 Сейчас в базе: {esc(_stats_line(cur))}\n\n"
+        "Рабочая база будет ПОЛНОСТЬЮ заменена файлом — всё, что занесено "
+        "после этого бэкапа, пропадёт. Перед заменой пришлю копию текущей "
+        "базы. Продолжить?",
+        parse_mode="HTML", reply_markup=confirm_kb(token))
+
+
 async def resetwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """ПОЛНЫЙ сброс склада (только админ): журнал, остатки, клиенты с долгами.
 
@@ -5404,5 +5505,7 @@ if __name__ == "__main__":
         handle_photo))
     app.add_handler(MessageHandler(
         (filters.VOICE | filters.AUDIO) & filters.UpdateType.MESSAGE, handle_voice))
+    app.add_handler(MessageHandler(
+        filters.Document.ALL & filters.UpdateType.MESSAGE, handle_db_file))
     print("Бот запущен...")
     app.run_polling(stop_signals=None)

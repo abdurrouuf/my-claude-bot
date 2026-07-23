@@ -1076,6 +1076,81 @@ def _reset_wh_doomed(conn, wh_id: int, client_ids: set):
             if wh_id in operation_warehouses(op) or op["client_id"] in client_ids]
 
 
+def inspect_backup(path: str) -> dict:
+    """Проверяет файл бэкапа: SQLite ли это, цел ли, наша ли структура.
+    Возвращает счётчики для карточки подтверждения; бросает ValueError
+    с понятным текстом, если файл не годится."""
+    with open(path, "rb") as f:
+        if f.read(16) != b"SQLite format 3\x00":
+            raise ValueError("файл не является базой SQLite")
+    conn = sqlite3.connect(path)
+    try:
+        # Таблицы базы используют нашу коллацию — без неё integrity_check
+        # и COUNT по ним падают на «no such collation sequence».
+        conn.create_collation(
+            "NOCASEU",
+            lambda a, b: (a.lower() > b.lower()) - (a.lower() < b.lower()),
+        )
+        ok = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if ok != "ok":
+            raise ValueError(f"база в файле повреждена ({str(ok)[:100]})")
+        tables = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        missing = {"operations", "clients", "warehouses", "stock",
+                   "users"} - tables
+        if missing:
+            raise ValueError("в файле нет наших таблиц: "
+                             + ", ".join(sorted(missing)))
+        def cnt(t):
+            return conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+        return {
+            "operations": cnt("operations"),
+            "clients": cnt("clients"),
+            "debt": conn.execute(
+                "SELECT COALESCE(SUM(debt), 0) FROM clients WHERE debt > 0"
+            ).fetchone()[0],
+            "last_op_ts": conn.execute(
+                "SELECT MAX(ts) FROM operations").fetchone()[0],
+        }
+    finally:
+        conn.close()
+
+
+def current_stats() -> dict:
+    """Те же счётчики по РАБОЧЕЙ базе (для сравнения с бэкапом)."""
+    conn = connect()
+    def cnt(t):
+        return conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+    return {
+        "operations": cnt("operations"),
+        "clients": cnt("clients"),
+        "debt": conn.execute(
+            "SELECT COALESCE(SUM(debt), 0) FROM clients WHERE debt > 0"
+        ).fetchone()[0],
+        "last_op_ts": conn.execute(
+            "SELECT MAX(ts) FROM operations").fetchone()[0],
+    }
+
+
+def restore_from(path: str):
+    """Заменяет рабочую базу файлом бэкапа (файл уже проверен
+    inspect_backup). Соединение закрывается, -wal/-shm сбрасываются.
+    После вызова процесс НУЖНО перезапустить, чтобы init() прошёл заново."""
+    global _conn
+    import shutil
+    dbp = _db_path()
+    with _lock:
+        if _conn is not None:
+            _conn.close()
+            _conn = None
+        for suf in ("-wal", "-shm"):
+            try:
+                os.remove(dbp + suf)
+            except OSError:
+                pass
+        shutil.copyfile(path, dbp)
+
+
 def reset_warehouse_preview(wh_id: int) -> dict:
     """Что именно удалит полный сброс склада (для карточки подтверждения)."""
     conn = connect()
