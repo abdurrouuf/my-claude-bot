@@ -3576,6 +3576,98 @@ async def _stock_report(update, context, actor, whs, with_prices=False):
         document=InputFile(pdf, filename=filename), caption="\n".join(summary))
 
 
+_DATE_WORD = {"вчера": -1, "сегодня": 0, "позавчера": -2}
+
+
+def _parse_moment(tokens):
+    """['вчера'] / ['22.07'] / ['22.07.2026', '14:30'] -> (datetime, желаемая
+    подпись) или (None, None). Без времени — конец дня 23:59."""
+    if not tokens:
+        return None, None
+    now = datetime.now(BISHKEK)
+    d = None
+    rest = []
+    t0 = tokens[0].lower()
+    if t0 in _DATE_WORD:
+        d = (now + timedelta(days=_DATE_WORD[t0])).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        rest = tokens[1:]
+    else:
+        m = re.fullmatch(r"(\d{1,2})\.(\d{1,2})(?:\.(\d{4}))?", t0)
+        if m:
+            try:
+                d = datetime(int(m.group(3) or now.year), int(m.group(2)),
+                             int(m.group(1)), tzinfo=BISHKEK)
+            except ValueError:
+                return None, None
+            rest = tokens[1:]
+    if d is None:
+        return None, None
+    hh, mm = 23, 59
+    if rest:
+        m = re.fullmatch(r"(\d{1,2})[:.](\d{2})", rest[0])
+        if m and 0 <= int(m.group(1)) <= 23 and 0 <= int(m.group(2)) <= 59:
+            hh, mm = int(m.group(1)), int(m.group(2))
+    moment = d.replace(hour=hh, minute=mm, second=59)
+    return moment, moment.strftime("%d.%m.%Y %H:%M")
+
+
+async def stockat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остатки склада на дату/время в прошлом (по журналу операций)."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    usage = ("Использование: /stockat Склад Дата [Время]\n"
+             "Примеры:\n"
+             "/stockat Каракол вчера — конец вчерашнего дня\n"
+             "/stockat Каракол 22.07 — конец дня 22.07\n"
+             "/stockat Каракол 22.07 14:30 — на момент времени\n"
+             "Время операций смотрите в /log")
+    args = list(context.args or [])
+    # Склад — все слова до первого похожего на дату
+    wh_tokens = []
+    while args and not (args[0].lower() in _DATE_WORD
+                        or re.fullmatch(r"\d{1,2}\.\d{1,2}(\.\d{4})?", args[0])):
+        wh_tokens.append(args.pop(0))
+    wh_name = " ".join(wh_tokens).strip()
+    moment, label = _parse_moment(args)
+    if not wh_name or moment is None:
+        await update.message.reply_text(usage)
+        return
+    wh = db.warehouse_by_name(wh_name)
+    if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        await update.message.reply_text(
+            f"Склад «{esc(wh_name)}» не найден или нет доступа.", parse_mode="HTML")
+        return
+    now = datetime.now(BISHKEK)
+    if moment > now:
+        moment, label = now, now.strftime("%d.%m.%Y %H:%M")
+    smap = db.stock_at(wh["id"], moment.isoformat(timespec="seconds"))
+    rows, total_qty, in_stock = [], 0, 0
+    for p in prices.PRICE_LIST_DATA:
+        qty = smap.get(p["id"], 0)
+        rows.append([p["id"], p["name"], p["volume"],
+                     f"{qty} шт" if qty else "—"])
+        if qty:
+            total_qty += qty
+            in_stock += 1
+    pdf = generate_report_pdf(
+        "ОСТАТКИ НА ДАТУ",
+        f"ОсОО «ВЕТОП» · склад «{wh['name']}» · на {label}",
+        [{"title": f"Склад «{wh['name']}» на {label}",
+          "headers": ["№", "Товар", "Фасовка", "Остаток"],
+          "rows": rows, "widths": [10, 105, 28, 24],
+          "footer": (f"В наличии было: {in_stock} из {len(rows)} позиций · "
+                     f"всего {fmt_num(total_qty)} шт")}])
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"остатки_{wh['name']}_"
+                           f"{moment.strftime('%d%m%Y_%H%M')}.pdf"),
+        caption=(f"🕰 «{wh['name']}» на {label}: {in_stock} поз., "
+                 f"{fmt_num(total_qty)} шт\n"
+                 "Восстановлено по журналу операций; отменённые операции "
+                 "не учитываются."))
+
+
 async def _stock_cmd(update, context, with_prices):
     actor = await get_actor(update)
     if actor is None:
@@ -5456,6 +5548,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pricepdf", pricepdf_cmd))
     app.add_handler(CommandHandler("stock", show_stock))
     app.add_handler(CommandHandler("stockprice", show_stock_price))
+    app.add_handler(CommandHandler("stockat", stockat_cmd))
     app.add_handler(CommandHandler("debts", show_debts))
     app.add_handler(CommandHandler("clients", clients_cmd))
     app.add_handler(CommandHandler("payment", payment_cmd))

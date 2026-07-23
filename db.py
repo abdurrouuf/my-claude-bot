@@ -1076,6 +1076,24 @@ def _reset_wh_doomed(conn, wh_id: int, client_ids: set):
             if wh_id in operation_warehouses(op) or op["client_id"] in client_ids]
 
 
+def stock_at(wh_id: int, moment_iso: str) -> dict:
+    """Остатки склада на момент времени: текущие минус дельты операций,
+    проведённых ПОСЛЕ этого момента. Отменённые операции считаются как
+    будто их не было (их дельты уже сторнированы в текущих остатках)."""
+    smap = dict(stock_map(wh_id))
+    for op in connect().execute(
+            "SELECT data FROM operations WHERE ts > ? AND status='done' "
+            "ORDER BY id", (moment_iso,)):
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        for wh, pid, d in data.get("stock_deltas", []):
+            if wh == wh_id:
+                smap[pid] = smap.get(pid, 0) - d
+    return smap
+
+
 def inspect_backup(path: str) -> dict:
     """Проверяет файл бэкапа: SQLite ли это, цел ли, наша ли структура.
     Возвращает счётчики для карточки подтверждения; бросает ValueError
