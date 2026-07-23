@@ -2642,8 +2642,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await alert_low_stock(context, [
                         (p["wh_id"], it["product_id"], -it["qty"])
                         for it in p["items"] if it.get("product_id")])
-            elif p["kind"] == "load_karakol":
-                from karakol_stock_data import KARAKOL_STOCK
+            elif p["kind"] == "load_wh":
+                data, _src = _stock_load_data(p["wh_name"])
+                if data is None:
+                    await q.edit_message_text("⚠️ Таблица загрузки не найдена.")
+                    return
                 # Перепроверка на кнопке: две заявки подряд задвоили бы остатки
                 nonzero_now = sum(1 for q_ in db.stock_map(p["wh_id"]).values() if q_)
                 if nonzero_now:
@@ -2652,20 +2655,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "повторная загрузка отменена, ничего не изменено.")
                     return
                 deltas = [(p["wh_id"], pid, qty)
-                          for pid, qty, _ in KARAKOL_STOCK if qty > 0]
+                          for pid, qty, _ in data if qty > 0]
                 total = sum(d[2] for d in deltas)
                 op_id, _ = db.commit_operation(
                     p["user_id"], "inventory", p["wh_id"], None,
-                    f"Стартовая загрузка остатков Каракола: {len(deltas)} поз., {total} шт",
-                    deltas, [], {"load": "karakol"})
-                for pid, qty, exp in KARAKOL_STOCK:
+                    f"Стартовая загрузка остатков склада {p['wh_name']}: "
+                    f"{len(deltas)} поз., {total} шт",
+                    deltas, [], {"load": p["wh_name"]})
+                for pid, qty, exp in data:
                     if qty > 0 and exp:
                         db.set_product_expiry(p["wh_id"], pid, exp)
                 await q.edit_message_text(
-                    f"✅ Остатки Каракола загружены (операция №{op_id}): "
-                    f"{len(deltas)} позиций, {total} шт.\n"
-                    "Сроки годности сохранены — смотрите /expiry Каракол.\n"
-                    "Проверьте: /stock (у Данияра) или /report Каракол.")
+                    f"✅ Остатки склада «{esc(p['wh_name'])}» загружены "
+                    f"(операция №{op_id}): {len(deltas)} позиций, {total} шт.\n"
+                    f"Сроки годности сохранены — /expiry {esc(p['wh_name'])}.\n"
+                    f"Проверьте: /stock {esc(p['wh_name'])}.", parse_mode="HTML")
             elif p["kind"] == "reset_wh":
                 # Первая кнопка — не стираем, а показываем ВТОРОЕ подтверждение
                 # с отдельной кнопкой (защита от «одним нажатием», просьба
@@ -5212,34 +5216,63 @@ async def fullmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Остальные склады остаются на черновиках.", parse_mode="HTML")
 
 
-async def loadkarakol_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Стартовая загрузка остатков Каракола (подтверждённые данные владельца)."""
+# Реестр стартовых загрузок: склад -> (модуль с данными, имя списка, описание).
+# Данные — [(id товара, количество, срок "MM.YYYY" или "")]. Новый склад:
+# получить от владельца таблицу остатков, собрать <склад>_stock_data.py по
+# образцу karakol_stock_data.py и добавить запись сюда.
+STOCK_LOADS = {
+    "каракол": ("karakol_stock_data", "KARAKOL_STOCK",
+                "проверенная вами таблица от 22.07.2026"),
+}
+
+
+def _stock_load_data(wh_name: str):
+    entry = STOCK_LOADS.get(wh_name.lower())
+    if entry is None:
+        return None, None
+    import importlib
+    module = importlib.import_module(entry[0])
+    return getattr(module, entry[1]), entry[2]
+
+
+async def loadwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Стартовая загрузка остатков склада из подготовленной таблицы (админ).
+
+    /loadwh Склад; /loadkarakol — то же для Каракола (старое имя)."""
     if await _require_admin(update) is None:
         return
-    from karakol_stock_data import KARAKOL_STOCK
-    wh = db.warehouse_by_name("Каракол")
+    name = " ".join(context.args or []).strip() or "Каракол"
+    wh = db.warehouse_by_name(name)
     if wh is None:
-        await update.message.reply_text("Склад «Каракол» не найден.")
+        await update.message.reply_text(f"Склад «{esc(name)}» не найден.",
+                                        parse_mode="HTML")
+        return
+    data, source = _stock_load_data(wh["name"])
+    if data is None:
+        await update.message.reply_text(
+            f"Для склада «{esc(wh['name'])}» пока нет подготовленной таблицы "
+            "остатков. Пришлите Джарвису таблицу (товар, количество, срок "
+            "годности) — он зашьёт её в загрузчик.", parse_mode="HTML")
         return
     nonzero_now = sum(1 for q in db.stock_map(wh["id"]).values() if q)
     if nonzero_now:
         await update.message.reply_text(
-            f"⚠️ На Караколе уже есть остатки ({nonzero_now} позиций) — повторная "
-            "загрузка задвоит их. Если нужно перезаписать — сначала обнулите "
-            "инвентаризацией или напишите Джарвису.")
+            f"⚠️ На складе «{esc(wh['name'])}» уже есть остатки ({nonzero_now} "
+            "позиций) — повторная загрузка задвоит их. Если нужно начать "
+            "заново — /resetwh, либо напишите Джарвису.", parse_mode="HTML")
         return
-    items = [(pid, qty, exp) for pid, qty, exp in KARAKOL_STOCK if qty > 0]
+    items = [(pid, qty, exp) for pid, qty, exp in data if qty > 0]
     total = sum(q for _, q, _ in items)
-    payload = {"kind": "load_karakol", "user_id": update.effective_user.id,
-               "chat_id": update.effective_chat.id, "wh_id": wh["id"]}
+    payload = {"kind": "load_wh", "user_id": update.effective_user.id,
+               "chat_id": update.effective_chat.id, "wh_id": wh["id"],
+               "wh_name": wh["name"]}
     token = new_pending(payload)
     await update.message.reply_text(
-        f"📦 <b>Стартовая загрузка остатков — склад «Каракол»</b>\n\n"
-        f"Позиций с остатком: <b>{len(items)}</b> (из {len(KARAKOL_STOCK)} в прайсе)\n"
+        f"📦 <b>Стартовая загрузка остатков — склад «{esc(wh['name'])}»</b>\n\n"
+        f"Позиций с остатком: <b>{len(items)}</b> (из {len(data)} в прайсе)\n"
         f"Всего: <b>{total} шт</b>\n"
-        f"Сроки годности будут сохранены ({sum(1 for _, q, e in KARAKOL_STOCK if q and e)} позиций).\n\n"
-        "Данные — из проверенной вами таблицы от 22.07.2026 "
-        "(просрочка входит, Цефти DC 10 мл). Провести?",
+        f"Сроки годности будут сохранены ({sum(1 for _, q, e in data if q and e)} позиций).\n\n"
+        f"Данные — {esc(source)}. Провести?",
         parse_mode="HTML", reply_markup=confirm_kb(token))
 
 
@@ -5571,7 +5604,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("promises", promises_cmd))
     app.add_handler(CommandHandler("abc", abc_cmd))
     app.add_handler(CommandHandler("fullmode", fullmode_cmd))
-    app.add_handler(CommandHandler("loadkarakol", loadkarakol_cmd))
+    app.add_handler(CommandHandler("loadwh", loadwh_cmd))
+    app.add_handler(CommandHandler("loadkarakol", loadwh_cmd))
     app.add_handler(CommandHandler("resetwh", resetwh_cmd))
     app.add_handler(CommandHandler("expiry", expiry_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
