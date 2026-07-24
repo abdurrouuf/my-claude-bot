@@ -290,6 +290,12 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
         _migrate_owner_warehouses(conn)
         _migrate_price_order(conn)
         _migrate_batches(conn)
+        # Починка сроков с «двухцифровым» годом из Excel (04.30 -> 1930):
+        # настоящих сроков в 19xx не бывает, безопасно переносим в 20xx.
+        for table in ("product_batches", "product_expiry"):
+            conn.execute(
+                f"UPDATE {table} SET expiry = substr(expiry, 1, 3) || '20' || "
+                f"substr(expiry, 6) WHERE substr(expiry, 4, 2) = '19'")
 
         for wname in warehouse_names:
             if conn.execute("SELECT 1 FROM warehouses WHERE name=?", (wname,)).fetchone() is None:

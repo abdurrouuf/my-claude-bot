@@ -5444,12 +5444,23 @@ async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not rows_db:
             summary.append(f"📅 «{wh['name']}»: сроков годности пока нет")
             continue
-        rows, n_expired, n_soon = [], 0, 0
+        # Партии одного товара — в ОДНОЙ строке (просьба владельца
+        # 25.07.2026): «12.2027 — 20 шт, 11.2028 — 23 шт». Порядок списка —
+        # по ближайшему сроку товара (expiry_list уже отсортирован).
+        grouped, order = {}, []
         for r in rows_db:
-            p = prices.BY_ID.get(r["product_id"])
-            label = p["name"].split("(")[0].strip() if p else f"товар №{r['product_id']}"
+            if r["product_id"] not in grouped:
+                grouped[r["product_id"]] = []
+                order.append(r["product_id"])
+            grouped[r["product_id"]].append((r["expiry"], r["qty"]))
+        rows, n_expired, n_soon, n_batches = [], 0, 0, 0
+        for pid in order:
+            batches = grouped[pid]
+            n_batches += len(batches)
+            p = prices.BY_ID.get(pid)
+            label = p["name"].split("(")[0].strip() if p else f"товар №{pid}"
             volume = p["volume"] if p else ""
-            d = _expiry_key_to_date(r["expiry"])
+            d = _expiry_key_to_date(batches[0][0])  # ближайший срок
             if d and d <= now:
                 status = "ПРОСРОЧЕНО!"
                 n_expired += 1
@@ -5458,12 +5469,18 @@ async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 n_soon += 1
             else:
                 status = ""
-            rows.append([r["expiry"], label, volume, f"{r['qty']} шт", status])
+            if len(batches) == 1:
+                exp_cell = batches[0][0]
+            else:
+                exp_cell = ", ".join(f"{e} — {q_} шт" for e, q_ in batches)
+            total_qty = sum(q_ for _, q_ in batches)
+            rows.append([exp_cell, label, volume, f"{total_qty} шт", status])
         sections.append(
             {"title": f"Склад «{wh['name']}»",
-             "headers": ["Срок", "Товар", "Фасовка", "Остаток", "Статус"],
-             "rows": rows, "widths": [18, 78, 24, 20, 27], "numbered": True,
-             "footer": f"Позиций: {len(rows)} · просрочено: {n_expired} · "
+             "headers": ["Срок (партии)", "Товар", "Фасовка", "Остаток", "Статус"],
+             "rows": rows, "widths": [34, 62, 24, 20, 27], "numbered": True,
+             "footer": f"Позиций: {len(rows)} (партий: {n_batches}) · "
+                       f"просрочено: {n_expired} · "
                        f"истекает в ближайшие 3 мес: {n_soon}"})
         summary.append(f"📅 «{wh['name']}»: {len(rows)} поз."
                        + (f" · ‼️ просрочено: {n_expired}" if n_expired else "")
