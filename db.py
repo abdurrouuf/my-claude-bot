@@ -127,6 +127,13 @@ CREATE TABLE IF NOT EXISTS product_expiry(
     expiry       TEXT NOT NULL,              -- "MM.YYYY"
     UNIQUE(warehouse_id, product_id)
 );
+CREATE TABLE IF NOT EXISTS product_batches(
+    warehouse_id INTEGER NOT NULL,
+    product_id   INTEGER NOT NULL,
+    expiry       TEXT NOT NULL DEFAULT '',   -- "MM.YYYY", '' = срок неизвестен
+    qty          INTEGER NOT NULL DEFAULT 0,
+    UNIQUE(warehouse_id, product_id, expiry)
+);
 CREATE TABLE IF NOT EXISTS promises(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT NOT NULL,
@@ -238,6 +245,26 @@ def _migrate_price_order(conn):
                  "VALUES('price_order_v2', '1')")
 
 
+def _migrate_batches(conn):
+    """Одноразово заводит партии для складов, загруженных до партионного
+    учёта: каждый остаток становится одной партией со сроком из
+    product_expiry (или «без срока»). Дальше партии живут при операциях."""
+    if conn.execute("SELECT value FROM settings WHERE key='batches_v1'").fetchone():
+        return
+    for s in conn.execute(
+            "SELECT warehouse_id, product_id, qty FROM stock WHERE qty != 0"):
+        exp = conn.execute(
+            "SELECT expiry FROM product_expiry WHERE warehouse_id=? AND product_id=?",
+            (s["warehouse_id"], s["product_id"])).fetchone()
+        conn.execute(
+            "INSERT INTO product_batches(warehouse_id, product_id, expiry, qty) "
+            "VALUES(?,?,?,?) ON CONFLICT(warehouse_id, product_id, expiry) "
+            "DO UPDATE SET qty = excluded.qty",
+            (s["warehouse_id"], s["product_id"],
+             exp["expiry"] if exp else "", s["qty"]))
+    conn.execute("INSERT OR REPLACE INTO settings(key, value) VALUES('batches_v1', '1')")
+
+
 def init(admin_id: int, warehouse_names: list, staff: dict):
     """Создаёт схему, склады и постоянных сотрудников.
 
@@ -261,6 +288,7 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_title TEXT")
         _migrate_owner_warehouses(conn)
         _migrate_price_order(conn)
+        _migrate_batches(conn)
 
         for wname in warehouse_names:
             if conn.execute("SELECT 1 FROM warehouses WHERE name=?", (wname,)).fetchone() is None:
@@ -460,8 +488,18 @@ def set_product_expiry(wh_id: int, product_id: int, expiry: str):
 
 
 def expiry_list(wh_id: int):
-    """Сроки годности склада с текущими остатками, ближайшие сначала."""
-    return connect().execute(
+    """Сроки годности склада, ближайшие сначала. Если склад ведётся партиями
+    (product_batches), каждая партия — своя строка; иначе — старый режим
+    «один срок на товар» (product_expiry × stock)."""
+    conn = connect()
+    rows = conn.execute(
+        "SELECT product_id, expiry, qty FROM product_batches "
+        "WHERE warehouse_id=? AND qty > 0 AND expiry != '' "
+        "ORDER BY substr(expiry, 4) || substr(expiry, 1, 2)",
+        (wh_id,)).fetchall()
+    if rows:
+        return rows
+    return conn.execute(
         "SELECT e.product_id, e.expiry, COALESCE(s.qty, 0) AS qty "
         "FROM product_expiry e "
         "LEFT JOIN stock s ON s.warehouse_id = e.warehouse_id "
@@ -918,10 +956,62 @@ def fuzzy_clients(wh_id: int, name: str, n: int = 3):
 
 # ---------- Операции (журнал + атомарное применение) ----------
 
+# Партии внутри склада: сортировка «сначала старые», партия без срока — в конце.
+_BATCH_ORDER = ("CASE WHEN expiry='' THEN 1 ELSE 0 END, "
+                "substr(expiry, 4) || substr(expiry, 1, 2)")
+
+
+def _batch_add(conn, wh, pid, expiry, delta):
+    conn.execute(
+        "INSERT INTO product_batches(warehouse_id, product_id, expiry, qty) "
+        "VALUES(?,?,?,?) ON CONFLICT(warehouse_id, product_id, expiry) "
+        "DO UPDATE SET qty = qty + excluded.qty",
+        (wh, pid, expiry or "", delta))
+
+
+def _apply_batches(conn, wh, pid, delta, plan=None):
+    """Правит партии при изменении остатка. Возвращает [(expiry, изменение)]
+    для журнала (нужно /undo). Минус — списание «сначала старые» (FEFO);
+    плюс — по плану партий (загрузка со сроками) либо в партию «без срока»."""
+    if not delta:
+        return []
+    if delta > 0:
+        rows = plan or [("", delta)]
+        for exp, q in rows:
+            _batch_add(conn, wh, pid, exp, q)
+        return [[exp, q] for exp, q in rows]
+    out, rest = [], -delta
+    for r in conn.execute(
+            "SELECT expiry, qty FROM product_batches "
+            "WHERE warehouse_id=? AND product_id=? AND qty > 0 "
+            f"ORDER BY {_BATCH_ORDER}", (wh, pid)).fetchall():
+        take = min(rest, r["qty"])
+        _batch_add(conn, wh, pid, r["expiry"], -take)
+        out.append([r["expiry"], -take])
+        rest -= take
+        if not rest:
+            break
+    if rest:
+        # Партий не хватило (минусовой остаток или партии не заведены) —
+        # долг вешаем на партию «без срока», сумма партий = остатку.
+        _batch_add(conn, wh, pid, "", -rest)
+        out.append(["", -rest])
+    return out
+
+
+def _revert_batches(conn, batch_deltas):
+    for wh, pid, exp, chg in batch_deltas or []:
+        _batch_add(conn, wh, pid, exp, -chg)
+
+
 def _commit_op(conn, user_id: int, op_type: str, warehouse_id, client_id,
                summary: str, stock_deltas: list, debt_deltas: list,
-               extra: dict = None, create_client: tuple = None):
-    """Тело проведения операции — вызывается только под _lock и открытой транзакцией."""
+               extra: dict = None, create_client: tuple = None,
+               batch_plan: dict = None):
+    """Тело проведения операции — вызывается только под _lock и открытой транзакцией.
+
+    batch_plan: {(wh, pid): [(expiry, qty), ...]} — раскладка ПОЛОЖИТЕЛЬНОЙ
+    дельты по партиям (стартовая загрузка со сроками)."""
     new_cid = None
     if create_client:
         c_wh, c_name, c_debt = create_client[:3]
@@ -935,13 +1025,18 @@ def _commit_op(conn, user_id: int, op_type: str, warehouse_id, client_id,
         client_id = new_cid
     debt_deltas = [(cid if cid is not None else new_cid, d) for cid, d in debt_deltas]
 
+    batch_deltas = []
     for wh, pid, d in stock_deltas:
         _apply_stock(conn, wh, pid, d)
+        for exp, chg in _apply_batches(conn, wh, pid, d,
+                                       (batch_plan or {}).get((wh, pid))):
+            batch_deltas.append([wh, pid, exp, chg])
     for cid, d in debt_deltas:
         conn.execute("UPDATE clients SET debt = debt + ? WHERE id=?", (d, cid))
 
     data = json.dumps(
-        {"stock_deltas": stock_deltas, "debt_deltas": debt_deltas, **(extra or {})},
+        {"stock_deltas": stock_deltas, "debt_deltas": debt_deltas,
+         "batch_deltas": batch_deltas, **(extra or {})},
         ensure_ascii=False,
     )
     cur = conn.execute(
@@ -955,7 +1050,8 @@ def _commit_op(conn, user_id: int, op_type: str, warehouse_id, client_id,
 
 def commit_operation(user_id: int, op_type: str, warehouse_id, client_id,
                      summary: str, stock_deltas: list, debt_deltas: list,
-                     extra: dict = None, create_client: tuple = None):
+                     extra: dict = None, create_client: tuple = None,
+                     batch_plan: dict = None):
     """Применяет изменения склада/долгов и пишет операцию в журнал одной транзакцией.
 
     create_client: (warehouse_id, name, initial_debt) — создать клиента внутри
@@ -965,7 +1061,8 @@ def commit_operation(user_id: int, op_type: str, warehouse_id, client_id,
     conn = connect()
     with _lock, conn:
         return _commit_op(conn, user_id, op_type, warehouse_id, client_id,
-                          summary, stock_deltas, debt_deltas, extra, create_client)
+                          summary, stock_deltas, debt_deltas, extra,
+                          create_client, batch_plan)
 
 
 def replace_operation(old_op_id: int, user_id: int, op_type: str, warehouse_id,
@@ -985,6 +1082,7 @@ def replace_operation(old_op_id: int, user_id: int, op_type: str, warehouse_id,
         data = json.loads(op["data"])
         for wh, pid, d in data.get("stock_deltas", []):
             _apply_stock(conn, wh, pid, -d)
+        _revert_batches(conn, data.get("batch_deltas"))
         for cid, d in data.get("debt_deltas", []):
             conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?", (d, cid))
         conn.execute("UPDATE operations SET status='cancelled' WHERE id=?", (old_op_id,))
@@ -1063,6 +1161,7 @@ def cancel_operation(op_id: int):
         data = json.loads(op["data"])
         for wh, pid, d in data.get("stock_deltas", []):
             _apply_stock(conn, wh, pid, -d)
+        _revert_batches(conn, data.get("batch_deltas"))
         for cid, d in data.get("debt_deltas", []):
             conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?", (d, cid))
         conn.execute("UPDATE operations SET status='cancelled' WHERE id=?", (op_id,))
@@ -1209,6 +1308,9 @@ def reset_warehouse(wh_id: int) -> dict:
             for wh, pid, d in data.get("stock_deltas", []):
                 if wh != wh_id:
                     _apply_stock(conn, wh, pid, -d)
+            for bwh, pid, exp, chg in data.get("batch_deltas", []):
+                if bwh != wh_id:
+                    _batch_add(conn, bwh, pid, exp, -chg)
             for cid, d in data.get("debt_deltas", []):
                 if cid not in client_ids:
                     conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?",
@@ -1223,6 +1325,7 @@ def reset_warehouse(wh_id: int) -> dict:
             (wh_id,)).fetchone()[0]
         conn.execute("DELETE FROM stock WHERE warehouse_id=?", (wh_id,))
         conn.execute("DELETE FROM product_expiry WHERE warehouse_id=?", (wh_id,))
+        conn.execute("DELETE FROM product_batches WHERE warehouse_id=?", (wh_id,))
         if client_ids:
             marks = ",".join("?" * len(client_ids))
             ids = tuple(client_ids)
