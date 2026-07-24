@@ -4,6 +4,7 @@ import difflib
 import json
 import logging
 import os
+import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
@@ -649,9 +650,19 @@ def warehouse_by_id(wh_id: int):
 
 
 def warehouse_by_name(name: str):
-    return connect().execute(
+    """Склад по имени; дефисы/пробелы не важны («Карабалта» = «Кара-Балта»)."""
+    row = connect().execute(
         "SELECT * FROM warehouses WHERE name=?", (name.strip(),)
     ).fetchone()
+    if row is not None:
+        return row
+    key = re.sub(r"[\s\-–—]+", "", name).lower()
+    if not key:
+        return None
+    for w in all_warehouses():
+        if re.sub(r"[\s\-–—]+", "", w["name"]).lower() == key:
+            return w
+    return None
 
 
 def all_warehouses():
