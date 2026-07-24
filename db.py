@@ -446,14 +446,17 @@ def promises_close(client: str, user_id=None):
 
 
 def clients_add_bulk(wh_id: int, entries: list):
-    """Создаёт клиентов справочником. entries: [(имя, долг)] или [имя].
+    """Создаёт клиентов справочником. entries: [(имя, долг[, телефон])] или [имя].
     Существующие пропускаются (долг им НЕ меняется). Возвращает (добавлены, пропущены)."""
     conn = connect()
     added, skipped = [], []
     with _lock, conn:
         for raw in entries:
+            phone = None
             if isinstance(raw, (list, tuple)):
                 name, debt = str(raw[0] or "").strip(), float(raw[1] or 0)
+                if len(raw) > 2 and raw[2]:
+                    phone = str(raw[2]).strip() or None
             else:
                 name, debt = str(raw or "").strip(), 0.0
             if not name:
@@ -465,8 +468,8 @@ def clients_add_bulk(wh_id: int, entries: list):
                 skipped.append(name)
                 continue
             conn.execute(
-                "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,?,NULL)",
-                (wh_id, name, debt))
+                "INSERT INTO clients(warehouse_id, name, debt, phone) VALUES(?,?,?,?)",
+                (wh_id, name, debt, phone))
             added.append(name)
     return added, skipped
 
