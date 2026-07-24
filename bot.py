@@ -418,10 +418,11 @@ def _build_static_system() -> str:
                  'на Каракол: Асан, Болот, ...», «новые клиенты: ...», или фото списка '
                  'клиентов), верни ТОЛЬКО JSON:')
     parts.append('{"action": "add_clients", "warehouse": null_или_имя_склада, '
-                 '"clients": [{"name": "Полное имя", "debt": 0}]}')
+                 '"clients": [{"name": "Полное имя", "debt": 0, "phone": null_или_телефон}]}')
     parts.append('- Имена пиши полностью, включая город/село («Джумгалбек Кара-Балта»).')
     parts.append('- "debt": стартовый долг клиента, если указан рядом с именем '
                  '(«Асан — 31470», «Болот долг 12000»); не указан — 0.')
+    parts.append('- "phone": телефон, если указан рядом с именем; не указан — null.')
     parts.append('- Выбирай этот режим только при явных словах о добавлении клиентов, '
                  'без товаров.')
     parts.append("")
@@ -1629,11 +1630,14 @@ async def start_transfer(update, context, actor, data):
 def add_clients_summary(p) -> str:
     entries = p["entries"]
     shown = entries[:30]
-    total_debt = sum(d for _, d in entries)
+    total_debt = sum(e[1] for e in entries)
     lines = [f"👥 <b>Новые клиенты</b> — склад «{esc(p['wh_name'])}» "
              f"({len(entries)} чел.)", ""]
-    for i, (n, debt) in enumerate(shown, 1):
-        lines.append(f"{i}. {esc(n)}" + (f" — долг {money(debt)}" if debt else ""))
+    for i, e in enumerate(shown, 1):
+        n, debt = e[0], e[1]
+        phone = e[2] if len(e) > 2 else None
+        lines.append(f"{i}. {esc(n)}" + (f" — долг {money(debt)}" if debt else "")
+                     + (" 📞" if phone else ""))
     if len(entries) > 30:
         lines.append(f"… и ещё {len(entries) - 30}")
     if p["skipped"]:
@@ -1654,12 +1658,15 @@ async def start_add_clients(update, context, actor, data):
         return
     seen, entries, skipped = set(), [], []
     for raw in (data.get("clients") or []):
+        phone = None
         if isinstance(raw, dict):
             name = str(raw.get("name") or "").strip()
             try:
                 debt = float(raw.get("debt") or 0)
             except (TypeError, ValueError):
                 debt = 0.0
+            if raw.get("phone"):
+                phone = _clean_phone(raw.get("phone")) or None
         else:
             name, debt = str(raw or "").strip(), 0.0
         if not name or name.lower() in seen:
@@ -1668,7 +1675,7 @@ async def start_add_clients(update, context, actor, data):
         if db.client_exact(wh["id"], name):
             skipped.append(name)
         else:
-            entries.append((name, debt))
+            entries.append((name, debt, phone))
     if not entries:
         await update.message.reply_text(
             "Все названные клиенты уже есть в базе — добавлять нечего." if skipped
@@ -2769,7 +2776,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     parse_mode="HTML")
             elif p["kind"] == "add_clients":
                 added, skipped = db.clients_add_bulk(p["wh_id"], p["entries"])
-                total_debt = sum(d for _, d in p["entries"])
+                total_debt = sum(e[1] for e in p["entries"])
                 msg = (f"✅ Добавлено клиентов на склад «{esc(p['wh_name'])}»: "
                        f"{len(added)}.")
                 if total_debt:
