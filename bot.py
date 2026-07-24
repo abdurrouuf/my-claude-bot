@@ -2654,21 +2654,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"⚠️ На складе уже есть остатки ({nonzero_now} позиций) — "
                         "повторная загрузка отменена, ничего не изменено.")
                     return
-                deltas = [(p["wh_id"], pid, qty)
-                          for pid, qty, _ in data if qty > 0]
-                total = sum(d[2] for d in deltas)
+                # Строки одного товара = партии: складываем в общую дельту,
+                # а раскладку по срокам передаём планом партий.
+                totals, plan = {}, {}
+                for pid, qty, exp in data:
+                    if qty <= 0:
+                        continue
+                    totals[pid] = totals.get(pid, 0) + qty
+                    plan.setdefault((p["wh_id"], pid), []).append((exp or "", qty))
+                deltas = [(p["wh_id"], pid, q) for pid, q in totals.items()]
+                total = sum(totals.values())
                 op_id, _ = db.commit_operation(
                     p["user_id"], "inventory", p["wh_id"], None,
                     f"Стартовая загрузка остатков склада {p['wh_name']}: "
                     f"{len(deltas)} поз., {total} шт",
-                    deltas, [], {"load": p["wh_name"]})
-                for pid, qty, exp in data:
-                    if qty > 0 and exp:
-                        db.set_product_expiry(p["wh_id"], pid, exp)
+                    deltas, [], {"load": p["wh_name"]}, batch_plan=plan)
+                # Старый справочник «один срок на товар» — ближайший срок.
+                for (wh_, pid), rows_ in plan.items():
+                    dated = sorted((e for e, _q in rows_ if e),
+                                   key=lambda e: e[3:] + e[:2])
+                    if dated:
+                        db.set_product_expiry(wh_, pid, dated[0])
                 await q.edit_message_text(
                     f"✅ Остатки склада «{esc(p['wh_name'])}» загружены "
-                    f"(операция №{op_id}): {len(deltas)} позиций, {total} шт.\n"
-                    f"Сроки годности сохранены — /expiry {esc(p['wh_name'])}.\n"
+                    f"(операция №{op_id}): {len(deltas)} позиций, {total} шт "
+                    f"({sum(len(r) for r in plan.values())} партий).\n"
+                    f"Сроки годности — /expiry {esc(p['wh_name'])}.\n"
                     f"Проверьте: /stock {esc(p['wh_name'])}.", parse_mode="HTML")
             elif p["kind"] == "reset_wh":
                 # Первая кнопка — не стираем, а показываем ВТОРОЕ подтверждение
@@ -5223,6 +5234,9 @@ async def fullmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 STOCK_LOADS = {
     "каракол": ("karakol_stock_data", "KARAKOL_STOCK",
                 "проверенная вами таблица от 22.07.2026"),
+    "кара-балта": ("karabalta_stock_data", "KARABALTA_STOCK",
+                   "ваша Excel-таблица от 21.07.2026 (ЭЛЕОВИТ 100мл взят 29 шт "
+                   "— уточняется у Беки)"),
 }
 
 
@@ -5261,17 +5275,26 @@ async def loadwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "позиций) — повторная загрузка задвоит их. Если нужно начать "
             "заново — /resetwh, либо напишите Джарвису.", parse_mode="HTML")
         return
+    # Один товар может идти несколькими строками — это разные ПАРТИИ
+    # (свой срок у каждой).
     items = [(pid, qty, exp) for pid, qty, exp in data if qty > 0]
+    pids = {pid for pid, _, _ in items}
     total = sum(q for _, q, _ in items)
     payload = {"kind": "load_wh", "user_id": update.effective_user.id,
                "chat_id": update.effective_chat.id, "wh_id": wh["id"],
                "wh_name": wh["name"]}
     token = new_pending(payload)
+    batch_note = ""
+    if len(items) > len(pids):
+        batch_note = (f"Партий: <b>{len(items)}</b> — у "
+                      f"{len(items) - len(pids)} товаров два срока годности.\n")
     await update.message.reply_text(
         f"📦 <b>Стартовая загрузка остатков — склад «{esc(wh['name'])}»</b>\n\n"
-        f"Позиций с остатком: <b>{len(items)}</b> (из {len(data)} в прайсе)\n"
+        f"Позиций с остатком: <b>{len(pids)}</b>\n"
+        f"{batch_note}"
         f"Всего: <b>{total} шт</b>\n"
-        f"Сроки годности будут сохранены ({sum(1 for _, q, e in data if q and e)} позиций).\n\n"
+        f"Сроки годности будут сохранены "
+        f"({sum(1 for _, q, e in data if q and e)} партий).\n\n"
         f"Данные — {esc(source)}. Провести?",
         parse_mode="HTML", reply_markup=confirm_kb(token))
 
