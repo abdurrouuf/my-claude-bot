@@ -991,8 +991,9 @@ def _batch_add(conn, wh, pid, expiry, delta):
 
 def _apply_batches(conn, wh, pid, delta, plan=None):
     """Правит партии при изменении остатка. Возвращает [(expiry, изменение)]
-    для журнала (нужно /undo). Минус — списание «сначала старые» (FEFO);
-    плюс — по плану партий (загрузка со сроками) либо в партию «без срока»."""
+    для журнала (нужно /undo). Минус — по плану (продавец выбрал партию
+    кнопкой), остаток плана — «сначала старые» (FEFO); плюс — по плану
+    партий (загрузка со сроками) либо в партию «без срока»."""
     if not delta:
         return []
     if delta > 0:
@@ -1001,6 +1002,16 @@ def _apply_batches(conn, wh, pid, delta, plan=None):
             _batch_add(conn, wh, pid, exp, q)
         return [[exp, q] for exp, q in rows]
     out, rest = [], -delta
+    for exp, q in (plan or []):
+        take = min(q, rest)
+        if take > 0:
+            # Выбранная партия списывается, даже если в ней меньше — минус
+            # останется в ней (продавец знает, что продал именно её).
+            _batch_add(conn, wh, pid, exp, -take)
+            out.append([exp, -take])
+            rest -= take
+        if not rest:
+            return out
     for r in conn.execute(
             "SELECT expiry, qty FROM product_batches "
             "WHERE warehouse_id=? AND product_id=? AND qty > 0 "
@@ -1017,6 +1028,14 @@ def _apply_batches(conn, wh, pid, delta, plan=None):
         _batch_add(conn, wh, pid, "", -rest)
         out.append(["", -rest])
     return out
+
+
+def product_batches_of(wh_id: int, product_id: int):
+    """Партии товара с остатком, «сначала старые» (для кнопок выбора)."""
+    return connect().execute(
+        "SELECT expiry, qty FROM product_batches "
+        "WHERE warehouse_id=? AND product_id=? AND qty > 0 "
+        f"ORDER BY {_BATCH_ORDER}", (wh_id, product_id)).fetchall()
 
 
 def _revert_batches(conn, batch_deltas):
