@@ -1589,7 +1589,10 @@ async def send_transfer_pdf(context, chat_id, p, op_id, summary, caption=None):
 
 def commit_transfer(p):
     # Дельты по товару агрегируются (товар мог идти несколькими строками с
-    # разными сроками), а сроки прихода уходят планом партий получателя.
+    # разными сроками). План партий: у перемещения src_batches (выбор партии
+    # или FEFO-раскладка из _finish_transfer) списывает конкретные партии
+    # источника И переносит их сроки на склад-получатель; у прихода извне
+    # срок позиции ложится партией получателя.
     dest, src, plan = {}, {}, {}
     for it in p["items"]:
         pid = it.get("product_id")
@@ -1598,8 +1601,14 @@ def commit_transfer(p):
         dest[pid] = dest.get(pid, 0) + it["qty"]
         if p["from_wh_id"]:
             src[pid] = src.get(pid, 0) + it["qty"]
-        if it.get("expiry"):
-            plan.setdefault((p["wh_id"], pid), []).append((it["expiry"], it["qty"]))
+        rows = it.get("src_batches")
+        if rows is None:
+            rows = [(it["expiry"], it["qty"])] if it.get("expiry") else []
+        for exp, q_ in rows:
+            if p["from_wh_id"]:
+                plan.setdefault((p["from_wh_id"], pid), []).append((exp, q_))
+            if exp:
+                plan.setdefault((p["wh_id"], pid), []).append((exp, q_))
     stock_deltas = [(p["wh_id"], pid, q) for pid, q in dest.items()]
     stock_deltas += [(p["from_wh_id"], pid, -q) for pid, q in src.items()]
     n = len(p["items"])
@@ -2327,23 +2336,31 @@ async def minstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Кнопки ----------
 
+def _batch_src_wh(p):
+    """Склад, с которого списываются партии: у перемещения — источник."""
+    if p.get("kind") == "transfer" and p.get("from_wh_id"):
+        return p["from_wh_id"]
+    return p["wh_id"]
+
+
 def _batch_questions(p):
-    """Позиции накладной, для которых нужно спросить партию: у товара
-    несколько партий с разными сроками, а выбор ещё не сделан."""
+    """Позиции, для которых нужно спросить партию: у товара несколько партий
+    с разными сроками, срок не указан явно, выбор ещё не сделан."""
     need = []
     choices = p.get("batch_choices") or {}
+    src_wh = _batch_src_wh(p)
     for i, it in enumerate(p["items"]):
         pid = it.get("product_id")
-        if not pid or str(i) in choices:
+        if not pid or str(i) in choices or it.get("expiry"):
             continue
-        batches = db.product_batches_of(p["wh_id"], pid)
+        batches = db.product_batches_of(src_wh, pid)
         if len(batches) > 1:
             need.append((i, it, batches))
     return need
 
 
 async def _ask_batch(q, p, question):
-    """Кнопки «какую партию продать?» для одной позиции накладной."""
+    """Кнопки «какую партию?» для одной позиции накладной/перемещения."""
     i, it, batches = question
     token = new_pending(p)
     kb = [[InlineKeyboardButton(f"📅 до {b['expiry']} — {b['qty']} шт",
@@ -2352,10 +2369,11 @@ async def _ask_batch(q, p, question):
     kb.append([InlineKeyboardButton(f"🔀 Сначала старые (до {batches[0]['expiry']})",
                                     callback_data=f"pbat:{token}:{i}:fefo")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+    verb = ("Какую партию перемещаете?" if p["kind"] == "transfer"
+            else "Из какой партии продаёте?")
     await q.edit_message_text(
         f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
-        "На складе несколько партий с разными сроками. Из какой партии "
-        "продаёте?",
+        f"На складе несколько партий с разными сроками. {verb}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -2389,6 +2407,85 @@ async def _finish_invoice(q, context, actor, p):
     await alert_low_stock(context, [
         (p["wh_id"], it["product_id"], -it["qty"])
         for it in p["items"] if it.get("product_id")])
+
+
+async def _finish_transfer(q, context, actor, p):
+    """Проведение перемещения/прихода после проверок и выбора партий."""
+    # Перепроверка остатка на кнопке: заявка могла ждать до суток,
+    # товар за это время могли продать (минус допустим, но подтверждающий
+    # должен его увидеть).
+    warn = ""
+    if p.get("from_wh_id"):
+        smap = db.stock_map(p["from_wh_id"])
+        minus = [
+            f"{it['name']} {it['volume']}: на складе "
+            f"{smap.get(it['product_id'], 0)}, забираем {it['qty']}"
+            for it in p["items"]
+            if it.get("product_id")
+            and smap.get(it["product_id"], 0) < it["qty"]]
+        if minus:
+            warn = ("\n\n⚠️ Остаток изменился со времени заявки — "
+                    "уйдёт в минус:\n• " + "\n• ".join(minus) +
+                    "\nЕсли это неверно — отмените: /undo")
+        # Раскладка по партиям источника: явный срок / выбор кнопкой /
+        # «сначала старые» — она же переносит сроки на склад-получатель.
+        choices = p.get("batch_choices") or {}
+        for i, it in enumerate(p["items"]):
+            pid = it.get("product_id")
+            if not pid:
+                continue
+            exp = it.get("expiry") or choices.get(str(i))
+            if exp:
+                it["src_batches"] = [(exp, it["qty"])]
+                continue
+            rows_, rest = [], it["qty"]
+            for b in db.product_batches_of(p["from_wh_id"], pid):
+                take = min(rest, b["qty"])
+                if take > 0:
+                    rows_.append((b["expiry"], take))
+                    rest -= take
+                if not rest:
+                    break
+            if rest:
+                rows_.append(("", rest))
+            it["src_batches"] = rows_
+    op_id, summary = commit_transfer(p)
+    await q.edit_message_text(
+        f"✅ {esc(summary)} — проведено (операция №{op_id})." + esc(warn),
+        parse_mode="HTML")
+    note = ""
+    if p.get("approver_id"):
+        note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
+        try:
+            await context.bot.send_message(
+                p["chat_id"],
+                f"✅ Ваша заявка проведена (операция №{op_id}): {esc(summary)}",
+                parse_mode="HTML")
+        except Exception:
+            log.warning("Не удалось уведомить заявителя")
+    else:
+        await notify_admin(context, actor, summary)
+    # PDF со списком и сроками — в чаты-ленты складов операции
+    # (просьба владельца 25.07.2026); нет ленты — подтвердившему.
+    actor_name = db.get_user(p["user_id"])["name"]
+    cap = f"📦 <b>{esc(actor_name)}</b> — {esc(summary)}"
+    if note:
+        cap += f"\n{esc(note)}"
+    feed_chats = set()
+    for wh_id_ in filter(None, (p["wh_id"], p.get("from_wh_id"))):
+        wh_ = db.warehouse_by_id(wh_id_)
+        if wh_ and wh_["feed_chat_id"]:
+            feed_chats.add(wh_["feed_chat_id"])
+    try:
+        for chat_id_ in (feed_chats or {q.message.chat.id}):
+            await send_transfer_pdf(context, chat_id_, p, op_id, summary,
+                                    caption=cap)
+    except Exception:
+        log.exception("Не удалось отправить PDF прихода")
+    if p["from_wh_id"]:
+        await alert_low_stock(context, [
+            (p["from_wh_id"], it["product_id"], -it["qty"])
+            for it in p["items"] if it.get("product_id")])
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2612,7 +2709,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if choice == "fefo":
             choices[idx] = ""   # пусто = «сначала старые» (FEFO)
         else:
-            batches = db.product_batches_of(p["wh_id"], item.get("product_id") or 0)
+            batches = db.product_batches_of(_batch_src_wh(p),
+                                            item.get("product_id") or 0)
             try:
                 choices[idx] = batches[int(choice)]["expiry"]
             except (ValueError, IndexError):
@@ -2622,9 +2720,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _ask_batch(q, p, need[0])
             return
         try:
-            await _finish_invoice(q, context, actor, p)
+            if p["kind"] == "transfer":
+                await _finish_transfer(q, context, actor, p)
+            else:
+                await _finish_invoice(q, context, actor, p)
         except Exception as e:
-            log.exception("Ошибка проведения накладной после выбора партии")
+            log.exception("Ошибка проведения после выбора партии")
             await q.edit_message_text(f"⚠️ Ошибка при проведении: {e}")
         return
 
@@ -2655,62 +2756,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "💵",
                                      exclude_chat_id=p["chat_id"])
             elif p["kind"] == "transfer":
-                # Перепроверка остатка на кнопке: заявка могла ждать до суток,
-                # товар за это время могли продать (у накладных такая
-                # перепроверка уже есть; минус для перемещений допустим,
-                # но подтверждающий должен его увидеть).
-                warn = ""
+                # Перемещение с многопартийным товаром — спрашиваем, какую
+                # партию перемещают (как при продаже); выбранный срок
+                # переезжает на склад-получатель.
                 if p.get("from_wh_id"):
-                    smap = db.stock_map(p["from_wh_id"])
-                    minus = [
-                        f"{it['name']} {it['volume']}: на складе "
-                        f"{smap.get(it['product_id'], 0)}, забираем {it['qty']}"
-                        for it in p["items"]
-                        if it.get("product_id")
-                        and smap.get(it["product_id"], 0) < it["qty"]]
-                    if minus:
-                        warn = ("\n\n⚠️ Остаток изменился со времени заявки — "
-                                "уйдёт в минус:\n• " + "\n• ".join(minus) +
-                                "\nЕсли это неверно — отмените: /undo")
-                op_id, summary = commit_transfer(p)
-                await q.edit_message_text(
-                    f"✅ {esc(summary)} — проведено (операция №{op_id})."
-                    + esc(warn),
-                    parse_mode="HTML")
-                note = ""
-                if p.get("approver_id"):
-                    note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
-                    try:
-                        await context.bot.send_message(
-                            p["chat_id"],
-                            f"✅ Ваша заявка проведена (операция №{op_id}): {esc(summary)}",
-                            parse_mode="HTML")
-                    except Exception:
-                        log.warning("Не удалось уведомить заявителя")
-                else:
-                    await notify_admin(context, actor, summary)
-                # PDF со списком и сроками — в чаты-ленты складов операции
-                # (просьба владельца 25.07.2026: документ нужен в общем чате,
-                # а не в личке). Нет ленты — присылаем подтвердившему.
-                actor_name = db.get_user(p["user_id"])["name"]
-                cap = f"📦 <b>{esc(actor_name)}</b> — {esc(summary)}"
-                if note:
-                    cap += f"\n{esc(note)}"
-                feed_chats = set()
-                for wh_id_ in filter(None, (p["wh_id"], p.get("from_wh_id"))):
-                    wh_ = db.warehouse_by_id(wh_id_)
-                    if wh_ and wh_["feed_chat_id"]:
-                        feed_chats.add(wh_["feed_chat_id"])
-                try:
-                    for chat_id_ in (feed_chats or {q.message.chat.id}):
-                        await send_transfer_pdf(context, chat_id_, p,
-                                                op_id, summary, caption=cap)
-                except Exception:
-                    log.exception("Не удалось отправить PDF прихода")
-                if p["from_wh_id"]:
-                    await alert_low_stock(context, [
-                        (p["from_wh_id"], it["product_id"], -it["qty"])
-                        for it in p["items"] if it.get("product_id")])
+                    need = _batch_questions(p)
+                    if need:
+                        await _ask_batch(q, p, need[0])
+                        return
+                await _finish_transfer(q, context, actor, p)
             elif p["kind"] == "handover":
                 op_id, summary = commit_handover(p)
                 remaining = db.cash_on_hand(p["user_id"])
