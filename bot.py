@@ -1556,7 +1556,7 @@ def transfer_summary(p) -> str:
     return "\n".join(lines)
 
 
-async def send_transfer_pdf(context, chat_id, p, op_id, summary):
+async def send_transfer_pdf(context, chat_id, p, op_id, summary, caption=None):
     """PDF прихода/перемещения: позиции, количества, сроки годности."""
     rows, total = [], 0
     for it in p["items"]:
@@ -1583,7 +1583,8 @@ async def send_transfer_pdf(context, chat_id, p, op_id, summary):
         document=InputFile(pdf, filename=(
             f"приход_{safe_filename(p['wh_name'])}_"
             f"{now.strftime('%d%m%Y_%H%M')}.pdf")),
-        caption=f"📦 {summary} (операция №{op_id})")
+        caption=caption or f"📦 {summary} (операция №{op_id})",
+        parse_mode="HTML" if caption else None)
 
 
 def commit_transfer(p):
@@ -2676,16 +2677,6 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ {esc(summary)} — проведено (операция №{op_id})."
                     + esc(warn),
                     parse_mode="HTML")
-                # PDF со списком и сроками — подтвердившему и заявителю
-                # (просьба владельца 25.07.2026).
-                try:
-                    await send_transfer_pdf(context, q.message.chat.id, p,
-                                            op_id, summary)
-                    if p["chat_id"] != q.message.chat.id:
-                        await send_transfer_pdf(context, p["chat_id"], p,
-                                                op_id, summary)
-                except Exception:
-                    log.exception("Не удалось отправить PDF прихода")
                 note = ""
                 if p.get("approver_id"):
                     note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
@@ -2698,9 +2689,24 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         log.warning("Не удалось уведомить заявителя")
                 else:
                     await notify_admin(context, actor, summary)
+                # PDF со списком и сроками — в чаты-ленты складов операции
+                # (просьба владельца 25.07.2026: документ нужен в общем чате,
+                # а не в личке). Нет ленты — присылаем подтвердившему.
                 actor_name = db.get_user(p["user_id"])["name"]
-                await feed_operation(context, op_id, actor_name, "📦", note,
-                                     exclude_chat_id=p["chat_id"])
+                cap = f"📦 <b>{esc(actor_name)}</b> — {esc(summary)}"
+                if note:
+                    cap += f"\n{esc(note)}"
+                feed_chats = set()
+                for wh_id_ in filter(None, (p["wh_id"], p.get("from_wh_id"))):
+                    wh_ = db.warehouse_by_id(wh_id_)
+                    if wh_ and wh_["feed_chat_id"]:
+                        feed_chats.add(wh_["feed_chat_id"])
+                try:
+                    for chat_id_ in (feed_chats or {q.message.chat.id}):
+                        await send_transfer_pdf(context, chat_id_, p,
+                                                op_id, summary, caption=cap)
+                except Exception:
+                    log.exception("Не удалось отправить PDF прихода")
                 if p["from_wh_id"]:
                     await alert_low_stock(context, [
                         (p["from_wh_id"], it["product_id"], -it["qty"])
