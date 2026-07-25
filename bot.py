@@ -5839,7 +5839,65 @@ async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=caption[:1000])
 
 
+# Подсказки команд Telegram: при вводе «/» появляется меню, фильтруется по
+# набранным буквам. Сотрудникам — рабочий набор, админу — полный список.
+STAFF_COMMANDS = [
+    ("stock", "Остатки склада"),
+    ("stockprice", "Остатки с ценами и суммой"),
+    ("stockat", "Остатки на дату (вчера, 22.07 14:30)"),
+    ("invoices", "Накладные за период с составом"),
+    ("debts", "Долги клиентов"),
+    ("clients", "Справочник клиентов с телефонами"),
+    ("client", "Карточка клиента: /client Имя"),
+    ("act", "Акт сверки PDF: /act Имя"),
+    ("expiry", "Сроки годности по партиям"),
+    ("cash", "Касса (наличные на руках)"),
+    ("report", "Отчёт за день/неделю/месяц"),
+    ("price", "Прайс-лист"),
+    ("pricepdf", "PDF-прайс для клиентов"),
+    ("promises", "Обещания оплаты"),
+    ("undo", "Отменить последнюю операцию"),
+    ("log", "Журнал операций"),
+    ("start", "Что умеет бот"),
+]
+ADMIN_COMMANDS = STAFF_COMMANDS + [
+    ("olddebts", "Давно не платили"),
+    ("drafts", "Сводка черновиков"),
+    ("abc", "АВС-анализ товаров и клиентов"),
+    ("deadstock", "Мёртвый товар"),
+    ("forecast", "Прогноз закупки"),
+    ("export", "Excel-экспорт всего учёта"),
+    ("minstock", "Минимальные остатки"),
+    ("pricelog", "История изменения цен"),
+    ("users", "Команда и доступы"),
+    ("grant", "Сделать старшим: /grant Имя"),
+    ("access", "Дать доступ к складу"),
+    ("fullmode", "Полный режим склада"),
+    ("loadwh", "Стартовая загрузка остатков"),
+    ("resetwh", "ПОЛНЫЙ сброс склада"),
+    ("feed", "Привязать чат-ленту склада"),
+    ("warehouses", "Список складов"),
+    ("backup", "Резервная копия базы"),
+    ("dbinfo", "Состояние базы данных"),
+    ("api", "Расходы на ИИ"),
+    ("apibalance", "Остаток баланса ИИ"),
+]
+
+
+async def _setup_command_menu(app):
+    from telegram import BotCommand, BotCommandScopeChat
+    try:
+        await app.bot.set_my_commands(
+            [BotCommand(c, d) for c, d in STAFF_COMMANDS])
+        await app.bot.set_my_commands(
+            [BotCommand(c, d) for c, d in ADMIN_COMMANDS],
+            scope=BotCommandScopeChat(ADMIN_ID))
+    except Exception:
+        log.exception("Не удалось настроить меню команд")
+
+
 async def _post_init(app):
+    await _setup_command_menu(app)
     if not db_storage_persistent():
         try:
             await app.bot.send_message(
