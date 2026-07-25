@@ -997,7 +997,12 @@ def _apply_batches(conn, wh, pid, delta, plan=None):
     if not delta:
         return []
     if delta > 0:
-        rows = plan or [("", delta)]
+        rows = list(plan or [])
+        planned = sum(q for _, q in rows)
+        if planned < delta:
+            # Часть прихода без срока (или плана нет) — в партию «без срока»,
+            # чтобы сумма партий всегда равнялась остатку.
+            rows.append(("", delta - planned))
         for exp, q in rows:
             _batch_add(conn, wh, pid, exp, q)
         return [[exp, q] for exp, q in rows]

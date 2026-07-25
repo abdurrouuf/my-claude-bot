@@ -331,11 +331,15 @@ def _build_static_system() -> str:
                  '(например «Беке: Альтопен 100мл 2к», «на склад Манас: ...», '
                  '«с Бишкека на Каракол: ...», «нужно на Каракол: ...»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "transfer", "from_warehouse": null_или_имя_склада, "to_warehouse": "имя склада", '
-                 '"items": [{"name": "...", "volume": "...", "qty": штук, "box_qty": коробок_или_null, "price": цена}]}')
+                 '"items": [{"name": "...", "volume": "...", "qty": штук, "box_qty": коробок_или_null, '
+                 '"price": цена, "expiry": null_или_срок}]}')
     parts.append('- Если назван сотрудник — подставь имя склада этого сотрудника в to_warehouse '
                  '(список сотрудников и складов — в блоке ниже).')
     parts.append('- "from_warehouse" заполняй только при явном перемещении «с X на Y»; '
                  'приход товара извне (с завода/базы) — null.')
+    parts.append('- "expiry": срок годности, если указан рядом с товаром («срок 11.2028», '
+                 '«11/28», «до 12.27») — строкой в формате "MM.YYYY" (месяц двумя цифрами, '
+                 'год четырьмя); не указан — null.')
     parts.append("ВАЖНО: не путай накладную с приходом. Выбирай transfer ТОЛЬКО если есть "
                  "явные слова прихода («приход», «привезли», «пополнение», «на склад X: ...» "
                  "в начале), перемещения («с X на Y»), или первое слово — точное имя "
@@ -1507,6 +1511,21 @@ async def start_payment(update, context, actor, data):
 
 # ---------- Перемещение / приход товара ----------
 
+def _norm_expiry(raw) -> str:
+    """«11/28», «11.28», «до 12.2027» -> "MM.YYYY"; непонятное -> ""."""
+    m = re.search(r"(\d{1,2})\s*[./-]\s*(\d{2,4})", str(raw or ""))
+    if not m:
+        return ""
+    mm, year = int(m.group(1)), int(m.group(2))
+    if not 1 <= mm <= 12:
+        return ""
+    if year < 100:
+        year += 2000
+    if not 2000 <= year <= 2099:
+        return ""
+    return f"{mm:02d}.{year}"
+
+
 def transfer_summary(p) -> str:
     header = "📦 <b>Приход товара</b>" if not p["from_wh_id"] else "📦 <b>Перемещение товара</b>"
     lines = [header]
@@ -1518,7 +1537,8 @@ def transfer_summary(p) -> str:
     lines.append("")
     for i, it in enumerate(p["items"], 1):
         box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
-        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт")
+        exp = f" · срок {it['expiry']}" if it.get("expiry") else ""
+        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт{exp}")
     warns = list(p["warnings"])
     if p["from_wh_id"]:
         for it in p["items"]:
@@ -1537,23 +1557,33 @@ def transfer_summary(p) -> str:
 
 
 def commit_transfer(p):
-    stock_deltas = []
+    # Дельты по товару агрегируются (товар мог идти несколькими строками с
+    # разными сроками), а сроки прихода уходят планом партий получателя.
+    dest, src, plan = {}, {}, {}
     for it in p["items"]:
-        if not it.get("product_id"):
+        pid = it.get("product_id")
+        if not pid:
             continue
-        stock_deltas.append((p["wh_id"], it["product_id"], it["qty"]))
+        dest[pid] = dest.get(pid, 0) + it["qty"]
         if p["from_wh_id"]:
-            stock_deltas.append((p["from_wh_id"], it["product_id"], -it["qty"]))
+            src[pid] = src.get(pid, 0) + it["qty"]
+        if it.get("expiry"):
+            plan.setdefault((p["wh_id"], pid), []).append((it["expiry"], it["qty"]))
+    stock_deltas = [(p["wh_id"], pid, q) for pid, q in dest.items()]
+    stock_deltas += [(p["from_wh_id"], pid, -q) for pid, q in src.items()]
     n = len(p["items"])
     if p["from_wh_id"]:
         summary = f"Перемещение: {p['from_wh_name']} → {p['wh_name']} ({n} поз.)"
     else:
         summary = f"Приход товара на склад {p['wh_name']} ({n} поз.)"
-    extra = {"items": [{k: it[k] for k in ("name", "volume", "qty", "box_qty")} for it in p["items"]]}
+    extra = {"items": [{k: it.get(k) for k in ("name", "volume", "qty",
+                                               "box_qty", "expiry")}
+                       for it in p["items"]]}
     if p.get("approver_id"):
         extra["approved_by"] = p["approver_id"]
     op_id, _ = db.commit_operation(
         p["user_id"], "transfer", p["wh_id"], None, summary, stock_deltas, [], extra,
+        batch_plan=plan or None,
     )
     return op_id, summary
 
@@ -1593,6 +1623,13 @@ async def start_transfer(update, context, actor, data):
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
+    # Сроки годности прихода: parse_items их не знает — переносим из
+    # исходных позиций (порядок совпадает) с нормализацией «11/28» и т.п.
+    for it, raw in zip(items, data.get("items") or []):
+        if isinstance(raw, dict) and raw.get("expiry"):
+            exp = _norm_expiry(raw["expiry"])
+            if exp:
+                it["expiry"] = exp
     matched = [it for it in items if it.get("product_id")]
     if not matched:
         await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу — приход не создан.")
