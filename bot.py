@@ -810,6 +810,14 @@ def commit_invoice(p, replace_op_id=None):
         "items": [{k: it[k] for k in ("name", "volume", "qty", "price", "box_qty")} for it in p["items"]],
         "total": total, "payment": p["payment"], "old_debt": old_debt,
     }
+    # Выбор партий продавцом (кнопки «какую партию продать?»): пустой выбор
+    # или его отсутствие = «сначала старые» (FEFO внутри _apply_batches).
+    batch_plan = {}
+    for i, it in enumerate(p["items"]):
+        exp = (p.get("batch_choices") or {}).get(str(i))
+        if exp and it.get("product_id"):
+            batch_plan.setdefault((p["wh_id"], it["product_id"]), []).append(
+                (exp, it["qty"]))
     if replace_op_id:
         op_id, _ = db.replace_operation(
             replace_op_id, p.get("op_user_id") or p["user_id"], "invoice",
@@ -819,6 +827,7 @@ def commit_invoice(p, replace_op_id=None):
         op_id, _ = db.commit_operation(
             p["user_id"], "invoice", p["wh_id"], cid, summary,
             stock_deltas, [(cid, debt_delta)], extra, create_client=create,
+            batch_plan=batch_plan or None,
         )
     return op_id, client_label, old_debt, total, summary
 
@@ -2250,6 +2259,70 @@ async def minstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Кнопки ----------
 
+def _batch_questions(p):
+    """Позиции накладной, для которых нужно спросить партию: у товара
+    несколько партий с разными сроками, а выбор ещё не сделан."""
+    need = []
+    choices = p.get("batch_choices") or {}
+    for i, it in enumerate(p["items"]):
+        pid = it.get("product_id")
+        if not pid or str(i) in choices:
+            continue
+        batches = db.product_batches_of(p["wh_id"], pid)
+        if len(batches) > 1:
+            need.append((i, it, batches))
+    return need
+
+
+async def _ask_batch(q, p, question):
+    """Кнопки «какую партию продать?» для одной позиции накладной."""
+    i, it, batches = question
+    token = new_pending(p)
+    kb = [[InlineKeyboardButton(f"📅 до {b['expiry']} — {b['qty']} шт",
+                                callback_data=f"pbat:{token}:{i}:{bi}")]
+          for bi, b in enumerate(batches)]
+    kb.append([InlineKeyboardButton(f"🔀 Сначала старые (до {batches[0]['expiry']})",
+                                    callback_data=f"pbat:{token}:{i}:fefo")])
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+    await q.edit_message_text(
+        f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
+        "На складе несколько партий с разными сроками. Из какой партии "
+        "продаёте?",
+        parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+async def _finish_invoice(q, context, actor, p):
+    """Проведение накладной после всех проверок и выбора партий."""
+    if p.get("client_id") is None:
+        # Клиент мог появиться, пока заявка ждала кнопки (вторая
+        # накладная, add_clients) — иначе INSERT упадёт по UNIQUE.
+        existing = db.client_exact(p["wh_id"], p.get("client_name") or "")
+        if existing is not None:
+            p["client_id"] = existing["id"]
+    op_id, client_label, old_debt, total, summary = commit_invoice(p)
+    await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
+    if p.get("approver_id"):
+        try:
+            await context.bot.send_message(
+                p["chat_id"],
+                f"✅ Админ подтвердил накладную №{op_id} новому клиенту "
+                f"«{esc(client_label)}».", parse_mode="HTML")
+        except Exception:
+            log.warning("Не удалось уведомить заявителя о накладной")
+    await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
+    await notify_admin(context, actor, summary)
+    # В ленту склада — только PDF со сводкой в подписи (без
+    # отдельного текстового сообщения, просьба владельца 21.07.2026).
+    actor_name = db.get_user(p["user_id"])["name"]
+    await feed_invoice_pdf(
+        context, p["wh_id"], client_label, p, old_debt, total,
+        caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}",
+        exclude_chat_id=p["chat_id"])
+    await alert_low_stock(context, [
+        (p["wh_id"], it["product_id"], -it["qty"])
+        for it in p["items"] if it.get("product_id")])
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     actor = db.get_user(q.from_user.id)
@@ -2457,6 +2530,36 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await q.edit_message_text(invoice_summary(p), parse_mode="HTML", reply_markup=confirm_kb(token))
         return
 
+    if kind == "pbat":  # выбор партии (срока годности) для позиции накладной
+        PENDING.pop(token, None)
+        await q.answer()
+        try:
+            idx = parts[2]
+            item = p["items"][int(idx)]
+        except (ValueError, IndexError):
+            await q.edit_message_text("⌛ Заявка устарела — отправьте накладную заново.")
+            return
+        choices = p.setdefault("batch_choices", {})
+        choice = parts[3] if len(parts) > 3 else "fefo"
+        if choice == "fefo":
+            choices[idx] = ""   # пусто = «сначала старые» (FEFO)
+        else:
+            batches = db.product_batches_of(p["wh_id"], item.get("product_id") or 0)
+            try:
+                choices[idx] = batches[int(choice)]["expiry"]
+            except (ValueError, IndexError):
+                choices[idx] = ""
+        need = _batch_questions(p)
+        if need:
+            await _ask_batch(q, p, need[0])
+            return
+        try:
+            await _finish_invoice(q, context, actor, p)
+        except Exception as e:
+            log.exception("Ошибка проведения накладной после выбора партии")
+            await q.edit_message_text(f"⚠️ Ошибка при проведении: {e}")
+        return
+
     if kind == "ok":
         PENDING.pop(token, None)  # сразу, чтобы не провести дважды
         await q.answer()
@@ -2466,34 +2569,14 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if lack:
                     await q.edit_message_text(lack_message(lack), parse_mode="HTML")
                     return
-                if p.get("client_id") is None:
-                    # Клиент мог появиться, пока заявка ждала кнопки (вторая
-                    # накладная, add_clients) — иначе INSERT упадёт по UNIQUE.
-                    existing = db.client_exact(p["wh_id"], p.get("client_name") or "")
-                    if existing is not None:
-                        p["client_id"] = existing["id"]
-                op_id, client_label, old_debt, total, summary = commit_invoice(p)
-                await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
-                if p.get("approver_id"):
-                    try:
-                        await context.bot.send_message(
-                            p["chat_id"],
-                            f"✅ Админ подтвердил накладную №{op_id} новому клиенту "
-                            f"«{esc(client_label)}».", parse_mode="HTML")
-                    except Exception:
-                        log.warning("Не удалось уведомить заявителя о накладной")
-                await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
-                await notify_admin(context, actor, summary)
-                # В ленту склада — только PDF со сводкой в подписи (без
-                # отдельного текстового сообщения, просьба владельца 21.07.2026).
-                actor_name = db.get_user(p["user_id"])["name"]
-                await feed_invoice_pdf(
-                    context, p["wh_id"], client_label, p, old_debt, total,
-                    caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}",
-                    exclude_chat_id=p["chat_id"])
-                await alert_low_stock(context, [
-                    (p["wh_id"], it["product_id"], -it["qty"])
-                    for it in p["items"] if it.get("product_id")])
+                # У товара несколько партий с разными сроками — спрашиваем,
+                # какую продать (просьба владельца 25.07.2026: сотрудник мог
+                # физически взять новую партию, FEFO молча списал бы старую).
+                need = _batch_questions(p)
+                if need:
+                    await _ask_batch(q, p, need[0])
+                    return
+                await _finish_invoice(q, context, actor, p)
             elif p["kind"] == "payment":
                 op_id, client_label, old_debt, summary = commit_payment(p)
                 await q.edit_message_text(
