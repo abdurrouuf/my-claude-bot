@@ -3989,8 +3989,12 @@ async def invoices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             except (ValueError, TypeError):
                 data = {}
             client = db.client_get(op["client_id"]) if op["client_id"] else None
-            goods = [f"{it.get('name')} {it.get('volume')} — {it.get('qty')} шт"
-                     for it in data.get("items", [])]
+            # Короткое имя (без состава в скобках) + неразрывные пробелы,
+            # чтобы «— 5 шт» не отрывалось на следующую строку.
+            goods = [
+                f"{str(it.get('name') or '').split('(')[0].strip()} "
+                f"{it.get('volume')} — {it.get('qty')} шт"
+                for it in data.get("items", [])]
             amount = data.get("total") or 0
             paid = data.get("payment") or 0
             total_sum += amount
