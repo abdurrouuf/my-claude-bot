@@ -157,7 +157,15 @@ def generate_report_pdf(title: str, subtitle: str, sections: list,
                 widths = [10] + list(widths)
         data = [[Paragraph(xml_escape(h), head_style) for h in headers]]
         for row in rows:
-            data.append([Paragraph(xml_escape(str(c)), cell_style) for c in row])
+            cells = []
+            for c in row:
+                if isinstance(c, (list, tuple)):
+                    # Список в ячейке = многострочный текст (позиции накладной)
+                    text = "<br/>".join(xml_escape(str(x)) for x in c)
+                else:
+                    text = xml_escape(str(c))
+                cells.append(Paragraph(text, cell_style))
+            data.append(cells)
         col_widths = [w * mm for w in widths] if widths else None
         table = Table(data, colWidths=col_widths, repeatRows=1)
         table.setStyle(TableStyle([
