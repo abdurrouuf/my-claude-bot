@@ -1556,6 +1556,36 @@ def transfer_summary(p) -> str:
     return "\n".join(lines)
 
 
+async def send_transfer_pdf(context, chat_id, p, op_id, summary):
+    """PDF прихода/перемещения: позиции, количества, сроки годности."""
+    rows, total = [], 0
+    for it in p["items"]:
+        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        rows.append([it["name"], it["volume"], f"{box}{it['qty']} шт",
+                     it.get("expiry") or "—"])
+        total += it["qty"]
+    if p.get("from_wh_id"):
+        title = "ПЕРЕМЕЩЕНИЕ ТОВАРА"
+        where = f"{p['from_wh_name']} → {p['wh_name']}"
+    else:
+        title = "ПРИХОД ТОВАРА"
+        where = f"склад «{p['wh_name']}»"
+    now = datetime.now(BISHKEK)
+    pdf = generate_report_pdf(
+        title,
+        f"ОсОО «ВЕТОП» · {where} · {now.strftime('%d.%m.%Y %H:%M')} · "
+        f"операция №{op_id}",
+        [{"headers": ["Товар", "Фасовка", "Количество", "Срок годности"],
+          "rows": rows, "widths": [82, 26, 32, 27], "numbered": True,
+          "footer": f"Итого: {len(rows)} позиций · {fmt_num(total)} шт"}])
+    await context.bot.send_document(
+        chat_id=chat_id,
+        document=InputFile(pdf, filename=(
+            f"приход_{safe_filename(p['wh_name'])}_"
+            f"{now.strftime('%d%m%Y_%H%M')}.pdf")),
+        caption=f"📦 {summary} (операция №{op_id})")
+
+
 def commit_transfer(p):
     # Дельты по товару агрегируются (товар мог идти несколькими строками с
     # разными сроками), а сроки прихода уходят планом партий получателя.
@@ -2646,6 +2676,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"✅ {esc(summary)} — проведено (операция №{op_id})."
                     + esc(warn),
                     parse_mode="HTML")
+                # PDF со списком и сроками — подтвердившему и заявителю
+                # (просьба владельца 25.07.2026).
+                try:
+                    await send_transfer_pdf(context, q.message.chat.id, p,
+                                            op_id, summary)
+                    if p["chat_id"] != q.message.chat.id:
+                        await send_transfer_pdf(context, p["chat_id"], p,
+                                                op_id, summary)
+                except Exception:
+                    log.exception("Не удалось отправить PDF прихода")
                 note = ""
                 if p.get("approver_id"):
                     note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
