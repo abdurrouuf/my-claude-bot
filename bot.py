@@ -3992,9 +3992,9 @@ async def invoices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # Короткое имя (без состава в скобках) + неразрывные пробелы,
             # чтобы «— 5 шт» не отрывалось на следующую строку.
             goods = [
-                f"{str(it.get('name') or '').split('(')[0].strip()} "
+                f"{j}. {str(it.get('name') or '').split('(')[0].strip()} "
                 f"{it.get('volume')} — {it.get('qty')} шт"
-                for it in data.get("items", [])]
+                for j, it in enumerate(data.get("items", []), 1)]
             amount = data.get("total") or 0
             paid = data.get("payment") or 0
             total_sum += amount
