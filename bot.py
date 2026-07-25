@@ -3953,6 +3953,82 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption="\n".join(summary))
 
 
+async def invoices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Накладные за период с составом: /invoices [Склад] [день|неделя|месяц]."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    args = list(context.args or [])
+    days_back, label = 0, "за сегодня"
+    if args and args[-1].lower() in PERIODS:
+        days_back, label = PERIODS[args[-1].lower()]
+        args = args[:-1]
+    wh_name = " ".join(args).strip()
+    if wh_name and wh_name.lower() != "all":
+        wh = db.warehouse_by_name(wh_name)
+        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(wh_name)}» не найден или нет доступа.", parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    now = datetime.now(BISHKEK)
+    start = (now - timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    ops = [op for op in db.operations_since(start.isoformat(timespec="seconds"))
+           if op["type"] == "invoice" and op["status"] == "done"]
+    sections, summary = [], []
+    for wh in whs:
+        rows, total_sum, total_paid = [], 0.0, 0.0
+        for op in ops:
+            if op["warehouse_id"] != wh["id"]:
+                continue
+            try:
+                data = json.loads(op["data"])
+            except (ValueError, TypeError):
+                data = {}
+            client = db.client_get(op["client_id"]) if op["client_id"] else None
+            goods = "; ".join(
+                f"{it.get('name')} {it.get('volume')} — {it.get('qty')} шт"
+                for it in data.get("items", []))
+            amount = data.get("total") or 0
+            paid = data.get("payment") or 0
+            total_sum += amount
+            total_paid += paid
+            try:
+                ts = datetime.fromisoformat(op["ts"]).strftime("%d.%m %H:%M")
+            except ValueError:
+                ts = op["ts"]
+            money_cell = fmt_num(amount)
+            if paid:
+                money_cell += f" (опл. {fmt_num(paid)})"
+            rows.append([f"№{op['id']} · {ts}",
+                         client["name"] if client else "—", goods, money_cell])
+        if not rows:
+            summary.append(f"🧾 «{wh['name']}»: накладных {label} нет")
+            continue
+        sections.append({
+            "title": f"Склад «{wh['name']}»",
+            "headers": ["Накладная", "Клиент", "Товары", "Сумма"],
+            "rows": rows, "widths": [26, 32, 80, 29], "numbered": True,
+            "footer": (f"Накладных: {len(rows)} · на {money(total_sum)}"
+                       + (f" · оплачено сразу {money(total_paid)}"
+                          if total_paid else "")),
+        })
+        summary.append(f"🧾 «{wh['name']}»: {len(rows)} накладных "
+                       f"на {money(total_sum)}")
+    if not sections:
+        await update.message.reply_text("\n".join(summary) or "Накладных нет.")
+        return
+    pdf = generate_report_pdf(
+        "НАКЛАДНЫЕ", f"ОсОО «ВЕТОП» · {label} · на {now.strftime('%d.%m.%Y %H:%M')}",
+        sections)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"накладные_{now.strftime('%d%m%Y')}.pdf"),
+        caption="\n".join(summary) + "\nОтменить накладную: /undo Номер (админ)")
+
+
 async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Полный справочник клиентов склада (включая нулевые долги) — PDF."""
     actor = await get_actor(update)
@@ -5797,6 +5873,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stockat", stockat_cmd))
     app.add_handler(CommandHandler("debts", show_debts))
     app.add_handler(CommandHandler("clients", clients_cmd))
+    app.add_handler(CommandHandler("invoices", invoices_cmd))
     app.add_handler(CommandHandler("payment", payment_cmd))
     app.add_handler(CommandHandler("invoice", invoice_hint))
     app.add_handler(CommandHandler("draft", draft_cmd))
