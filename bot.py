@@ -811,7 +811,9 @@ def commit_invoice(p, replace_op_id=None):
     if p["payment"]:
         summary += f", приход {fmt_num(p['payment'])} сом"
     extra = {
-        "items": [{k: it[k] for k in ("name", "volume", "qty", "price", "box_qty")} for it in p["items"]],
+        "items": [{**{k: it[k] for k in ("name", "volume", "qty", "price",
+                                         "box_qty")},
+                   "product_id": it.get("product_id")} for it in p["items"]],
         "total": total, "payment": p["payment"], "old_debt": old_debt,
     }
     # Выбор партий продавцом (кнопки «какую партию продать?»): пустой выбор
@@ -1617,7 +1619,8 @@ def commit_transfer(p):
     else:
         summary = f"Приход товара на склад {p['wh_name']} ({n} поз.)"
     extra = {"items": [{k: it.get(k) for k in ("name", "volume", "qty",
-                                               "box_qty", "expiry")}
+                                               "box_qty", "expiry",
+                                               "product_id")}
                        for it in p["items"]]}
     if p.get("approver_id"):
         extra["approved_by"] = p["approver_id"]
@@ -5143,9 +5146,33 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         info.append(["Клиент", client["name"]])
     info.append(["Сводка", op["summary"]])
     bd = data.get("batch_deltas") or []
-    parts_ = [f"{exp or 'без срока'}: {chg:+d} шт" for _, _, exp, chg in bd]
-    if parts_:
-        info.append(["Партии", ", ".join(parts_)])
+    # Партии показываем в строке товара (колонка «Срок»), а не отдельной
+    # кучей (просьба владельца 26.07.2026). Списания (продажа/перемещение)
+    # приоритетнее приходов; товар находим по product_id, для старых
+    # записей — по названию и фасовке из прайса.
+    bd_by_pid = {}
+    for _, pid_, exp_, chg_ in bd:
+        if chg_ < 0:
+            bd_by_pid.setdefault(pid_, []).append((exp_, -chg_))
+    if not bd_by_pid:
+        for _, pid_, exp_, chg_ in bd:
+            if chg_ > 0 and exp_:
+                bd_by_pid.setdefault(pid_, []).append((exp_, chg_))
+    name_to_pid = {(pr["name"], pr["volume"]): pr["id"]
+                   for pr in prices.PRICE_LIST_DATA}
+    embedded = set()
+
+    def _item_expiry_cell(it):
+        pid_ = it.get("product_id") or name_to_pid.get(
+            (str(it.get("name") or ""), str(it.get("volume") or "")))
+        rows_ = bd_by_pid.get(pid_)
+        if rows_:
+            embedded.add(pid_)
+            if len(rows_) == 1:
+                return rows_[0][0] or "без срока"
+            return ", ".join(f"{e or 'без срока'} — {q_} шт" for e, q_ in rows_)
+        return it.get("expiry") or "—"
+
     sections = [{"headers": ["Параметр", "Значение"],
                  "rows": info, "widths": [38, 139]}]
     items = data.get("items") or []
@@ -5158,7 +5185,13 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 name, str(it.get("volume") or ""), f"{it.get('qty')} шт",
                 fmt_num(price) if price is not None else "—",
                 fmt_num((it.get("qty") or 0) * price) if price is not None else "—",
-                it.get("expiry") or "—"])
+                _item_expiry_cell(it)])
+        if set(bd_by_pid) - embedded:
+            # Партии, не привязавшиеся к строкам (старые записи), — в шапку
+            info.append(["Партии", ", ".join(
+                f"{e or 'без срока'}: {q_} шт"
+                for pid_ in set(bd_by_pid) - embedded
+                for e, q_ in bd_by_pid[pid_])])
         footer = ""
         if data.get("total") is not None:
             footer = f"Итого: {money(data['total'])}"
