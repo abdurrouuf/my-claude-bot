@@ -5100,6 +5100,74 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long(update.message, "\n".join(lines))
 
 
+async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Детали операции по номеру: /op 26 (сотрудник — только свои)."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    try:
+        op_id = int(context.args[0])
+    except (IndexError, ValueError, TypeError):
+        await update.message.reply_text(
+            "Укажите номер операции: /op 26\nНомера смотрите в /log или /invoices")
+        return
+    op = db.get_operation(op_id)
+    if op is None or (not is_admin(actor) and op["user_id"] != actor["id"]):
+        await update.message.reply_text(
+            f"Операция №{op_id} не найдена"
+            + ("" if is_admin(actor) else " среди ваших операций") + ".")
+        return
+    try:
+        data = json.loads(op["data"])
+    except (ValueError, TypeError):
+        data = {}
+    u = db.get_user(op["user_id"])
+    wh = db.warehouse_by_id(op["warehouse_id"]) if op["warehouse_id"] else None
+    client = db.client_get(op["client_id"]) if op["client_id"] else None
+    try:
+        ts = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y %H:%M")
+    except ValueError:
+        ts = op["ts"]
+    icon = LOG_TYPE_ICONS.get(op["type"], "▫️")
+    lines = [f"{icon} <b>Операция №{op['id']}</b>"
+             + (" · <b>❌ ОТМЕНЕНА</b>" if op["status"] == "cancelled" else ""),
+             f"🕒 {ts} · ✍️ {esc(u['name'] if u else str(op['user_id']))}"]
+    if wh:
+        lines.append(f"🏬 Склад: {esc(wh['name'])}")
+    if client:
+        lines.append(f"👤 Клиент: {esc(client['name'])}")
+    lines.append(f"📄 {esc(op['summary'])}")
+    items = data.get("items") or []
+    if items:
+        lines.append("")
+        lines.append("<b>Состав:</b>")
+        for j, it in enumerate(items, 1):
+            name = str(it.get("name") or "").split("(")[0].strip()
+            row = f"{j}. {esc(name)} {esc(str(it.get('volume') or ''))} — {it.get('qty')} шт"
+            if it.get("price") is not None:
+                row += (f" × {fmt_num(it['price'])}"
+                        f" = {fmt_num((it.get('qty') or 0) * it['price'])}")
+            if it.get("expiry"):
+                row += f" · срок {it['expiry']}"
+            lines.append(row)
+    if data.get("total") is not None:
+        lines.append("")
+        lines.append(f"💵 Сумма: <b>{money(data['total'])}</b>")
+        if data.get("payment"):
+            lines.append(f"✅ Оплачено сразу: {money(data['payment'])}")
+    elif data.get("amount") is not None:
+        lines.append("")
+        lines.append(f"💵 Сумма: <b>{money(data['amount'])}</b>")
+    bd = data.get("batch_deltas") or []
+    parts_ = [f"{exp or 'без срока'}: {chg:+d}" for _, _, exp, chg in bd]
+    if parts_:
+        lines.append("📅 Партии: " + esc(", ".join(parts_)))
+    if op["status"] != "cancelled" and is_admin(actor):
+        lines.append("")
+        lines.append(f"Отменить: /undo {op['id']}")
+    await send_long(update.message, "\n".join(lines))
+
+
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
@@ -5915,6 +5983,7 @@ STAFF_COMMANDS = [
     ("promises", "Обещания оплаты"),
     ("undo", "Отменить последнюю операцию"),
     ("log", "Журнал операций"),
+    ("op", "Детали операции: /op 26"),
     ("start", "Что умеет бот"),
 ]
 ADMIN_COMMANDS = STAFF_COMMANDS + [
@@ -6018,6 +6087,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("expiry", expiry_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
+    app.add_handler(CommandHandler("op", op_cmd))
     app.add_handler(CommandHandler("undo", undo_cmd))
     app.add_handler(CommandHandler("add", add_user_cmd))
     app.add_handler(CommandHandler("remove", remove_user_cmd))
