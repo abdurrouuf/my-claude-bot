@@ -5171,7 +5171,9 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             embedded.add(pid_)
             if len(rows_) == 1:
                 return rows_[0][0] or "без срока"
-            return ", ".join(f"{e or 'без срока'} — {q_} шт" for e, q_ in rows_)
+            # Каждая партия своей строкой, «05.2028 — 15 шт» неразрывно
+            return [f"{e or 'без срока'} — {q_} шт"
+                    for e, q_ in rows_]
         return it.get("expiry") or "—"
 
     sections = [{"headers": ["Параметр", "Значение"],
@@ -5201,7 +5203,7 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         sections.append({"title": "Состав",
                          "headers": ["Товар", "Фасовка", "Кол-во", "Цена",
                                      "Сумма", "Срок"],
-                         "rows": rows, "widths": [55, 22, 18, 18, 22, 22],
+                         "rows": rows, "widths": [46, 20, 18, 16, 21, 36],
                          "numbered": True, "footer": footer})
     elif data.get("amount") is not None:
         sections[0]["rows"].append(["Сумма", money(data["amount"])])
