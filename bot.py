@@ -422,9 +422,12 @@ def _build_static_system() -> str:
                  'верни ТОЛЬКО JSON:')
     parts.append('{"action": "return", "client": "Имя", "warehouse": null, '
                  '"items": [{"name": "точное название из прайса", "volume": "фасовка", '
-                 '"qty": штук, "box_qty": коробок_или_null, "price": цена, "price_explicit": false}]}')
+                 '"qty": штук, "box_qty": коробок_или_null, "price": цена, '
+                 '"price_explicit": false, "expiry": null_или_срок}]}')
     parts.append('- price бери из прайса; если сотрудник сам явно написал цену возврата '
                  '(например «по 85») — поставь её и "price_explicit": true.')
+    parts.append('- "expiry": срок годности, если указан рядом с товаром '
+                 '(«срок 11.2028», «11/28») — строкой "MM.YYYY"; нет — null.')
     parts.append('- Коробки переводи в штуки как обычно. Возврат подтверждает админ.')
     parts.append("")
     parts.append("=== РЕЖИМ 10: ТЕЛЕФОН КЛИЕНТА ===")
@@ -1372,23 +1375,53 @@ def return_summary(p) -> str:
     return "\n".join(lines)
 
 
+def _arrival_batch_plan(wh_id, items):
+    """План партий для прихода (возврат, плюс инвентаризации): явный срок
+    позиции, иначе ближайшая существующая датированная партия товара —
+    товар не проваливается в партию «без срока» и остаётся виден в /expiry."""
+    plan = {}
+    for it in items:
+        pid, qty = it.get("product_id"), it.get("qty") or 0
+        if not pid or qty <= 0:
+            continue
+        exp = it.get("expiry")
+        if not exp:
+            dated = [b for b in db.product_batches_of(wh_id, pid)
+                     if b["expiry"]]
+            exp = dated[0]["expiry"] if dated else ""
+        if exp:
+            plan.setdefault((wh_id, pid), []).append((exp, qty))
+    return plan
+
+
 def commit_return(p):
     c = db.client_get(p["client_id"])
+    if c is None:
+        raise ValueError("клиент не найден — возможно, справочник сбрасывали")
     old_debt = c["debt"]
     total = sum(it["qty"] * it["price"] for it in p["items"])
-    stock_deltas = [(p["wh_id"], it["product_id"], it["qty"])
-                    for it in p["items"] if it.get("product_id")]
+    # Дельты по товару агрегируются (план партий применяется один раз)
+    qty_by_pid = {}
+    for it in p["items"]:
+        if it.get("product_id"):
+            qty_by_pid[it["product_id"]] = (qty_by_pid.get(it["product_id"], 0)
+                                            + it["qty"])
+    stock_deltas = [(p["wh_id"], pid, q) for pid, q in qty_by_pid.items()]
+    batch_plan = _arrival_batch_plan(p["wh_id"], p["items"])
     summary = f"Возврат: {c['name']} — {fmt_num(total)} сом (склад {p['wh_name']})"
     extra = {
-        "items": [{k: it[k] for k in ("name", "volume", "qty", "price", "box_qty")}
-                  for it in p["items"]],
+        "items": [{**{k: it[k] for k in ("name", "volume", "qty", "price",
+                                         "box_qty")},
+                   "product_id": it.get("product_id"),
+                   "expiry": it.get("expiry")} for it in p["items"]],
         "total": total, "old_debt": old_debt,
     }
     if p.get("approver_id"):
         extra["approved_by"] = p["approver_id"]
     op_id, _ = db.commit_operation(
         p["user_id"], "return", p["wh_id"], p["client_id"], summary,
-        stock_deltas, [(p["client_id"], -total)], extra)
+        stock_deltas, [(p["client_id"], -total)], extra,
+        batch_plan=batch_plan or None)
     return op_id, c["name"], old_debt, total, summary
 
 
@@ -1422,6 +1455,12 @@ async def start_return(update, context, actor, data):
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
+    # Срок годности возврата, если указан («срок 11.2028») — как у прихода
+    for it, raw in zip(items, data.get("items") or []):
+        if isinstance(raw, dict) and raw.get("expiry"):
+            exp = _norm_expiry(raw["expiry"])
+            if exp:
+                it["expiry"] = exp
 
     payload = {
         "kind": "return", "user_id": actor["id"], "chat_id": update.effective_chat.id,
@@ -2213,12 +2252,18 @@ def commit_inventory(p):
                            "base": base, "fact": it["fact"]})
     if not stock_deltas:
         return None, "расхождений уже нет"
+    # Плюсовые корректировки прикладываем к ближайшей датированной партии
+    # товара (не в «без срока»); минусовые спишутся FEFO как обычно.
+    batch_plan = _arrival_batch_plan(
+        p["wh_id"], [{"product_id": pid, "qty": d}
+                     for _, pid, d in stock_deltas if d > 0])
     summary = f"Инвентаризация: склад {p['wh_name']} ({len(stock_deltas)} корректир.)"
     extra = {"items": detail}
     if p.get("approver_id"):
         extra["approved_by"] = p["approver_id"]
     op_id, _ = db.commit_operation(
-        p["user_id"], "inventory", p["wh_id"], None, summary, stock_deltas, [], extra)
+        p["user_id"], "inventory", p["wh_id"], None, summary, stock_deltas, [],
+        extra, batch_plan=batch_plan or None)
     return op_id, summary
 
 
