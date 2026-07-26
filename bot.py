@@ -45,10 +45,11 @@ DRAFT_WATERMARK = os.environ.get("DRAFT_WATERMARK", "0") == "1"
 TRANSITION_MODE = os.environ.get("TRANSITION_MODE", "1") == "1"
 
 TRANSITION_HINT = (
-    "⏳ Идёт настройка базы данных — эта операция пока недоступна.\n\n"
-    "А вот накладные выписывать можно — просто напишите как обычно:\n"
+    "⏳ Ваш склад пока работает в режиме черновиков — эта операция для него "
+    "недоступна.\n\n"
+    "Накладные выписывать можно — просто напишите как обычно:\n"
     "Асан, Албенивер 200мл 1к, долг 31470, приход 5000\n\n"
-    "Придёт готовая PDF-накладная, ничего в базу не запишется."
+    "Придёт готовая PDF-накладная, остатки и долги не изменятся."
 )
 
 
@@ -114,6 +115,31 @@ anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
 
 chat_histories = {}
 HISTORY_LIMIT = 10  # история пересылается с каждым запросом — короче = дешевле
+# Старые сообщения истории режутся до этого размера: полный JSON накладной
+# на 20 позиций весит ~1000 токенов и был главным пожирателем баланса
+# (~46% стоимости запроса по аудиту 27.07.2026). Текущее сообщение
+# пользователя уходит целиком — режется только прошлое.
+HISTORY_MSG_MAX = 700
+
+
+def _request_history(chat_id) -> list:
+    """Окно истории для запроса к ИИ.
+
+    - Начинается с user-сообщения: срез [-10:] мог начинаться с ответа
+      ассистента, а Messages API требует первым user — каждый второй запрос
+      в длинном диалоге падал с 400 (баг найден аудитом 27.07.2026).
+    - Все сообщения, кроме последнего (текущего), обрезаются до
+      HISTORY_MSG_MAX символов — для контекста хватает начала."""
+    h = chat_histories.get(chat_id, [])[-HISTORY_LIMIT:]
+    while h and h[0]["role"] != "user":
+        h = h[1:]
+    out = []
+    for i, m in enumerate(h):
+        c = m["content"]
+        if i < len(h) - 1 and isinstance(c, str) and len(c) > HISTORY_MSG_MAX:
+            c = c[:HISTORY_MSG_MAX] + " …[обрезано]"
+        out.append({"role": m["role"], "content": c})
+    return out
 
 # Неподтверждённые заявки (накладные/приходы/перемещения) до нажатия кнопки.
 PENDING = {}
@@ -201,11 +227,13 @@ def new_pending(payload: dict, ttl: int = PENDING_TTL) -> str:
         PENDING.pop(k, None)
     # Одинаковое сообщение, отправленное дважды (двойное касание, повтор
     # голосового), создавало ДВЕ живые карточки — нажатие обеих задваивало
-    # операцию. Новая идентичная заявка гасит старую: её кнопка ответит
-    # «Заявка устарела».
+    # операцию. Новая идентичная заявка гасит старую, но только СВЕЖУЮ
+    # (окно 2 минуты): «сдал 5000» утром и «сдал 5000» вечером — это две
+    # настоящие операции, старая заявка должна жить.
     key = _pending_key(payload)
     if key is not None:
-        for k in [k for k, v in PENDING.items() if _pending_key(v) == key]:
+        for k in [k for k, v in PENDING.items()
+                  if now - v["created"] < 120 and _pending_key(v) == key]:
             PENDING.pop(k, None)
     token = secrets.token_hex(6)
     payload["created"] = now
@@ -229,6 +257,20 @@ def confirm_kb(token: str) -> InlineKeyboardMarkup:
         InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
         InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}"),
     ]])
+
+
+async def _require_private(update) -> bool:
+    """Отчёты с чувствительными данными (телефоны, долги, кассы, журнал) —
+    только в личке: в группе PDF увидели бы все участники чата, в том числе
+    по чужим складам (аудит 27.07.2026). True = можно продолжать."""
+    if update.effective_chat and update.effective_chat.type != "private":
+        try:
+            await update.message.reply_text(
+                "🔒 Эта команда работает в личке с ботом — напишите мне напрямую.")
+        except Exception:
+            pass
+        return False
+    return True
 
 
 async def notify_admin(context, actor_row, text: str):
@@ -470,6 +512,12 @@ def _build_static_system() -> str:
                  'где <Имя> — имя СОТРУДНИКА (из списка сотрудников в динамическом '
                  'блоке), добавь в JSON действия поле "as_employee": "<Имя>". '
                  'В остальных случаях это поле не добавляй.')
+    parts.append('- В динамическом блоке будет список «Известные клиенты». '
+                 'Сообщения часто приходят из распознавания голоса с ошибками '
+                 'в именах: если имя клиента в сообщении созвучно одному из '
+                 'списка — подставь точное имя из списка. Если не похоже ни '
+                 'на одно — это новый клиент: оформляй с именем как есть, '
+                 'НЕ спрашивай подтверждения и не проверяй существование.')
     parts.append("")
     parts.append("ПРАЙС-ЛИСТ (формат: №. Название | Фасовка | шт/кор | цена):")
     parts.append(prices.PRICE_LIST_TEXT)
@@ -495,15 +543,20 @@ def _refresh_price_dependents():
 
 # Известные клиенты дёргаются на каждое сообщение (фильтр чатов складов,
 # динамический промпт) — а данные меняются редко. Кэш на 2 минуты.
-_KNOWN_CLIENTS_CACHE = {"ts": 0.0, "names": []}
+_KNOWN_CLIENTS_CACHE = {"ts": 0.0, "data": {}}
 
 
-def known_clients_cached(limit: int) -> list:
+def known_clients_cached(limit: int, wh_ids: list = None) -> list:
+    """Имена клиентов с кэшем 2 мин; wh_ids — только эти склады (для
+    промпта сотрудника), None — вся база (фильтр чатов, подсказка STT)."""
     now = time.monotonic()
-    if not _KNOWN_CLIENTS_CACHE["names"] or now - _KNOWN_CLIENTS_CACHE["ts"] > 120:
-        _KNOWN_CLIENTS_CACHE["names"] = db.known_client_names(300)
+    if now - _KNOWN_CLIENTS_CACHE["ts"] > 120:
+        _KNOWN_CLIENTS_CACHE["data"] = {}
         _KNOWN_CLIENTS_CACHE["ts"] = now
-    return _KNOWN_CLIENTS_CACHE["names"][:limit]
+    key = tuple(sorted(wh_ids)) if wh_ids is not None else None
+    if key not in _KNOWN_CLIENTS_CACHE["data"]:
+        _KNOWN_CLIENTS_CACHE["data"][key] = db.known_client_names(300, wh_ids)
+    return _KNOWN_CLIENTS_CACHE["data"][key][:limit]
 
 
 def build_dynamic_system(actor) -> str:
@@ -524,16 +577,12 @@ def build_dynamic_system(actor) -> str:
         if w:
             lines.append(f"- {u['name']} → склад «{w['name']}»")
     lines.append("Все склады: " + ", ".join(f"«{w['name']}»" for w in db.all_warehouses()))
-    known = known_clients_cached(40)
+    # Только имена клиентов СКЛАДОВ СОТРУДНИКА (правила про список — в
+    # статичном кэшируемом блоке; чужие склады сотруднику не показываем).
+    wh_ids = None if is_admin(actor) else [w["id"] for w in visible]
+    known = known_clients_cached(40, wh_ids)
     if known:
-        lines.append(
-            "Известные клиенты (сообщения часто приходят из распознавания голоса "
-            "с ошибками в именах — если имя клиента в сообщении созвучно одному "
-            "из этих, подставь точное имя из списка): " + ", ".join(known) + ".")
-        lines.append(
-            "Если имя не похоже ни на одно из списка — это просто новый или ещё "
-            "не записанный клиент: оформляй накладную с именем как есть, НЕ "
-            "спрашивай подтверждения и не проверяй, существует ли клиент.")
+        lines.append("Известные клиенты: " + ", ".join(known) + ".")
     return "\n".join(lines)
 
 
@@ -788,6 +837,10 @@ def commit_invoice(p, replace_op_id=None):
         client_label = p["client_name"]
     else:
         c = db.client_get(cid)
+        if c is None:
+            # Клиента могли удалить, пока заявка ждала кнопки (/resetwh)
+            raise ValueError("клиент не найден — возможно, справочник "
+                             "сбрасывали; отправьте накладную заново")
         old_debt = c["debt"]
         client_label = c["name"]
         if p.get("phone"):
@@ -805,8 +858,14 @@ def commit_invoice(p, replace_op_id=None):
                             old_debt -= d
                 except (ValueError, TypeError):
                     pass
-    stock_deltas = [(p["wh_id"], it["product_id"], -it["qty"])
-                    for it in p["items"] if it.get("product_id")]
+    # Дельты агрегируются по товару: план партий применяется один раз на
+    # товар, и товар двумя строками (две партии) списывается правильно.
+    qty_by_pid = {}
+    for it in p["items"]:
+        if it.get("product_id"):
+            qty_by_pid[it["product_id"]] = (qty_by_pid.get(it["product_id"], 0)
+                                            + it["qty"])
+    stock_deltas = [(p["wh_id"], pid, -q) for pid, q in qty_by_pid.items()]
     summary = f"Накладная: {client_label} — {fmt_num(total)} сом (склад {p['wh_name']})"
     if p["payment"]:
         summary += f", приход {fmt_num(p['payment'])} сом"
@@ -828,6 +887,7 @@ def commit_invoice(p, replace_op_id=None):
         op_id, _ = db.replace_operation(
             replace_op_id, p.get("op_user_id") or p["user_id"], "invoice",
             p["wh_id"], cid, summary, stock_deltas, [(cid, debt_delta)], extra,
+            batch_plan=batch_plan or None,
         )
     else:
         op_id, _ = db.commit_operation(
@@ -1175,7 +1235,7 @@ async def start_handover(update, context, actor, data):
     }
     feed_whs = (db.warehouses_of_feed(update.effective_chat.id)
                 if update.effective_chat else [])
-    if len(feed_whs) == 1:
+    if len(feed_whs) == 1 and db.can_use_warehouse(actor, feed_whs[0]["id"]):
         payload["wh_id"] = feed_whs[0]["id"]
     if is_admin(actor):
         token = new_pending(payload)
@@ -1252,6 +1312,8 @@ def _cash_employee_text(u) -> str:
 async def cash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
+        return
+    if not await _require_private(update):
         return
     if is_admin(actor):
         # Кнопки: каждый сотрудник по отдельности + все сразу
@@ -2376,10 +2438,13 @@ def _batch_questions(p):
 async def _ask_batch(q, p, question):
     """Кнопки «какую партию?» для одной позиции накладной/перемещения."""
     i, it, batches = question
-    token = new_pending(p)
+    # Сохраняем исходный TTL заявки: перемещение, ждавшее админа сутки, не
+    # должно после вопроса о партии жить 15 минут. В кнопке — сам срок,
+    # а не порядковый номер (за время вопросов список партий мог измениться).
+    token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
     kb = [[InlineKeyboardButton(f"📅 до {b['expiry']} — {b['qty']} шт",
-                                callback_data=f"pbat:{token}:{i}:{bi}")]
-          for bi, b in enumerate(batches)]
+                                callback_data=f"pbat:{token}:{i}:{b['expiry'] or '~'}")]
+          for b in batches]
     kb.append([InlineKeyboardButton(f"🔀 Сначала старые (до {batches[0]['expiry']})",
                                     callback_data=f"pbat:{token}:{i}:fefo")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
@@ -2400,27 +2465,40 @@ async def _finish_invoice(q, context, actor, p):
         if existing is not None:
             p["client_id"] = existing["id"]
     op_id, client_label, old_debt, total, summary = commit_invoice(p)
-    await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
-    if p.get("approver_id"):
+    # Операция УЖЕ в базе — любые сбои дальше (Telegram, PDF) не должны
+    # выглядеть как «не проведено», иначе сотрудник повторит накладную
+    # и задвоит её (находка аудита 27.07.2026).
+    try:
+        await q.edit_message_text(f"✅ Накладная №{op_id} проведена.")
+        if p.get("approver_id"):
+            try:
+                await context.bot.send_message(
+                    p["chat_id"],
+                    f"✅ Админ подтвердил накладную №{op_id} новому клиенту "
+                    f"«{esc(client_label)}».", parse_mode="HTML")
+            except Exception:
+                log.warning("Не удалось уведомить заявителя о накладной")
+        await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
+        await notify_admin(context, actor, summary)
+        # В ленту склада — только PDF со сводкой в подписи (без
+        # отдельного текстового сообщения, просьба владельца 21.07.2026).
+        actor_name = db.get_user(p["user_id"])["name"]
+        await feed_invoice_pdf(
+            context, p["wh_id"], client_label, p, old_debt, total,
+            caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}",
+            exclude_chat_id=p["chat_id"])
+        await alert_low_stock(context, [
+            (p["wh_id"], it["product_id"], -it["qty"])
+            for it in p["items"] if it.get("product_id")])
+    except Exception:
+        log.exception("Накладная №%s проведена, но уведомления не дошли", op_id)
         try:
-            await context.bot.send_message(
-                p["chat_id"],
-                f"✅ Админ подтвердил накладную №{op_id} новому клиенту "
-                f"«{esc(client_label)}».", parse_mode="HTML")
+            await q.edit_message_text(
+                f"✅ Накладная №{op_id} ПРОВЕДЕНА, но часть уведомлений/PDF "
+                "не отправилась. Повторно проводить НЕ нужно — документ: "
+                f"/op {op_id}")
         except Exception:
-            log.warning("Не удалось уведомить заявителя о накладной")
-    await send_invoice_pdf(context, p["chat_id"], client_label, p, old_debt, total)
-    await notify_admin(context, actor, summary)
-    # В ленту склада — только PDF со сводкой в подписи (без
-    # отдельного текстового сообщения, просьба владельца 21.07.2026).
-    actor_name = db.get_user(p["user_id"])["name"]
-    await feed_invoice_pdf(
-        context, p["wh_id"], client_label, p, old_debt, total,
-        caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}",
-        exclude_chat_id=p["chat_id"])
-    await alert_low_stock(context, [
-        (p["wh_id"], it["product_id"], -it["qty"])
-        for it in p["items"] if it.get("product_id")])
+            pass
 
 
 async def _finish_transfer(q, context, actor, p):
@@ -2464,42 +2542,54 @@ async def _finish_transfer(q, context, actor, p):
                 rows_.append(("", rest))
             it["src_batches"] = rows_
     op_id, summary = commit_transfer(p)
-    await q.edit_message_text(
-        f"✅ {esc(summary)} — проведено (операция №{op_id})." + esc(warn),
-        parse_mode="HTML")
-    note = ""
-    if p.get("approver_id"):
-        note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
-        try:
-            await context.bot.send_message(
-                p["chat_id"],
-                f"✅ Ваша заявка проведена (операция №{op_id}): {esc(summary)}",
-                parse_mode="HTML")
-        except Exception:
-            log.warning("Не удалось уведомить заявителя")
-    else:
-        await notify_admin(context, actor, summary)
-    # PDF со списком и сроками — в чаты-ленты складов операции
-    # (просьба владельца 25.07.2026); нет ленты — подтвердившему.
-    actor_name = db.get_user(p["user_id"])["name"]
-    cap = f"📦 <b>{esc(actor_name)}</b> — {esc(summary)}"
-    if note:
-        cap += f"\n{esc(note)}"
-    feed_chats = set()
-    for wh_id_ in filter(None, (p["wh_id"], p.get("from_wh_id"))):
-        wh_ = db.warehouse_by_id(wh_id_)
-        if wh_ and wh_["feed_chat_id"]:
-            feed_chats.add(wh_["feed_chat_id"])
+    # Операция уже в базе — сбои уведомлений не должны выглядеть как
+    # «не проведено» (см. _finish_invoice).
     try:
-        for chat_id_ in (feed_chats or {q.message.chat.id}):
-            await send_transfer_pdf(context, chat_id_, p, op_id, summary,
-                                    caption=cap)
+        await q.edit_message_text(
+            f"✅ {esc(summary)} — проведено (операция №{op_id})." + esc(warn),
+            parse_mode="HTML")
+        note = ""
+        if p.get("approver_id"):
+            note = f"Заявка: {p.get('requester_name', '')}, подтвердил админ"
+            try:
+                await context.bot.send_message(
+                    p["chat_id"],
+                    f"✅ Ваша заявка проведена (операция №{op_id}): {esc(summary)}",
+                    parse_mode="HTML")
+            except Exception:
+                log.warning("Не удалось уведомить заявителя")
+        else:
+            await notify_admin(context, actor, summary)
+        # PDF со списком и сроками — в чаты-ленты складов операции
+        # (просьба владельца 25.07.2026); нет ленты — подтвердившему.
+        actor_name = db.get_user(p["user_id"])["name"]
+        cap = f"📦 <b>{esc(actor_name)}</b> — {esc(summary)}"
+        if note:
+            cap += f"\n{esc(note)}"
+        feed_chats = set()
+        for wh_id_ in filter(None, (p["wh_id"], p.get("from_wh_id"))):
+            wh_ = db.warehouse_by_id(wh_id_)
+            if wh_ and wh_["feed_chat_id"]:
+                feed_chats.add(wh_["feed_chat_id"])
+        try:
+            for chat_id_ in (feed_chats or {q.message.chat.id}):
+                await send_transfer_pdf(context, chat_id_, p, op_id, summary,
+                                        caption=cap)
+        except Exception:
+            log.exception("Не удалось отправить PDF прихода")
+        if p["from_wh_id"]:
+            await alert_low_stock(context, [
+                (p["from_wh_id"], it["product_id"], -it["qty"])
+                for it in p["items"] if it.get("product_id")])
     except Exception:
-        log.exception("Не удалось отправить PDF прихода")
-    if p["from_wh_id"]:
-        await alert_low_stock(context, [
-            (p["from_wh_id"], it["product_id"], -it["qty"])
-            for it in p["items"] if it.get("product_id")])
+        log.exception("Операция №%s проведена, но уведомления не дошли", op_id)
+        try:
+            await q.edit_message_text(
+                f"✅ Операция №{op_id} ПРОВЕДЕНА, но часть уведомлений/PDF "
+                "не отправилась. Повторно проводить НЕ нужно — документ: "
+                f"/op {op_id}")
+        except Exception:
+            pass
 
 
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2535,6 +2625,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if kind == "no":
         PENDING.pop(token, None)
         await q.answer()
+        # Отменённое восстановление базы: подчистить временный файл
+        if p.get("kind") in ("restore_db", "restore_db2") and p.get("path"):
+            try:
+                os.remove(p["path"])
+            except OSError:
+                pass
         if p.get("approver_id"):
             await q.edit_message_text("❌ Заявка отклонена.")
             if p["kind"] == "invoice":
@@ -2723,12 +2819,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if choice == "fefo":
             choices[idx] = ""   # пусто = «сначала старые» (FEFO)
         else:
-            batches = db.product_batches_of(_batch_src_wh(p),
-                                            item.get("product_id") or 0)
-            try:
-                choices[idx] = batches[int(choice)]["expiry"]
-            except (ValueError, IndexError):
-                choices[idx] = ""
+            # В кнопке закодирован сам срок («~» = партия без срока);
+            # сверяем с текущими партиями — устаревший выбор уходит в FEFO.
+            exp = "" if choice == "~" else choice
+            current = {b["expiry"] for b in db.product_batches_of(
+                _batch_src_wh(p), item.get("product_id") or 0)}
+            choices[idx] = exp if exp in current else ""
         need = _batch_questions(p)
         if need:
             await _ask_batch(q, p, need[0])
@@ -2740,7 +2836,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await _finish_invoice(q, context, actor, p)
         except Exception as e:
             log.exception("Ошибка проведения после выбора партии")
-            await q.edit_message_text(f"⚠️ Ошибка при проведении: {e}")
+            await q.edit_message_text(f"⚠️ Операция НЕ проведена: {e}")
+            # Заявитель (если это была заявка админу) должен узнать об ошибке
+            if p.get("chat_id") and p["chat_id"] != q.message.chat.id:
+                try:
+                    await context.bot.send_message(
+                        p["chat_id"],
+                        f"⚠️ Ваша заявка не проведена: {e}. Отправьте заново.")
+                except Exception:
+                    log.warning("Не удалось уведомить заявителя об ошибке")
         return
 
     if kind == "ok":
@@ -2975,6 +3079,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML")
                     return
                 db.restore_from(p["path"])
+                try:
+                    os.remove(p["path"])
+                except OSError:
+                    pass
                 await q.edit_message_text(
                     "✅ База заменена файлом бэкапа.\n"
                     "🔄 Перезапускаюсь, чтобы всё перечиталось начисто — "
@@ -3004,7 +3112,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"• клиентов удалено: {stats['clients']} "
                     f"(долгов было {money(stats['debt'])})\n\n"
                     "Загрузка заново:\n"
-                    "1. Остатки: /loadkarakol (для Каракола) или инвентаризацией\n"
+                    "1. Остатки: /loadwh Склад (если есть таблица) или инвентаризацией\n"
                     "2. Клиенты: «добавь клиентов на "
                     f"{esc(p['wh_name'])}: Имя — долг, Имя — долг, ...»",
                     parse_mode="HTML")
@@ -3085,9 +3193,14 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
     if not quiet:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        reply = await ask_claude(chat_histories[chat_id], actor)
+        reply = await ask_claude(_request_history(chat_id), actor)
     except Exception as e:
         log.exception("Claude API error")
+        # Убираем добавленное user-сообщение — иначе парность истории
+        # ломается и мусор ездит в контексте следующих запросов.
+        h = chat_histories.get(chat_id, [])
+        if h and h[-1]["role"] == "user":
+            h.pop()
         # Отвечаем и в чате склада: сюда попадает только похожее на операцию
         # (фильтр), молчание = сотрудник уверен, что оплата записана.
         await update.message.reply_text(
@@ -3270,7 +3383,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     history = chat_histories.setdefault(chat_id, [])
-    messages = history[-HISTORY_LIMIT:] + [{"role": "user", "content": content}]
+    # История с обрезкой старых сообщений и гарантией «первым — user»
+    messages = _request_history(chat_id) + [{"role": "user", "content": content}]
     try:
         resp = await anthropic_client.messages.create(
             model=CLAUDE_MODEL, max_tokens=CLAUDE_MAX_TOKENS,
@@ -3324,7 +3438,7 @@ def _stt_prompt_full() -> str:
     """Подсказка Whisper: препараты + имена известных клиентов из базы."""
     base = STT_PROMPT
     try:
-        names = db.known_client_names(30)
+        names = known_clients_cached(30)
     except Exception:
         log.exception("Не удалось получить имена клиентов для подсказки STT")
         names = []
@@ -3558,6 +3672,11 @@ def _strip_wake_word(text: str):
         if m is None:
             return None
         w = m.group(1).lower()
+        # Нечёткое совпадение — только для слов, начинающихся как «Джарвис»
+        # (дж/ж/j): порог 0.7 без этого ловил «барис», «завис», «давис»
+        # (аудит 27.07.2026).
+        if not w.startswith(("дж", "ж", "j")):
+            return None
         if max(difflib.SequenceMatcher(None, w, wk).ratio()
                for wk in _WAKE_WORDS) < 0.7:
             return None
@@ -3566,23 +3685,33 @@ def _strip_wake_word(text: str):
 
 # Слова-приметы операций: если ни одной приметы нет, сообщение в чате склада
 # в ИИ не отправляется (экономия API — болтовня до Claude не доходит).
-OP_KEYWORDS = ("приход", "оплат", "заплат", "наклад", "черновик", "возврат",
-               "перемещ", "инвентариз", "сдал", "сдаю", "обещал", "обеща",
-               "минимал", "минимум", "телефон", "спеццен", "добавь", "долг")
+# «Сильные» слова срабатывают сами по себе; «слабые» — только вместе с
+# цифрами (аудит 27.07.2026: «Долго ждать» ловилось на «долг», «Телефон
+# разрядился» — на «телефон»).
+OP_STRONG = ("приход", "наклад", "черновик", "возврат", "перемещ",
+             "инвентариз", "сдал", "сдаю", "обещал", "обеща", "спеццен")
+OP_WEAK = ("оплат", "заплат", "минимал", "минимум", "телефон", "добавь",
+           "долг")
 
 
 def _looks_like_operation(text: str) -> bool:
     """Бесплатная проверка «похоже на операцию» для чатов складов."""
     t = text.lower()
-    if any(k in t for k in OP_KEYWORDS):
+    has_digit = any(ch.isdigit() for ch in t)
+    if any(k in t for k in OP_STRONG):
         return True
-    # Товар из прайса или известный клиент + числа — похоже на накладную/оплату
-    if not any(ch.isdigit() for ch in t):
+    if not has_digit:
         return False
-    for p in prices.PRICE_LIST_DATA:
-        if p["name"].split()[0].split("-")[0].lower() in t:
-            return True
+    if any(k in t for k in OP_WEAK):
+        return True
+    # Товар из прайса + числа — похоже на накладную/оплату. Короткие
+    # приметы («топ», «ивер») — только целым словом, иначе ловится «стоп»,
+    # «универ» и т.п.
     words = set(re.findall(r"[а-яёa-z]+", t))
+    for p in prices.PRICE_LIST_DATA:
+        w = p["name"].split()[0].split("-")[0].lower()
+        if (w in t if len(w) >= 5 else w in words):
+            return True
     for name in known_clients_cached(300):
         w = name.split()[0].lower()
         if len(w) >= 3 and w in words:
@@ -3873,6 +4002,8 @@ async def stockat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    if not await _require_private(update):
+        return
     usage = ("Использование: /stockat Склад Дата [Время]\n"
              "Примеры:\n"
              "/stockat Каракол вчера — конец вчерашнего дня\n"
@@ -4026,6 +4157,8 @@ async def invoices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    if not await _require_private(update):
+        return
     args = list(context.args or [])
     days_back, label = 0, "за сегодня"
     if args and args[-1].lower() in PERIODS:
@@ -4104,6 +4237,8 @@ async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Полный справочник клиентов склада (включая нулевые долги) — PDF."""
     actor = await get_actor(update)
     if actor is None:
+        return
+    if not await _require_private(update):
         return
     arg = " ".join(context.args).strip() if context.args else ""
     if arg and arg.lower() != "all":
@@ -5077,6 +5212,8 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    if not await _require_private(update):
+        return
     try:
         n = min(int(context.args[0]), 30) if context.args else 10
     except ValueError:
@@ -5118,6 +5255,8 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Детали операции по номеру: /op 26 (сотрудник — только свои)."""
     actor = await get_actor(update)
     if actor is None:
+        return
+    if not await _require_private(update):
         return
     try:
         op_id = int(context.args[0])
@@ -5676,8 +5815,8 @@ STOCK_LOADS = {
     "каракол": ("karakol_stock_data", "KARAKOL_STOCK",
                 "проверенная вами таблица от 22.07.2026"),
     "кара-балта": ("karabalta_stock_data", "KARABALTA_STOCK",
-                   "ваша Excel-таблица от 21.07.2026 (ЭЛЕОВИТ 100мл взят 29 шт "
-                   "— уточняется у Беки)"),
+                   "ваша Excel-таблица от 21.07.2026 (ЭЛЕОВИТ 100мл — 19 шт, "
+                   "пересчёт Беки 26.07)"),
 }
 
 
@@ -5772,7 +5911,7 @@ async def handle_db_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         tg_file = await doc.get_file()
         await tg_file.download_to_drive(path)
-        info = db.inspect_backup(path)
+        info = db.inspect_backup(path, expected_admin_id=ADMIN_ID)
     except ValueError as e:
         await update.message.reply_text(f"⛔ Это не похоже на бэкап нашей базы: {esc(str(e))}",
                                         parse_mode="HTML")
@@ -5784,6 +5923,10 @@ async def handle_db_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         log.exception("Не удалось скачать/проверить файл бэкапа")
         await update.message.reply_text(f"⚠️ Не удалось обработать файл: {e}")
+        try:
+            os.remove(path)
+        except OSError:
+            pass
         return
     cur = db.current_stats()
     payload = {"kind": "restore_db", "user_id": actor["id"],
@@ -6075,10 +6218,15 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
 
 
 async def _setup_command_menu(app):
-    from telegram import BotCommand, BotCommandScopeChat
+    from telegram import (BotCommand, BotCommandScopeAllGroupChats,
+                          BotCommandScopeChat)
     try:
         await app.bot.set_my_commands(
             [BotCommand(c, d) for c, d in STAFF_COMMANDS])
+        # В группах меню не показываем: команды с данными там всё равно
+        # закрыты (_require_private), а посторонним список ни к чему.
+        await app.bot.set_my_commands(
+            [], scope=BotCommandScopeAllGroupChats())
         await app.bot.set_my_commands(
             [BotCommand(c, d) for c, d in ADMIN_COMMANDS],
             scope=BotCommandScopeChat(ADMIN_ID))
