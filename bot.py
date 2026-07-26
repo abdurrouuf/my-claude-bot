@@ -5128,44 +5128,61 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         ts = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y %H:%M")
     except ValueError:
         ts = op["ts"]
-    icon = LOG_TYPE_ICONS.get(op["type"], "▫️")
-    lines = [f"{icon} <b>Операция №{op['id']}</b>"
-             + (" · <b>❌ ОТМЕНЕНА</b>" if op["status"] == "cancelled" else ""),
-             f"🕒 {ts} · ✍️ {esc(u['name'] if u else str(op['user_id']))}"]
+    type_names = {"invoice": "Накладная", "payment": "Приход денег",
+                  "transfer": "Перемещение / приход товара",
+                  "inventory": "Инвентаризация", "return": "Возврат",
+                  "handover": "Сдача выручки"}
+    info = [["Тип", type_names.get(op["type"], op["type"])],
+            ["Статус", "❌ ОТМЕНЕНА" if op["status"] == "cancelled"
+             else "проведена"],
+            ["Дата", ts],
+            ["Исполнитель", u["name"] if u else str(op["user_id"])]]
     if wh:
-        lines.append(f"🏬 Склад: {esc(wh['name'])}")
+        info.append(["Склад", wh["name"]])
     if client:
-        lines.append(f"👤 Клиент: {esc(client['name'])}")
-    lines.append(f"📄 {esc(op['summary'])}")
+        info.append(["Клиент", client["name"]])
+    info.append(["Сводка", op["summary"]])
+    bd = data.get("batch_deltas") or []
+    parts_ = [f"{exp or 'без срока'}: {chg:+d} шт" for _, _, exp, chg in bd]
+    if parts_:
+        info.append(["Партии", ", ".join(parts_)])
+    sections = [{"headers": ["Параметр", "Значение"],
+                 "rows": info, "widths": [38, 139]}]
     items = data.get("items") or []
     if items:
-        lines.append("")
-        lines.append("<b>Состав:</b>")
-        for j, it in enumerate(items, 1):
+        rows = []
+        for it in items:
             name = str(it.get("name") or "").split("(")[0].strip()
-            row = f"{j}. {esc(name)} {esc(str(it.get('volume') or ''))} — {it.get('qty')} шт"
-            if it.get("price") is not None:
-                row += (f" × {fmt_num(it['price'])}"
-                        f" = {fmt_num((it.get('qty') or 0) * it['price'])}")
-            if it.get("expiry"):
-                row += f" · срок {it['expiry']}"
-            lines.append(row)
-    if data.get("total") is not None:
-        lines.append("")
-        lines.append(f"💵 Сумма: <b>{money(data['total'])}</b>")
-        if data.get("payment"):
-            lines.append(f"✅ Оплачено сразу: {money(data['payment'])}")
+            price = it.get("price")
+            rows.append([
+                name, str(it.get("volume") or ""), f"{it.get('qty')} шт",
+                fmt_num(price) if price is not None else "—",
+                fmt_num((it.get("qty") or 0) * price) if price is not None else "—",
+                it.get("expiry") or "—"])
+        footer = ""
+        if data.get("total") is not None:
+            footer = f"Итого: {money(data['total'])}"
+            if data.get("payment"):
+                footer += f" · оплачено сразу: {money(data['payment'])}"
+        sections.append({"title": "Состав",
+                         "headers": ["Товар", "Фасовка", "Кол-во", "Цена",
+                                     "Сумма", "Срок"],
+                         "rows": rows, "widths": [55, 22, 18, 18, 22, 22],
+                         "numbered": True, "footer": footer})
     elif data.get("amount") is not None:
-        lines.append("")
-        lines.append(f"💵 Сумма: <b>{money(data['amount'])}</b>")
-    bd = data.get("batch_deltas") or []
-    parts_ = [f"{exp or 'без срока'}: {chg:+d}" for _, _, exp, chg in bd]
-    if parts_:
-        lines.append("📅 Партии: " + esc(", ".join(parts_)))
+        sections[0]["rows"].append(["Сумма", money(data["amount"])])
+    status_mark = " (ОТМЕНЕНА)" if op["status"] == "cancelled" else ""
+    pdf = generate_report_pdf(
+        f"ОПЕРАЦИЯ №{op['id']}{status_mark}",
+        f"ОсОО «ВЕТОП» · {type_names.get(op['type'], op['type'])} · {ts}",
+        sections)
+    icon = LOG_TYPE_ICONS.get(op["type"], "▫️")
+    caption = f"{icon} №{op['id']} · {op['summary']}"
     if op["status"] != "cancelled" and is_admin(actor):
-        lines.append("")
-        lines.append(f"Отменить: /undo {op['id']}")
-    await send_long(update.message, "\n".join(lines))
+        caption += f"\nОтменить: /undo {op['id']}"
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"операция_{op['id']}.pdf"),
+        caption=caption)
 
 
 async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
