@@ -1139,7 +1139,10 @@ def handover_summary(p) -> str:
 
 def commit_handover(p):
     u = db.get_user(p["user_id"])
-    wh = db.warehouse_of(p["user_id"])
+    # Склад операции: чат склада, где написали «сдал» (лента этого склада
+    # увидит инкассацию), иначе родной склад сотрудника.
+    wh = (db.warehouse_by_id(p["wh_id"]) if p.get("wh_id")
+          else db.warehouse_of(p["user_id"]))
     summary = f"Инкассация: {u['name']} сдал {fmt_num(p['amount'])} сом"
     extra = {"amount": p["amount"]}
     if p.get("approver_id"):
@@ -1151,8 +1154,12 @@ def commit_handover(p):
 
 
 async def start_handover(update, context, actor, data):
-    own = db.warehouse_of(actor["id"])
-    if transition_blocked(actor) and not (own and own["full_mode"]):
+    # Сдача выручки доступна, если ЛЮБОЙ доступный сотруднику склад в полном
+    # режиме: касса общая, а выручка могла прийти с полного склада (Бека —
+    # родной Бишкек на черновиках, но торгует на Кара-Балте; инцидент
+    # 27.07.2026 — бот отвечал «переходный период»).
+    if transition_blocked(actor) and not any(
+            w["full_mode"] for w in db.visible_warehouses(actor)):
         await update.message.reply_text(TRANSITION_HINT)
         return
     try:
@@ -1166,6 +1173,10 @@ async def start_handover(update, context, actor, data):
         "kind": "handover", "user_id": actor["id"],
         "chat_id": update.effective_chat.id, "amount": amount,
     }
+    feed_whs = (db.warehouses_of_feed(update.effective_chat.id)
+                if update.effective_chat else [])
+    if len(feed_whs) == 1:
+        payload["wh_id"] = feed_whs[0]["id"]
     if is_admin(actor):
         token = new_pending(payload)
         await update.message.reply_text(handover_summary(payload), parse_mode="HTML",
