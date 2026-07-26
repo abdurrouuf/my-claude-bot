@@ -502,13 +502,18 @@ def expiry_list(wh_id: int):
     (product_batches), каждая партия — своя строка; иначе — старый режим
     «один срок на товар» (product_expiry × stock)."""
     conn = connect()
-    rows = conn.execute(
-        "SELECT product_id, expiry, qty FROM product_batches "
-        "WHERE warehouse_id=? AND qty > 0 AND expiry != '' "
-        "ORDER BY substr(expiry, 4) || substr(expiry, 1, 2)",
-        (wh_id,)).fetchall()
-    if rows:
-        return rows
+    # Признак «склад на партиях» — ЛЮБЫЕ партии (в т.ч. «без срока»), иначе
+    # после распродажи датированных партий показывались бы фантомные сроки
+    # из легаси-таблицы product_expiry.
+    has_batches = conn.execute(
+        "SELECT 1 FROM product_batches WHERE warehouse_id=? AND qty != 0 "
+        "LIMIT 1", (wh_id,)).fetchone()
+    if has_batches:
+        return conn.execute(
+            "SELECT product_id, expiry, qty FROM product_batches "
+            "WHERE warehouse_id=? AND qty > 0 AND expiry != '' "
+            "ORDER BY substr(expiry, 4) || substr(expiry, 1, 2)",
+            (wh_id,)).fetchall()
     return conn.execute(
         "SELECT e.product_id, e.expiry, COALESCE(s.qty, 0) AS qty "
         "FROM product_expiry e "
@@ -519,26 +524,41 @@ def expiry_list(wh_id: int):
         (wh_id,)).fetchall()
 
 
-def known_client_names(limit: int = 40):
-    """Имена клиентов для подсказки распознаванию голосовых.
-    Сначала часто используемые (из журнала черновиков), потом остальной
-    справочник — чтобы большой импорт не вытеснил ходовые имена."""
+def known_client_names(limit: int = 40, wh_ids: list = None):
+    """Имена клиентов для подсказок. wh_ids — только клиенты этих складов
+    (сотруднику в промпт не даём имена чужих складов); None — вся база.
+    Сначала часто используемые (из журнала черновиков — только без фильтра
+    складов), потом справочник — чтобы импорт не вытеснил ходовые имена."""
     conn = connect()
     seen, out = set(), []
-    for r in conn.execute(
-            "SELECT client, COUNT(*) AS n FROM draft_log "
-            "GROUP BY client COLLATE NOCASEU ORDER BY n DESC, MAX(id) DESC"):
-        k = r["client"].lower()
-        if k not in seen:
-            seen.add(k)
-            out.append(r["client"])
-    for r in conn.execute("SELECT name FROM clients ORDER BY name"):
+    if wh_ids is None:
+        for r in conn.execute(
+                "SELECT client, COUNT(*) AS n FROM draft_log "
+                "GROUP BY client COLLATE NOCASEU ORDER BY n DESC, MAX(id) DESC"):
+            k = r["client"].lower()
+            if k not in seen:
+                seen.add(k)
+                out.append(r["client"])
+        clients_sql = "SELECT name FROM clients ORDER BY name"
+        alias_sql = "SELECT alias FROM client_aliases ORDER BY alias"
+        params = ()
+    else:
+        if not wh_ids:
+            return []
+        marks = ",".join("?" * len(wh_ids))
+        clients_sql = (f"SELECT name FROM clients WHERE warehouse_id IN ({marks}) "
+                       "ORDER BY name")
+        alias_sql = (f"SELECT a.alias FROM client_aliases a "
+                     f"JOIN clients c ON c.id = a.client_id "
+                     f"WHERE c.warehouse_id IN ({marks}) ORDER BY a.alias")
+        params = tuple(wh_ids)
+    for r in conn.execute(clients_sql, params):
         k = r["name"].lower()
         if k not in seen:
             seen.add(k)
             out.append(r["name"])
     # Псевдонимы — их сотрудники и произносят («Виктория» вместо «Вика Уманец»)
-    for r in conn.execute("SELECT alias FROM client_aliases ORDER BY alias"):
+    for r in conn.execute(alias_sql, params):
         k = r["alias"].lower()
         if k not in seen:
             seen.add(k)
@@ -1069,11 +1089,14 @@ def _commit_op(conn, user_id: int, op_type: str, warehouse_id, client_id,
         client_id = new_cid
     debt_deltas = [(cid if cid is not None else new_cid, d) for cid, d in debt_deltas]
 
+    # План партий применяется РОВНО ОДИН РАЗ на (склад, товар): если товар
+    # идёт несколькими дельтами, повторное применение плана задваивало бы
+    # списание партий (баг найден аудитом 27.07.2026).
+    bp = dict(batch_plan) if batch_plan else {}
     batch_deltas = []
     for wh, pid, d in stock_deltas:
         _apply_stock(conn, wh, pid, d)
-        for exp, chg in _apply_batches(conn, wh, pid, d,
-                                       (batch_plan or {}).get((wh, pid))):
+        for exp, chg in _apply_batches(conn, wh, pid, d, bp.pop((wh, pid), None)):
             batch_deltas.append([wh, pid, exp, chg])
     for cid, d in debt_deltas:
         conn.execute("UPDATE clients SET debt = debt + ? WHERE id=?", (d, cid))
@@ -1111,7 +1134,8 @@ def commit_operation(user_id: int, op_type: str, warehouse_id, client_id,
 
 def replace_operation(old_op_id: int, user_id: int, op_type: str, warehouse_id,
                       client_id, summary: str, stock_deltas: list,
-                      debt_deltas: list, extra: dict = None):
+                      debt_deltas: list, extra: dict = None,
+                      batch_plan: dict = None):
     """Сторно старой операции + проведение новой ОДНОЙ транзакцией (замена
     накладной). Раньше это были два отдельных коммита: если второй падал,
     старая накладная оставалась отменённой без замены — учёт расходился.
@@ -1131,7 +1155,8 @@ def replace_operation(old_op_id: int, user_id: int, op_type: str, warehouse_id,
             conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?", (d, cid))
         conn.execute("UPDATE operations SET status='cancelled' WHERE id=?", (old_op_id,))
         return _commit_op(conn, user_id, op_type, warehouse_id, client_id,
-                          summary, stock_deltas, debt_deltas, extra)
+                          summary, stock_deltas, debt_deltas, extra,
+                          batch_plan=batch_plan)
 
 
 def get_operation(op_id: int):
@@ -1237,10 +1262,10 @@ def stock_at(wh_id: int, moment_iso: str) -> dict:
     return smap
 
 
-def inspect_backup(path: str) -> dict:
-    """Проверяет файл бэкапа: SQLite ли это, цел ли, наша ли структура.
-    Возвращает счётчики для карточки подтверждения; бросает ValueError
-    с понятным текстом, если файл не годится."""
+def inspect_backup(path: str, expected_admin_id: int = None) -> dict:
+    """Проверяет файл бэкапа: SQLite ли это, цел ли, наша ли структура,
+    НАША ли это база (админ с ожидаемым id внутри). Возвращает счётчики
+    для карточки; бросает ValueError с понятным текстом, если не годится."""
     with open(path, "rb") as f:
         if f.read(16) != b"SQLite format 3\x00":
             raise ValueError("файл не является базой SQLite")
@@ -1262,6 +1287,11 @@ def inspect_backup(path: str) -> dict:
         if missing:
             raise ValueError("в файле нет наших таблиц: "
                              + ", ".join(sorted(missing)))
+        if expected_admin_id is not None and conn.execute(
+                "SELECT 1 FROM users WHERE id=? AND role='admin'",
+                (expected_admin_id,)).fetchone() is None:
+            raise ValueError("в файле нет нашего администратора — похоже, "
+                             "это база другого бота")
         def cnt(t):
             return conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         return {
