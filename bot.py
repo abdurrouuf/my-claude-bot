@@ -5071,7 +5071,10 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not ops:
         await update.message.reply_text("Журнал пуст.")
         return
-    lines = ["🗒 <b>Последние операции</b> (новые сверху)"]
+    # Хронологический порядок: старые сверху, новые снизу — как в чате
+    # (просьба владельца 25.07.2026).
+    ops = list(reversed(ops))
+    lines = ["🗒 <b>Последние операции</b> (новые внизу)"]
     last_day = None
     for op in ops:
         try:
