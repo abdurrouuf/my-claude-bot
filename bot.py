@@ -4979,46 +4979,11 @@ def overdue_rows(warehouses, min_days: int):
     return out
 
 
-def build_overdue(warehouses, min_days: int) -> str:
-    """Список должников, не плативших min_days и более дней (текст)."""
+def overdue_report(warehouses, min_days: int):
+    """PDF «Давно не платили»: (pdf, found, total) или None, если должников нет."""
     data = overdue_rows(warehouses, min_days)
-    lines = [f"⏰ <b>Давно не платили ({min_days}+ дней):</b>"]
-    found = 0
-    total = 0.0
-    for wh, rows in data:
-        lines.append("")
-        lines.append(f"🏬 <b>Склад «{esc(wh['name'])}»</b>")
-        for days, c, has_paid in rows:
-            age = f"{days} дн. без оплат" if days is not None else "давно (дата неизвестна)"
-            mark = "" if has_paid else " — ни одной оплаты"
-            phone = f" · 📞 {esc(c['phone'])}" if c["phone"] else ""
-            lines.append(f"👤 {esc(c['name'])}: <b>{money(c['debt'])}</b> · {age}{mark}{phone}")
-            found += 1
-            total += c["debt"]
-    if not found:
-        return ""
-    lines.append("")
-    lines.append(f"💰 Итого зависших долгов: <b>{money(total)}</b>")
-    return "\n".join(lines)
-
-
-async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    actor = await get_actor(update)
-    if actor is None:
-        return
-    min_days = DEBT_ALERT_DAYS
-    if context.args:
-        try:
-            min_days = max(1, int(context.args[0]))
-        except ValueError:
-            await update.message.reply_text(
-                "Использование: /olddebts [дней]\nПример: /olddebts 45")
-            return
-    data = overdue_rows(db.visible_warehouses(actor), min_days)
     if not data:
-        await update.message.reply_text(
-            f"✅ Нет клиентов без оплат дольше {min_days} дней.")
-        return
+        return None
     sections, found, total = [], 0, 0.0
     for wh, rows in data:
         sec_rows, sec_total = [], 0.0
@@ -5039,29 +5004,64 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     pdf = generate_report_pdf(
         "ДАВНО НЕ ПЛАТИЛИ", f"ОсОО «ВЕТОП» · {min_days}+ дней без оплат · на {date_str}",
         sections, footer=f"ИТОГО ЗАВИСШИХ ДОЛГОВ: {money(total)}" if len(sections) > 1 else "")
+    return pdf, found, total
+
+
+def overdue_filename() -> str:
+    date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
+    return f"старые_долги_{date_str}.pdf"
+
+
+async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    min_days = DEBT_ALERT_DAYS
+    if context.args:
+        try:
+            min_days = max(1, int(context.args[0]))
+        except ValueError:
+            await update.message.reply_text(
+                "Использование: /olddebts [дней]\nПример: /olddebts 45")
+            return
+    report = overdue_report(db.visible_warehouses(actor), min_days)
+    if report is None:
+        await update.message.reply_text(
+            f"✅ Нет клиентов без оплат дольше {min_days} дней.")
+        return
+    pdf, found, total = report
     await update.message.reply_document(
-        document=InputFile(pdf, filename=f"старые_долги_{date_str.replace('.', '')}.pdf"),
+        document=InputFile(pdf, filename=overdue_filename()),
         caption=f"⏰ Не платили {min_days}+ дней: {found} клиентов, "
                 f"зависло {money(total)}")
 
 
 async def send_debt_alerts(bot):
-    """Еженедельное напоминание о старых долгах: админу — всё, сотруднику — своё."""
-    admin_text = build_overdue(db.all_warehouses(), DEBT_ALERT_DAYS)
-    if admin_text:
+    """Еженедельное напоминание о старых долгах PDF-файлом:
+    админу — все склады, сотруднику — свои."""
+    report = overdue_report(db.all_warehouses(), DEBT_ALERT_DAYS)
+    if report:
+        pdf, found, total = report
         try:
-            await send_long_bot(bot, ADMIN_ID, admin_text)
+            await bot.send_document(
+                ADMIN_ID, document=InputFile(pdf, filename=overdue_filename()),
+                caption=f"⏰ Не платили {DEBT_ALERT_DAYS}+ дней: {found} клиентов, "
+                        f"зависло {money(total)}")
         except Exception as e:
             log.warning("Не удалось отправить напоминание админу: %s", e)
     for u in db.list_users():
         if u["id"] == ADMIN_ID:
             continue
-        text = build_overdue(db.visible_warehouses(u), DEBT_ALERT_DAYS)
-        if not text:
+        report = overdue_report(db.visible_warehouses(u), DEBT_ALERT_DAYS)
+        if not report:
             continue
+        pdf, found, total = report
         try:
-            await send_long_bot(bot, u["id"],
-                                text + "\n\nПора напомнить клиентам об оплате 📞")
+            await bot.send_document(
+                u["id"], document=InputFile(pdf, filename=overdue_filename()),
+                caption=f"⏰ Не платили {DEBT_ALERT_DAYS}+ дней: {found} клиентов, "
+                        f"зависло {money(total)}\n"
+                        f"Пора напомнить клиентам об оплате 📞")
         except Exception as e:
             log.warning("Не удалось отправить напоминание %s: %s", u["name"], e)
 
