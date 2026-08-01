@@ -2687,26 +2687,36 @@ def _expiry_questions(p):
     return need
 
 
-async def _ask_expiry(q, p, question, chat_id, user_id):
-    """Просит написать срок годности текстом и запоминает, кого ждём."""
+async def _ask_expiry(q, context, p, question, chat_id, user_id):
+    """Просит написать срок годности текстом и запоминает, кого ждём.
+
+    По заявке сотрудника вопрос уходит и САМОМУ сотруднику — упаковка у
+    него на складе (просьба владельца 01.08.2026); админ при этом тоже
+    может ответить, принимается первый ответ."""
     i, it = question
-    key = (chat_id, user_id)
+    keys = [(chat_id, user_id)]
+    requester = None
+    if (p.get("approver_id") and p.get("chat_id")
+            and p.get("user_id") and p["user_id"] != user_id):
+        requester = db.get_user(p["user_id"])
+        if requester:
+            keys.append((p["chat_id"], p["user_id"]))
     # Один вопрос о сроке за раз: второй вопрос затирал бы первый, и ответ
     # молча уходил бы не в ту операцию (находка ревизии 01.08.2026).
-    old = AWAIT_EXPIRY.get(key)
-    if old and get_pending(old) is not None:
-        token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
-        await q.edit_message_text(
-            "⏸ У вас уже висит вопрос о сроке годности по другой операции.\n"
-            "Сначала ответьте на него (или нажмите там «Отмена»), затем "
-            "нажмите «Продолжить» здесь.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔁 Продолжить", callback_data=f"ok:{token}")],
-                [InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")]]))
-        return
+    for k in keys:
+        old = AWAIT_EXPIRY.get(k)
+        if old and get_pending(old) is not None:
+            token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
+            await q.edit_message_text(
+                "⏸ Уже висит вопрос о сроке годности по другой операции.\n"
+                "Сначала нужно ответить на него (или нажать там «Отмена»), "
+                "затем нажмите «Продолжить» здесь.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🔁 Продолжить", callback_data=f"ok:{token}")],
+                    [InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")]]))
+            return
     p["awaiting_expiry"] = i
     token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
-    AWAIT_EXPIRY[key] = token
     src_name = p.get("from_wh_name") or p.get("wh_name")
     what = "перемещение" if p["kind"] == "transfer" else "списание"
     src_wh = _batch_src_wh(p)
@@ -2717,15 +2727,38 @@ async def _ask_expiry(q, p, question, chat_id, user_id):
     else:
         why = (f"На складе «{esc(src_name)}» у этого товара не записан "
                f"срок годности.")
-    await q.edit_message_text(
-        f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
-        f"{why}\n\n"
-        f"Посмотрите на упаковку и напишите срок ответным сообщением — "
-        f"например: <b>11.2028</b>\n"
-        f"Без срока годности {what} не провожу.",
-        parse_mode="HTML",
-        reply_markup=InlineKeyboardMarkup([[
-            InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")]]))
+    head = (f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
+            f"{why}\n\n")
+    ask = (f"Посмотрите на упаковку и напишите срок ответным сообщением — "
+           f"например: <b>11.2028</b>\n"
+           f"Без срока годности {what} не провожу.")
+    sent_to_requester = False
+    if requester:
+        try:
+            await context.bot.send_message(
+                p["chat_id"],
+                head + f"Это по вашей заявке ({what}). " + ask,
+                parse_mode="HTML")
+            sent_to_requester = True
+        except Exception:
+            log.warning("Не удалось отправить вопрос о сроке сотруднику %s — "
+                        "спрошу подтверждающего", requester["name"])
+    AWAIT_EXPIRY[(chat_id, user_id)] = token
+    if sent_to_requester:
+        AWAIT_EXPIRY[(p["chat_id"], p["user_id"])] = token
+        text = (head + f"📨 Вопрос отправлен сотруднику "
+                f"<b>{esc(requester['name'])}</b> — упаковка у него на "
+                f"складе. Можете ответить и сами: напишите срок сюда "
+                f"(например: <b>11.2028</b>). Принимается первый ответ.")
+    else:
+        text = head + ask
+    # Кнопку «Отмена» показываем только тому, кто вправе её нажать
+    # (у заявки сотрудника — только подтверждающий админ).
+    kb = None
+    if not p.get("approver_id") or user_id == p.get("approver_id"):
+        kb = InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")]])
+    await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
 
 
 async def _ask_batch(q, p, question):
@@ -2776,7 +2809,7 @@ async def _continue_op(q, context, actor, p, chat_id, user_id):
         return
     need = _expiry_questions(p)
     if need:
-        await _ask_expiry(q, p, need[0], chat_id, user_id)
+        await _ask_expiry(q, context, p, need[0], chat_id, user_id)
         return
     if p["kind"] == "transfer":
         await _finish_transfer(q, context, actor, p)
@@ -3028,12 +3061,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if kind == "no":
         PENDING.pop(token, None)
-        # Снимаем ожидание срока годности только если оно относится К ЭТОЙ
-        # заявке: «Отмена» на другой карточке не должна глушить чужой вопрос
-        # (находка ревизии 01.08.2026).
-        exp_key = (q.message.chat.id, q.from_user.id)
-        if AWAIT_EXPIRY.get(exp_key) == token:
-            AWAIT_EXPIRY.pop(exp_key, None)
+        # Снимаем ожидания срока годности, относящиеся К ЭТОЙ заявке (их
+        # может быть два: админ + сотрудник-заявитель); чужие вопросы
+        # «Отмена» на другой карточке не глушит (ревизия 01.08.2026).
+        for k in [k for k, v in AWAIT_EXPIRY.items() if v == token]:
+            AWAIT_EXPIRY.pop(k, None)
         await q.answer()
         # Отменённое восстановление базы: подчистить временный файл
         if p.get("kind") in ("restore_db", "restore_db2") and p.get("path"):
@@ -3628,7 +3660,10 @@ async def expiry_reply(update, context, text: str) -> bool:
         AWAIT_EXPIRY.pop(key, None)
         PENDING.pop(token, None)
         return private
-    AWAIT_EXPIRY.pop(key, None)
+    # Вопрос мог ждать ответа и у админа, и у сотрудника-заявителя —
+    # принимается первый ответ, оба ожидания снимаются.
+    for k in [k for k, v in AWAIT_EXPIRY.items() if v == token]:
+        AWAIT_EXPIRY.pop(k, None)
     PENDING.pop(token, None)
     idx = p.pop("awaiting_expiry", None)
     try:
@@ -3639,6 +3674,17 @@ async def expiry_reply(update, context, text: str) -> bool:
         return True
     it["expiry"] = exp
     it["expiry_asked"] = True      # на складе товар лежит без срока
+    # Ответил сотрудник — админ (подтверждающий) должен видеть, что заявка
+    # поехала дальше; ответил админ — сотруднику скажет _finish_*.
+    if p.get("approver_id") and update.effective_user.id != p["approver_id"]:
+        try:
+            await context.bot.send_message(
+                p["approver_id"],
+                f"📅 {esc(actor['name'])} назвал срок {exp} для "
+                f"{esc(it['name'])} {esc(it['volume'])} — провожу операцию.",
+                parse_mode="HTML")
+        except Exception:
+            log.warning("Не удалось уведомить админа об ответе о сроке")
     responder = _MsgResponder(update.message)
     await update.message.reply_text(
         f"📅 Записал срок {exp}: {esc(it['name'])} {esc(it['volume'])}.",
