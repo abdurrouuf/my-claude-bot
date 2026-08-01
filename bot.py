@@ -4833,10 +4833,20 @@ def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
                          "headers": ["Показатель", "Значение"],
                          "rows": rows, "widths": [80, 87]})
         if d["top"]:
-            sections.append({"title": f"Топ товаров — «{wh['name']}»",
+            # Отчёт по одному складу показывает ВСЕ проданные препараты
+            # (просьба владельца 01.08.2026), общий по нескольким — топ-10,
+            # иначе PDF разрастается на все склады сразу.
+            one_wh = len(data) == 1
+            shown = d["top"] if one_wh else d["top"][:10]
+            note = f"Позиций продано: {len(d['top'])}"
+            if not one_wh and len(d["top"]) > len(shown):
+                note += f" · в списке первые {len(shown)}"
+            sections.append({"title": ("Проданные товары" if one_wh
+                                       else "Топ товаров") + f" — «{wh['name']}»",
                              "headers": ["Товар", "Продано"],
-                             "rows": [[n, f"{q} шт"] for n, q in d["top"][:10]],
-                             "widths": [130, 37]})
+                             "rows": [[n, f"{q} шт"] for n, q in shown],
+                             "widths": [130, 37],
+                             "numbered": True, "footer": note})
         summary.append(f"📊 «{wh['name']}»: продажи {money(d['sales'])}, "
                        f"деньги {money(d['money'])}")
         grand_sales += d["sales"]
