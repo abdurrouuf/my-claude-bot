@@ -66,7 +66,7 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
             payment = data.get("payment", "") or ""
         elif op["type"] in ("payment", "handover"):
             payment = data.get("amount", "")
-        elif op["type"] == "return":
+        elif op["type"] in ("return", "writeoff"):
             total = -data.get("total", 0)
         ws.append([
             op["id"], dt, OP_TYPES.get(op["type"], op["type"]),

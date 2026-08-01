@@ -2690,14 +2690,36 @@ def _expiry_questions(p):
 async def _ask_expiry(q, p, question, chat_id, user_id):
     """Просит написать срок годности текстом и запоминает, кого ждём."""
     i, it = question
+    key = (chat_id, user_id)
+    # Один вопрос о сроке за раз: второй вопрос затирал бы первый, и ответ
+    # молча уходил бы не в ту операцию (находка ревизии 01.08.2026).
+    old = AWAIT_EXPIRY.get(key)
+    if old and get_pending(old) is not None:
+        token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
+        await q.edit_message_text(
+            "⏸ У вас уже висит вопрос о сроке годности по другой операции.\n"
+            "Сначала ответьте на него (или нажмите там «Отмена»), затем "
+            "нажмите «Продолжить» здесь.",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("🔁 Продолжить", callback_data=f"ok:{token}")],
+                [InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")]]))
+        return
     p["awaiting_expiry"] = i
     token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
-    AWAIT_EXPIRY[(chat_id, user_id)] = token
+    AWAIT_EXPIRY[key] = token
     src_name = p.get("from_wh_name") or p.get("wh_name")
     what = "перемещение" if p["kind"] == "transfer" else "списание"
+    src_wh = _batch_src_wh(p)
+    dated = sum(b["qty"] for b in _dated_batches(src_wh, it.get("product_id") or 0))
+    if dated:
+        why = (f"Датированных партий на складе «{esc(src_name)}» хватает "
+               f"только на {dated} шт из {it['qty']}.")
+    else:
+        why = (f"На складе «{esc(src_name)}» у этого товара не записан "
+               f"срок годности.")
     await q.edit_message_text(
         f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
-        f"На складе «{esc(src_name)}» у этого товара не записан срок годности.\n\n"
+        f"{why}\n\n"
         f"Посмотрите на упаковку и напишите срок ответным сообщением — "
         f"например: <b>11.2028</b>\n"
         f"Без срока годности {what} не провожу.",
@@ -2813,11 +2835,21 @@ def _fill_src_batches(p):
     """Раскладка списания по партиям склада-источника: явный срок / выбор
     кнопкой / «сначала старые». Срок, названный в ответ на вопрос бота
     (expiry_asked), к партиям источника не применяется — товар лежит там
-    без срока, списываем как есть, а сам срок уезжает с товаром."""
+    без срока, списываем как есть, а сам срок уезжает с товаром.
+
+    used: снимок партий читается из базы ДО проведения, поэтому две строки
+    одного товара без учёта друг друга списывали бы одну и ту же партию
+    дважды (ревизия 01.08.2026) — занятое предыдущими строками вычитаем."""
     src_wh = _batch_src_wh(p)
     if not src_wh:
         return
     choices = p.get("batch_choices") or {}
+    used = {}
+
+    def take_from(pid, exp, qty):
+        used[(pid, exp)] = used.get((pid, exp), 0) + qty
+        return (exp, qty)
+
     for i, it in enumerate(p["items"]):
         pid = it.get("product_id")
         if not pid:
@@ -2826,26 +2858,40 @@ def _fill_src_batches(p):
         if not exp:
             picked = _choice_batch(choices.get(str(i)))
             if picked is not None:
-                it["src_batches"] = [(picked, it["qty"])]
+                it["src_batches"] = [take_from(pid, picked, it["qty"])]
                 continue
         if exp:
-            it["src_batches"] = [(exp, it["qty"])]
+            it["src_batches"] = [take_from(pid, exp, it["qty"])]
             continue
         rows_, rest = [], it["qty"]
         for b in db.product_batches_of(src_wh, pid):
-            take = min(rest, b["qty"])
+            avail = b["qty"] - used.get((pid, b["expiry"]), 0)
+            take = min(rest, avail)
             if take > 0:
-                rows_.append((b["expiry"], take))
+                rows_.append(take_from(pid, b["expiry"], take))
                 rest -= take
             if not rest:
                 break
         if rest:
-            rows_.append(("", rest))
+            rows_.append(take_from(pid, "", rest))
         it["src_batches"] = rows_
 
 
 async def _finish_writeoff(q, context, actor, p):
     """Проведение списания после выбора партий и уточнения сроков."""
+    # Перепроверка остатка на кнопке: заявка сотрудника могла ждать админа
+    # до суток, товар за это время могли продать (минус допустим, как у
+    # перемещения, но подтверждающий должен его увидеть).
+    smap = db.stock_map(p["wh_id"])
+    minus = [
+        f"{it['name']} {it['volume']}: на складе "
+        f"{smap.get(it['product_id'], 0)}, списываем {it['qty']}"
+        for it in p["items"]
+        if it.get("product_id") and smap.get(it["product_id"], 0) < it["qty"]]
+    warn = ""
+    if minus:
+        warn = ("\n\n⚠️ Остаток изменился со времени заявки — уйдёт в минус:\n• "
+                + "\n• ".join(minus) + "\nЕсли это неверно — отмените: /undo")
     _fill_src_batches(p)
     op_id, summary, total = commit_writeoff(p)
     # Операция уже в базе — сбои уведомлений не должны выглядеть как
@@ -2853,7 +2899,7 @@ async def _finish_writeoff(q, context, actor, p):
     try:
         await q.edit_message_text(
             f"✅ {esc(summary)} — проведено (операция №{op_id}).\n"
-            f"Отменить: /undo {op_id}", parse_mode="HTML")
+            f"Отменить: /undo {op_id}" + esc(warn), parse_mode="HTML")
         if p.get("approver_id"):
             try:
                 await context.bot.send_message(
@@ -2982,7 +3028,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if kind == "no":
         PENDING.pop(token, None)
-        AWAIT_EXPIRY.pop((q.message.chat.id, q.from_user.id), None)
+        # Снимаем ожидание срока годности только если оно относится К ЭТОЙ
+        # заявке: «Отмена» на другой карточке не должна глушить чужой вопрос
+        # (находка ревизии 01.08.2026).
+        exp_key = (q.message.chat.id, q.from_user.id)
+        if AWAIT_EXPIRY.get(exp_key) == token:
+            AWAIT_EXPIRY.pop(exp_key, None)
         await q.answer()
         # Отменённое восстановление базы: подчистить временный файл
         if p.get("kind") in ("restore_db", "restore_db2") and p.get("path"):
@@ -3533,6 +3584,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Сообщения ----------
 
+# Ответ на вопрос о сроке — практически только дата («11.2028», «до 12.27»,
+# «срок 06.2029»). Либеральный _norm_expiry здесь опасен: «в 10.30 приеду»
+# или «оплатил 5.000» превращались бы в срок годности (ревизия 01.08.2026).
+EXPIRY_REPLY_RE = re.compile(
+    r"^(?:срок(?:\s+годности)?|до|годен\s+до)?[:\s]*"
+    r"(\d{1,2}\s*[./-]\s*\d{2,4})\s*(?:г(?:\.|ода)?)?\.?$",
+    re.IGNORECASE)
+
+
 async def expiry_reply(update, context, text: str) -> bool:
     """Сообщение — ответ на вопрос бота «какой срок годности?».
 
@@ -3546,18 +3606,27 @@ async def expiry_reply(update, context, text: str) -> bool:
     private = update.effective_chat.type == "private"
     p = get_pending(token)
     if p is None:
+        # Вопрос протух — не съедаем сообщение: пусть обработается как
+        # обычно, а про устаревший вопрос скажем отдельно.
         AWAIT_EXPIRY.pop(key, None)
         if private:
             await update.message.reply_text(
-                "⌛ Заявка устарела — отправьте операцию заново.")
-        return private
-    exp = _norm_expiry(text)
+                "⌛ Вопрос о сроке годности устарел — ту операцию нужно "
+                "отправить заново. Это сообщение обрабатываю как обычно.")
+        return False
+    m = EXPIRY_REPLY_RE.match(text.strip())
+    exp = _norm_expiry(m.group(1)) if m else ""
     if not exp:
         if private:
             await update.message.reply_text(
                 "Не понял срок годности. Напишите месяц и год — например: "
                 "<b>11.2028</b>\nИли нажмите «Отмена» под вопросом.",
                 parse_mode="HTML")
+        return private
+    actor = db.get_user(update.effective_user.id)
+    if actor is None or not actor["active"]:
+        AWAIT_EXPIRY.pop(key, None)
+        PENDING.pop(token, None)
         return private
     AWAIT_EXPIRY.pop(key, None)
     PENDING.pop(token, None)
@@ -3570,7 +3639,6 @@ async def expiry_reply(update, context, text: str) -> bool:
         return True
     it["expiry"] = exp
     it["expiry_asked"] = True      # на складе товар лежит без срока
-    actor = db.get_user(update.effective_user.id)
     responder = _MsgResponder(update.message)
     await update.message.reply_text(
         f"📅 Записал срок {exp}: {esc(it['name'])} {esc(it['volume'])}.",
@@ -4519,6 +4587,11 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    # Долги и телефоны клиентов — только в личке (та же логика, что закрыла
+    # /clients и /invoices аудитом 27.07: в группе PDF увидят все участники,
+    # в том числе по чужим складам).
+    if not await _require_private(update):
+        return
     arg = " ".join(context.args).strip() if context.args else ""
     if arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
@@ -4745,6 +4818,7 @@ def report_data(warehouses, days_back: int, last_hours: int = None):
     for wh in warehouses:
         inv_data, pay_sum, transfers = [], 0.0, 0
         ret_sum, ret_count = 0.0, 0
+        wo_sum, wo_count = 0.0, 0
         for op in ops:
             try:
                 data = json.loads(op["data"])
@@ -4757,6 +4831,9 @@ def report_data(warehouses, days_back: int, last_hours: int = None):
             elif op["type"] == "return" and op["warehouse_id"] == wh["id"]:
                 ret_sum += data.get("total", 0)
                 ret_count += 1
+            elif op["type"] == "writeoff" and op["warehouse_id"] == wh["id"]:
+                wo_sum += data.get("total", 0)
+                wo_count += 1
             elif op["type"] == "transfer" and wh["id"] in db.operation_warehouses(op):
                 transfers += 1
         sales = sum(d.get("total", 0) for d in inv_data)
@@ -4770,8 +4847,10 @@ def report_data(warehouses, days_back: int, last_hours: int = None):
             "wh": wh, "n_inv": len(inv_data), "sales": sales,
             "money": inv_payments + pay_sum, "debt_added": sales - inv_payments,
             "ret_count": ret_count, "ret_sum": ret_sum, "transfers": transfers,
+            "wo_count": wo_count, "wo_sum": wo_sum,
             "top": sorted(top.items(), key=lambda x: -x[1]),
-            "empty": not inv_data and not pay_sum and not transfers and not ret_count,
+            "empty": (not inv_data and not pay_sum and not transfers
+                      and not ret_count and not wo_count),
         })
     return out
 
@@ -4827,6 +4906,8 @@ def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
             rows.append(["Выдано в долг", money(d["debt_added"])])
         if d["ret_count"]:
             rows.append(["Возвраты", f"{d['ret_count']} на {money(d['ret_sum'])}"])
+        if d["wo_count"]:
+            rows.append(["Списания", f"{d['wo_count']} на {money(d['wo_sum'])}"])
         if d["transfers"]:
             rows.append(["Приходы/перемещения", str(d["transfers"])])
         sections.append({"title": f"Склад «{wh['name']}»",
@@ -5396,6 +5477,9 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    # Долги и телефоны — только в личке (см. show_debts).
+    if not await _require_private(update):
+        return
     min_days = DEBT_ALERT_DAYS
     if context.args:
         try:
@@ -5647,7 +5731,9 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_private(update):
         return
     try:
-        n = min(int(context.args[0]), 100) if context.args else 20
+        # Нижняя граница обязательна: отрицательный LIMIT в SQLite означает
+        # «без лимита» — /log -5 выгружал бы весь журнал за всю историю.
+        n = max(1, min(int(context.args[0]), 100)) if context.args else 20
     except ValueError:
         n = 20
     ops = db.recent_operations(n, None if is_admin(actor) else actor["id"])
