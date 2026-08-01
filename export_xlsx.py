@@ -17,6 +17,7 @@ OP_TYPES = {
     "return": "Возврат",
     "inventory": "Инвентаризация",
     "handover": "Инкассация",
+    "writeoff": "Списание",
 }
 
 HEADER_FILL = PatternFill("solid", fgColor="1B5E20")
