@@ -4217,7 +4217,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/act Имя — акт сверки в PDF",
         "/price — прайс-лист",
         "/pricepdf — красивый PDF-прайс для отправки клиентам",
-        "/log — последние операции",
+        "/log — журнал последних операций PDF-файлом (/log 50 — больше)",
         "/undo — отменить свою последнюю операцию (в течение часа)",
         "➕ <b>Дополнить накладную</b>: <i>добавь в последнюю накладную Мустанга: "
         "Дексатоп 50мл 5 шт</i>",
@@ -5633,6 +5633,12 @@ LOG_TYPE_ICONS = {"invoice": "🧾", "payment": "💵", "transfer": "📦",
                   "inventory": "📋", "return": "🔙", "handover": "💰",
                   "writeoff": "🗑"}
 
+# Названия типов операций для таблиц PDF (эмодзи в шрифте документа нет)
+LOG_TYPE_NAMES = {"invoice": "Накладная", "payment": "Оплата",
+                  "transfer": "Перемещение", "inventory": "Инвентаризация",
+                  "return": "Возврат", "handover": "Сдача выручки",
+                  "writeoff": "Списание"}
+
 
 async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
@@ -5641,9 +5647,9 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_private(update):
         return
     try:
-        n = min(int(context.args[0]), 30) if context.args else 10
+        n = min(int(context.args[0]), 100) if context.args else 20
     except ValueError:
-        n = 10
+        n = 20
     ops = db.recent_operations(n, None if is_admin(actor) else actor["id"])
     if not ops:
         await update.message.reply_text("Журнал пуст.")
@@ -5651,30 +5657,51 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Хронологический порядок: старые сверху, новые снизу — как в чате
     # (просьба владельца 25.07.2026).
     ops = list(reversed(ops))
-    lines = ["🗒 <b>Последние операции</b> (новые внизу)"]
-    last_day = None
+    sections, cancelled = [], 0
+    rows, last_day = [], None
+
+    def flush(day):
+        if rows:
+            sections.append({"title": day,
+                             "headers": ["№ оп.", "Время", "Сотрудник",
+                                         "Тип", "Операция"],
+                             "rows": list(rows), "widths": [16, 16, 28, 33, 89]})
+            rows.clear()
+
     for op in ops:
         try:
             dt = datetime.fromisoformat(op["ts"])
             day, tm = dt.strftime("%d.%m.%Y"), dt.strftime("%H:%M")
         except ValueError:
-            day, tm = "", op["ts"]
+            day, tm = "—", op["ts"]
         if day != last_day:
-            lines.append(f"\n📅 <b>{day}</b>")
+            flush(last_day)
             last_day = day
         u = db.get_user(op["user_id"])
         who = u["name"] if u else str(op["user_id"])
-        icon = LOG_TYPE_ICONS.get(op["type"], "▫️")
-        summary = esc(op["summary"])
+        summary = op["summary"]
         if op["status"] == "cancelled":
-            lines.append(f"❌ <b>№{op['id']}</b> · {tm} · {esc(who)} — <i>отменена</i>")
-            lines.append(f"<s>{summary}</s>")
-        else:
-            lines.append(f"{icon} <b>№{op['id']}</b> · {tm} · {esc(who)}")
-            lines.append(summary)
-        lines.append("")
-    lines.append("Отменить: /undo Номер (только админ) · Больше: /log 30")
-    await send_long(update.message, "\n".join(lines))
+            cancelled += 1
+            summary = f"ОТМЕНЕНА · {summary}"
+        rows.append([str(op["id"]), tm, who,
+                     LOG_TYPE_NAMES.get(op["type"], op["type"]), summary])
+    flush(last_day)
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    who_label = "все сотрудники" if is_admin(actor) else actor["name"]
+    footer = f"Операций в журнале: {len(ops)}"
+    if cancelled:
+        footer += f" · из них отменено: {cancelled}"
+    pdf = generate_report_pdf(
+        "ЖУРНАЛ ОПЕРАЦИЙ",
+        f"ОсОО «ВЕТОП» · последние {len(ops)} · {who_label} · на {date_str}",
+        sections, footer=footer)
+    caption = f"🗒 Последние операции: {len(ops)} (новые внизу)"
+    if is_admin(actor):
+        caption += "\nОтменить: /undo Номер"
+    caption += "\nБольше: /log 50 · подробности: /op Номер"
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"журнал_{date_str.replace('.', '')}.pdf"),
+        caption=caption)
 
 
 async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
