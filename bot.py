@@ -485,6 +485,28 @@ def _build_static_system() -> str:
     parts.append('- В items — ТОЛЬКО добавляемые товары; старые бот подставит сам. '
                  'Коробки переводи в штуки как обычно.')
     parts.append("")
+    parts.append("=== РЕЖИМ 15: СПИСАНИЕ ТОВАРА СО СКЛАДА ===")
+    parts.append('Если товар убирают со склада без покупателя и без денег («спиши '
+                 'Альтопен 100мл 5 шт — просрочка», «списание Каракол: Дексатоп 50мл '
+                 '3 шт, бой», «утилизация ...», «разбилось 2 флакона ...», '
+                 '«испортился ...»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "writeoff", "warehouse": null_или_имя_склада, '
+                 '"reason": "причина", '
+                 '"items": [{"name": "точное название из прайса", "volume": "фасовка", '
+                 '"qty": штук, "box_qty": коробок_или_null, "price": цена, '
+                 '"expiry": null_или_срок}]}')
+    parts.append('- "reason": причина коротко словами («просрочка», «бой», «порча», '
+                 '«недостача», «утилизация»); не названа — "не указана".')
+    parts.append('- "expiry": срок годности списываемой партии, если назван («срок '
+                 '11.2028», «11/28») — строкой "MM.YYYY"; не назван — null '
+                 '(бот спросит сам, это нормально).')
+    parts.append('- price бери из прайса — она нужна для суммы списания. '
+                 'Коробки переводи в штуки как обычно.')
+    parts.append('- Не путай с возвратом (там есть клиент, товар приходит НА склад) '
+                 'и с инвентаризацией (там фактический остаток, а не сколько убрать).')
+    parts.append('- Списание проводит только админ — заявка сотрудника уйдёт ему '
+                 'на подтверждение, это нормально.')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -1718,9 +1740,14 @@ def commit_transfer(p):
         rows = it.get("src_batches")
         if rows is None:
             rows = [(it["expiry"], it["qty"])] if it.get("expiry") else []
-        for exp, q_ in rows:
-            if p["from_wh_id"]:
+        if p["from_wh_id"]:
+            for exp, q_ in rows:
                 plan.setdefault((p["from_wh_id"], pid), []).append((exp, q_))
+        # Получателю срок позиции важнее партий источника: сотрудник мог
+        # назвать его в ответ на вопрос бота, а на источнике товар лежал
+        # без срока — уезжает он уже со сроком.
+        dest_rows = [(it["expiry"], it["qty"])] if it.get("expiry") else rows
+        for exp, q_ in dest_rows:
             if exp:
                 plan.setdefault((p["wh_id"], pid), []).append((exp, q_))
     stock_deltas = [(p["wh_id"], pid, q) for pid, q in dest.items()]
@@ -2333,6 +2360,120 @@ async def start_inventory(update, context, actor, data):
                                     reply_markup=confirm_kb(token))
 
 
+# ---------- Списание товара со склада ----------
+
+def writeoff_summary(p) -> str:
+    lines = ["🗑 <b>Списание товара</b>"]
+    if p.get("requester_name"):
+        lines.append(f"✍️ Заявка от: <b>{esc(p['requester_name'])}</b>")
+    lines.append(f"🏬 Склад: <b>{esc(p['wh_name'])}</b>")
+    lines.append(f"📝 Причина: <b>{esc(p['reason'])}</b>")
+    lines.append("")
+    total = 0.0
+    for i, it in enumerate(p["items"], 1):
+        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        exp = f" · срок {it['expiry']}" if it.get("expiry") else ""
+        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — "
+                     f"{box}{it['qty']} шт{exp}")
+        total += it["qty"] * it.get("price", 0)
+    lines.append("")
+    lines.append(f"💰 Сумма списания: <b>{money(total)}</b>")
+    smap = db.stock_map(p["wh_id"])
+    for it in p["items"]:
+        pid = it.get("product_id")
+        if pid and smap.get(pid, 0) < it["qty"]:
+            lines.append(f"⚠️ {esc(it['name'])} {esc(it['volume'])}: на складе "
+                         f"{smap.get(pid, 0)} шт — остаток уйдёт в минус")
+    for w in p.get("warnings", []):
+        lines.append(f"⚠️ {esc(w)}")
+    lines.append("")
+    lines.append("Списать этот товар со склада?")
+    return "\n".join(lines)
+
+
+def commit_writeoff(p):
+    """Убирает товар со склада без клиента и без денег (порча, просрочка, бой)."""
+    qty_by_pid, plan = {}, {}
+    for it in p["items"]:
+        pid = it.get("product_id")
+        if not pid:
+            continue
+        qty_by_pid[pid] = qty_by_pid.get(pid, 0) + it["qty"]
+        for exp, q_ in (it.get("src_batches") or []):
+            plan.setdefault((p["wh_id"], pid), []).append((exp, q_))
+    stock_deltas = [(p["wh_id"], pid, -q) for pid, q in qty_by_pid.items()]
+    total = sum(it["qty"] * it.get("price", 0) for it in p["items"])
+    summary = (f"Списание ({p['reason']}): склад {p['wh_name']}, "
+               f"{len(p['items'])} поз. на {fmt_num(total)} сом")
+    extra = {"items": [{k: it.get(k) for k in ("name", "volume", "qty", "box_qty",
+                                               "price", "expiry", "product_id")}
+                       for it in p["items"]],
+             "total": total, "reason": p["reason"]}
+    if p.get("approver_id"):
+        extra["approved_by"] = p["approver_id"]
+    op_id, _ = db.commit_operation(
+        p["user_id"], "writeoff", p["wh_id"], None, summary, stock_deltas, [],
+        extra, batch_plan=plan or None)
+    return op_id, summary, total
+
+
+async def start_writeoff(update, context, actor, data):
+    wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
+    if err:
+        await update.message.reply_text(err, parse_mode="HTML")
+        return
+    if transition_blocked(actor) and not wh["full_mode"]:
+        await update.message.reply_text(TRANSITION_HINT)
+        return
+    try:
+        items, warnings = parse_items(data.get("items") or [])
+    except ValueError as e:
+        await update.message.reply_text(f"⚠️ {e}")
+        return
+    for it, raw in zip(items, data.get("items") or []):
+        if isinstance(raw, dict) and raw.get("expiry"):
+            exp = _norm_expiry(raw["expiry"])
+            if exp:
+                it["expiry"] = exp
+    if not [it for it in items if it.get("product_id")]:
+        await update.message.reply_text(
+            "⚠️ Ни один товар не распознан по прайсу — списание не создано.")
+        return
+
+    payload = {
+        "kind": "writeoff", "user_id": actor["id"], "chat_id": update.effective_chat.id,
+        "wh_id": wh["id"], "wh_name": wh["name"],
+        "reason": str(data.get("reason") or "").strip() or "не указана",
+        "items": items, "warnings": warnings,
+    }
+
+    # Товар уходит со склада без денег — проводит только админ.
+    if not is_admin(actor):
+        payload["approver_id"] = ADMIN_ID
+        payload["requester_name"] = actor["name"]
+        token = new_pending(payload, ttl=APPROVAL_TTL)
+        try:
+            await context.bot.send_message(
+                ADMIN_ID, writeoff_summary(payload), parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+                ]]))
+        except Exception:
+            log.exception("Не удалось отправить списание админу")
+            PENDING.pop(token, None)
+            await update.message.reply_text("⚠️ Не удалось отправить админу. Попробуйте позже.")
+            return
+        await update.message.reply_text(
+            f"📨 Списание со склада «{esc(wh['name'])}» отправлено админу "
+            f"на подтверждение. Я сообщу результат.", parse_mode="HTML")
+        return
+
+    token = new_pending(payload)
+    await update.message.reply_text(writeoff_summary(payload), parse_mode="HTML",
+                                    reply_markup=confirm_kb(token))
+
+
 # ---------- Минимальные остатки ----------
 
 def low_stock_hits(stock_deltas):
@@ -2458,26 +2599,82 @@ async def minstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Кнопки ----------
 
 def _batch_src_wh(p):
-    """Склад, с которого списываются партии: у перемещения — источник."""
-    if p.get("kind") == "transfer" and p.get("from_wh_id"):
-        return p["from_wh_id"]
-    return p["wh_id"]
+    """Склад, с которого списываются партии: у перемещения — источник.
+    None — списывать неоткуда (приход товара извне)."""
+    if p.get("kind") == "transfer":
+        return p.get("from_wh_id")
+    return p.get("wh_id")
+
+
+def _dated_batches(src_wh, pid):
+    """Партии товара с известным сроком годности («без срока» не в счёт)."""
+    return [b for b in db.product_batches_of(src_wh, pid) if b["expiry"]]
 
 
 def _batch_questions(p):
-    """Позиции, для которых нужно спросить партию: у товара несколько партий
-    с разными сроками, срок не указан явно, выбор ещё не сделан."""
+    """Позиции, для которых нужно спросить партию кнопками: у товара несколько
+    датированных партий, их хватает на списание, срок не указан явно,
+    выбор ещё не сделан."""
     need = []
     choices = p.get("batch_choices") or {}
     src_wh = _batch_src_wh(p)
+    if not src_wh:
+        return need
     for i, it in enumerate(p["items"]):
         pid = it.get("product_id")
         if not pid or str(i) in choices or it.get("expiry"):
             continue
-        batches = db.product_batches_of(src_wh, pid)
-        if len(batches) > 1:
+        batches = _dated_batches(src_wh, pid)
+        if len(batches) > 1 and sum(b["qty"] for b in batches) >= it["qty"]:
             need.append((i, it, batches))
     return need
+
+
+# Операции, в которых товар уходит со склада и срок годности обязателен
+# (просьба владельца 01.08.2026: «без срока не пропускать»).
+EXPIRY_REQUIRED_KINDS = ("transfer", "writeoff")
+
+# У кого бот ждёт срок годности текстом: (chat_id, user_id) -> токен заявки
+AWAIT_EXPIRY = {}
+
+
+def _expiry_questions(p):
+    """Позиции, по которым срок годности неизвестен: датированных партий на
+    складе-источнике не хватает на списываемое количество. Такую операцию
+    не проводим, пока сотрудник не назовёт срок с упаковки."""
+    need = []
+    if p.get("kind") not in EXPIRY_REQUIRED_KINDS:
+        return need
+    src_wh = _batch_src_wh(p)
+    if not src_wh:
+        return need
+    choices = p.get("batch_choices") or {}
+    for i, it in enumerate(p["items"]):
+        pid = it.get("product_id")
+        if not pid or it.get("expiry") or choices.get(str(i)):
+            continue
+        if sum(b["qty"] for b in _dated_batches(src_wh, pid)) < it["qty"]:
+            need.append((i, it))
+    return need
+
+
+async def _ask_expiry(q, p, question, chat_id, user_id):
+    """Просит написать срок годности текстом и запоминает, кого ждём."""
+    i, it = question
+    p["awaiting_expiry"] = i
+    token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
+    AWAIT_EXPIRY[(chat_id, user_id)] = token
+    src_name = p.get("from_wh_name") or p.get("wh_name")
+    what = "перемещение" if p["kind"] == "transfer" else "списание"
+    await q.edit_message_text(
+        f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
+        f"На складе «{esc(src_name)}» у этого товара не записан срок годности.\n\n"
+        f"Посмотрите на упаковку и напишите срок ответным сообщением — "
+        f"например: <b>11.2028</b>\n"
+        f"Без срока годности {what} не провожу.",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup([[
+            InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")]]))
 
 
 async def _ask_batch(q, p, question):
@@ -2493,12 +2690,46 @@ async def _ask_batch(q, p, question):
     kb.append([InlineKeyboardButton(f"🔀 Сначала старые (до {batches[0]['expiry']})",
                                     callback_data=f"pbat:{token}:{i}:fefo")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
-    verb = ("Какую партию перемещаете?" if p["kind"] == "transfer"
-            else "Из какой партии продаёте?")
+    verb = {"transfer": "Какую партию перемещаете?",
+            "writeoff": "Какую партию списываете?"}.get(
+                p["kind"], "Из какой партии продаёте?")
     await q.edit_message_text(
         f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
         f"На складе несколько партий с разными сроками. {verb}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
+
+
+class _MsgResponder:
+    """Заглушка callback-кнопки: продолжение диалога обычным сообщением
+    (сотрудник ответил сроком годности текстом, кнопки уже нет)."""
+
+    def __init__(self, message):
+        self.message = message
+
+    async def edit_message_text(self, text, **kwargs):
+        await self.message.reply_text(text, **kwargs)
+
+    async def answer(self, *args, **kwargs):
+        return None
+
+
+async def _continue_op(q, context, actor, p, chat_id, user_id):
+    """Дозадаёт вопросы (партия кнопками, срок годности текстом) и проводит
+    операцию, когда спрашивать больше нечего."""
+    need = _batch_questions(p)
+    if need:
+        await _ask_batch(q, p, need[0])
+        return
+    need = _expiry_questions(p)
+    if need:
+        await _ask_expiry(q, p, need[0], chat_id, user_id)
+        return
+    if p["kind"] == "transfer":
+        await _finish_transfer(q, context, actor, p)
+    elif p["kind"] == "writeoff":
+        await _finish_writeoff(q, context, actor, p)
+    else:
+        await _finish_invoice(q, context, actor, p)
 
 
 async def _finish_invoice(q, context, actor, p):
@@ -2546,6 +2777,73 @@ async def _finish_invoice(q, context, actor, p):
             pass
 
 
+def _fill_src_batches(p):
+    """Раскладка списания по партиям склада-источника: явный срок / выбор
+    кнопкой / «сначала старые». Срок, названный в ответ на вопрос бота
+    (expiry_asked), к партиям источника не применяется — товар лежит там
+    без срока, списываем как есть, а сам срок уезжает с товаром."""
+    src_wh = _batch_src_wh(p)
+    if not src_wh:
+        return
+    choices = p.get("batch_choices") or {}
+    for i, it in enumerate(p["items"]):
+        pid = it.get("product_id")
+        if not pid:
+            continue
+        exp = ("" if it.get("expiry_asked") else (it.get("expiry") or "")) \
+            or choices.get(str(i)) or ""
+        if exp:
+            it["src_batches"] = [(exp, it["qty"])]
+            continue
+        rows_, rest = [], it["qty"]
+        for b in db.product_batches_of(src_wh, pid):
+            take = min(rest, b["qty"])
+            if take > 0:
+                rows_.append((b["expiry"], take))
+                rest -= take
+            if not rest:
+                break
+        if rest:
+            rows_.append(("", rest))
+        it["src_batches"] = rows_
+
+
+async def _finish_writeoff(q, context, actor, p):
+    """Проведение списания после выбора партий и уточнения сроков."""
+    _fill_src_batches(p)
+    op_id, summary, total = commit_writeoff(p)
+    # Операция уже в базе — сбои уведомлений не должны выглядеть как
+    # «не проведено» (см. _finish_invoice).
+    try:
+        await q.edit_message_text(
+            f"✅ {esc(summary)} — проведено (операция №{op_id}).\n"
+            f"Отменить: /undo {op_id}", parse_mode="HTML")
+        if p.get("approver_id"):
+            try:
+                await context.bot.send_message(
+                    p["chat_id"],
+                    f"✅ Админ подтвердил списание (операция №{op_id}): "
+                    f"{esc(summary)}", parse_mode="HTML")
+            except Exception:
+                log.warning("Не удалось уведомить заявителя о списании")
+        else:
+            await notify_admin(context, actor, summary)
+        await feed_operation(context, op_id, db.get_user(p["user_id"])["name"],
+                             "🗑", exclude_chat_id=p["chat_id"])
+        await alert_low_stock(context, [
+            (p["wh_id"], it["product_id"], -it["qty"])
+            for it in p["items"] if it.get("product_id")])
+    except Exception:
+        log.exception("Операция №%s проведена, но уведомления не дошли", op_id)
+        try:
+            await q.edit_message_text(
+                f"✅ Списание ПРОВЕДЕНО (операция №{op_id}), но часть "
+                "уведомлений не отправилась. Повторно проводить НЕ нужно — "
+                f"документ: /op {op_id}")
+        except Exception:
+            pass
+
+
 async def _finish_transfer(q, context, actor, p):
     """Проведение перемещения/прихода после проверок и выбора партий."""
     # Перепроверка остатка на кнопке: заявка могла ждать до суток,
@@ -2564,28 +2862,7 @@ async def _finish_transfer(q, context, actor, p):
             warn = ("\n\n⚠️ Остаток изменился со времени заявки — "
                     "уйдёт в минус:\n• " + "\n• ".join(minus) +
                     "\nЕсли это неверно — отмените: /undo")
-        # Раскладка по партиям источника: явный срок / выбор кнопкой /
-        # «сначала старые» — она же переносит сроки на склад-получатель.
-        choices = p.get("batch_choices") or {}
-        for i, it in enumerate(p["items"]):
-            pid = it.get("product_id")
-            if not pid:
-                continue
-            exp = it.get("expiry") or choices.get(str(i))
-            if exp:
-                it["src_batches"] = [(exp, it["qty"])]
-                continue
-            rows_, rest = [], it["qty"]
-            for b in db.product_batches_of(p["from_wh_id"], pid):
-                take = min(rest, b["qty"])
-                if take > 0:
-                    rows_.append((b["expiry"], take))
-                    rest -= take
-                if not rest:
-                    break
-            if rest:
-                rows_.append(("", rest))
-            it["src_batches"] = rows_
+    _fill_src_batches(p)
     op_id, summary = commit_transfer(p)
     # Операция уже в базе — сбои уведомлений не должны выглядеть как
     # «не проведено» (см. _finish_invoice).
@@ -2669,6 +2946,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if kind == "no":
         PENDING.pop(token, None)
+        AWAIT_EXPIRY.pop((q.message.chat.id, q.from_user.id), None)
         await q.answer()
         # Отменённое восстановление базы: подчистить временный файл
         if p.get("kind") in ("restore_db", "restore_db2") and p.get("path"):
@@ -2683,6 +2961,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         f"со стартовым долгом")
             elif p["kind"] == "inventory":
                 what = f"инвентаризацию склада «{esc(p['wh_name'])}»"
+            elif p["kind"] == "writeoff":
+                what = f"списание со склада «{esc(p['wh_name'])}»"
             elif p["kind"] == "return":
                 what = f"возврат от «{esc(p.get('client_name') or '')}»"
             elif p["kind"] == "handover":
@@ -2870,15 +3150,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             current = {b["expiry"] for b in db.product_batches_of(
                 _batch_src_wh(p), item.get("product_id") or 0)}
             choices[idx] = exp if exp in current else ""
-        need = _batch_questions(p)
-        if need:
-            await _ask_batch(q, p, need[0])
-            return
         try:
-            if p["kind"] == "transfer":
-                await _finish_transfer(q, context, actor, p)
-            else:
-                await _finish_invoice(q, context, actor, p)
+            await _continue_op(q, context, actor, p,
+                               q.message.chat.id, q.from_user.id)
         except Exception as e:
             log.exception("Ошибка проведения после выбора партии")
             await q.edit_message_text(f"⚠️ Операция НЕ проведена: {e}")
@@ -2904,11 +3178,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # У товара несколько партий с разными сроками — спрашиваем,
                 # какую продать (просьба владельца 25.07.2026: сотрудник мог
                 # физически взять новую партию, FEFO молча списал бы старую).
-                need = _batch_questions(p)
-                if need:
-                    await _ask_batch(q, p, need[0])
-                    return
-                await _finish_invoice(q, context, actor, p)
+                await _continue_op(q, context, actor, p,
+                                   q.message.chat.id, q.from_user.id)
             elif p["kind"] == "payment":
                 op_id, client_label, old_debt, summary = commit_payment(p)
                 await q.edit_message_text(
@@ -2918,16 +3189,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await notify_admin(context, actor, summary)
                 await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "💵",
                                      exclude_chat_id=p["chat_id"])
-            elif p["kind"] == "transfer":
-                # Перемещение с многопартийным товаром — спрашиваем, какую
-                # партию перемещают (как при продаже); выбранный срок
-                # переезжает на склад-получатель.
-                if p.get("from_wh_id"):
-                    need = _batch_questions(p)
-                    if need:
-                        await _ask_batch(q, p, need[0])
-                        return
-                await _finish_transfer(q, context, actor, p)
+            elif p["kind"] in ("transfer", "writeoff"):
+                # Перемещение и списание: спрашиваем, какую партию забираем
+                # (выбранный срок переезжает на склад-получатель), а если
+                # срок у товара вообще не записан — просим написать его
+                # текстом и без него операцию не проводим.
+                await _continue_op(q, context, actor, p,
+                                   q.message.chat.id, q.from_user.id)
             elif p["kind"] == "handover":
                 op_id, summary = commit_handover(p)
                 remaining = db.cash_on_hand(p["user_id"])
@@ -3229,6 +3497,56 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Сообщения ----------
 
+async def expiry_reply(update, context, text: str) -> bool:
+    """Сообщение — ответ на вопрос бота «какой срок годности?».
+
+    True — сообщение обработано (в ИИ не идёт: и быстрее, и бесплатно).
+    В группе непонятный ответ пропускаем дальше как обычное сообщение,
+    чтобы не мешать разговору; вопрос остаётся висеть."""
+    key = (update.effective_chat.id, update.effective_user.id)
+    token = AWAIT_EXPIRY.get(key)
+    if not token:
+        return False
+    private = update.effective_chat.type == "private"
+    p = get_pending(token)
+    if p is None:
+        AWAIT_EXPIRY.pop(key, None)
+        if private:
+            await update.message.reply_text(
+                "⌛ Заявка устарела — отправьте операцию заново.")
+        return private
+    exp = _norm_expiry(text)
+    if not exp:
+        if private:
+            await update.message.reply_text(
+                "Не понял срок годности. Напишите месяц и год — например: "
+                "<b>11.2028</b>\nИли нажмите «Отмена» под вопросом.",
+                parse_mode="HTML")
+        return private
+    AWAIT_EXPIRY.pop(key, None)
+    PENDING.pop(token, None)
+    idx = p.pop("awaiting_expiry", None)
+    try:
+        it = p["items"][int(idx)]
+    except (TypeError, ValueError, IndexError, KeyError):
+        await update.message.reply_text(
+            "⌛ Заявка устарела — отправьте операцию заново.")
+        return True
+    it["expiry"] = exp
+    it["expiry_asked"] = True      # на складе товар лежит без срока
+    actor = db.get_user(update.effective_user.id)
+    responder = _MsgResponder(update.message)
+    await update.message.reply_text(
+        f"📅 Записал срок {exp}: {esc(it['name'])} {esc(it['volume'])}.",
+        parse_mode="HTML")
+    try:
+        await _continue_op(responder, context, actor, p, key[0], key[1])
+    except Exception as e:
+        log.exception("Ошибка проведения после ответа о сроке годности")
+        await update.message.reply_text(f"⚠️ Операция НЕ проведена: {e}")
+    return True
+
+
 async def process_text(update, context, actor, text, draft=False, quiet=False):
     chat_id = update.effective_chat.id
     history = chat_histories.setdefault(chat_id, [])
@@ -3258,7 +3576,7 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
 
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
-WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory",
+WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory", "writeoff",
                      "amend_invoice", "set_min", "set_phone", "set_price",
                      "client_alias"}
 
@@ -3339,6 +3657,8 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             await start_set_min(update, context, actor, data)
         elif action == "inventory":
             await start_inventory(update, context, actor, data)
+        elif action == "writeoff":
+            await start_writeoff(update, context, actor, data)
         elif action == "set_price":
             await start_set_price(update, context, actor, data)
         elif action == "change_price":
@@ -3669,6 +3989,10 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Эхо «Распознал» — в личке всегда; в чате склада — выше, только
         # после обращения «Джарвис».
         await update.message.reply_text(f"🎤 Распознал: «{text}»")
+    # Срок годности можно и продиктовать: «одиннадцать двадцать восемь»
+    # распознаётся как «11.28» — этого достаточно.
+    if await expiry_reply(update, context, text):
+        return
     draft = False
     m = DRAFT_RE.match(text)
     if m:
@@ -3734,7 +4058,8 @@ def _strip_wake_word(text: str):
 # цифрами (аудит 27.07.2026: «Долго ждать» ловилось на «долг», «Телефон
 # разрядился» — на «телефон»).
 OP_STRONG = ("приход", "наклад", "черновик", "возврат", "перемещ",
-             "инвентариз", "сдал", "сдаю", "обещал", "обеща", "спеццен")
+             "инвентариз", "сдал", "сдаю", "обещал", "обеща", "спеццен",
+             "спиши", "списан", "списать", "просрочк", "утилиз")
 OP_WEAK = ("оплат", "заплат", "минимал", "минимум", "телефон", "добавь",
            "долг")
 
@@ -3766,6 +4091,10 @@ def _looks_like_operation(text: str) -> bool:
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or not update.message.text:
+        return
+    # Ответ на вопрос о сроке годности ловим до всех фильтров: голое
+    # «11.2028» в чате склада на операцию не похоже и иначе потерялось бы.
+    if await expiry_reply(update, context, update.message.text.strip()):
         return
     quiet = False
     if update.effective_chat.type != "private":
@@ -3866,6 +4195,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "<i>инвентаризация: Альтопен 100мл 18, Дексатоп 50мл 9</i>",
         "🔙 <b>Возврат товара</b> (подтверждает админ):",
         "<i>возврат от Асана: Альтопен 100мл 5 шт</i>",
+        "🗑 <b>Списание</b> — порча, бой, просрочка (подтверждает админ):",
+        "<i>спиши Альтопен 100мл 5 шт — просрочка</i>",
+        "📅 При перемещении и списании бот спросит срок годности, если он "
+        "у товара не записан — посмотрите на упаковку и напишите его "
+        "(например <i>11.2028</i>).",
         "💰 <b>Сдать выручку</b>: <i>сдал 50000</i> · /cash — ваша касса",
         "📞 <b>Телефон клиента</b>: <i>телефон Асана: 0700 12 34 56</i>",
         "📅 <b>Обещание оплаты</b>: <i>Асан обещал 50000 в пятницу</i> — утром "
@@ -5250,7 +5584,8 @@ async def weekly_debt_loop(app):
 
 
 LOG_TYPE_ICONS = {"invoice": "🧾", "payment": "💵", "transfer": "📦",
-                  "inventory": "📋", "return": "🔙", "handover": "💰"}
+                  "inventory": "📋", "return": "🔙", "handover": "💰",
+                  "writeoff": "🗑"}
 
 
 async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -5329,7 +5664,7 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     type_names = {"invoice": "Накладная", "payment": "Приход денег",
                   "transfer": "Перемещение / приход товара",
                   "inventory": "Инвентаризация", "return": "Возврат",
-                  "handover": "Сдача выручки"}
+                  "handover": "Сдача выручки", "writeoff": "Списание"}
     info = [["Тип", type_names.get(op["type"], op["type"])],
             ["Статус", "❌ ОТМЕНЕНА" if op["status"] == "cancelled"
              else "проведена"],
