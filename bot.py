@@ -904,8 +904,8 @@ def commit_invoice(p, replace_op_id=None):
     # или его отсутствие = «сначала старые» (FEFO внутри _apply_batches).
     batch_plan = {}
     for i, it in enumerate(p["items"]):
-        exp = (p.get("batch_choices") or {}).get(str(i))
-        if exp and it.get("product_id"):
+        exp = _choice_batch((p.get("batch_choices") or {}).get(str(i)))
+        if exp is not None and it.get("product_id"):
             batch_plan.setdefault((p["wh_id"], it["product_id"]), []).append(
                 (exp, it["qty"]))
     if replace_op_id:
@@ -2611,21 +2611,50 @@ def _dated_batches(src_wh, pid):
     return [b for b in db.product_batches_of(src_wh, pid) if b["expiry"]]
 
 
-def _batch_questions(p):
-    """Позиции, для которых нужно спросить партию кнопками: у товара несколько
-    датированных партий, их хватает на списание, срок не указан явно,
-    выбор ещё не сделан."""
-    need = []
-    choices = p.get("batch_choices") or {}
+# Кнопка «партия без срока»: пустой выбор означает FEFO, поэтому партию
+# без срока кодируем отдельным знаком (иначе выбор «без срока» списывал
+# бы самую старую датированную партию).
+BATCH_NO_EXPIRY = "~"
+
+
+def _choice_batch(choice):
+    """Выбор кнопкой -> срок партии для плана списания.
+    None — выбора нет («сначала старые», FEFO)."""
+    if not choice:
+        return None
+    return "" if choice == BATCH_NO_EXPIRY else choice
+
+
+def _batch_options(p, pid, qty):
+    """Партии товара для кнопок «какую партию?».
+
+    Продажа — все партии, что реально лежат на складе (в том числе без
+    срока): продавец должен сказать, какую коробку взял. Перемещение и
+    списание — только датированные и только если их хватает: без срока
+    такую операцию всё равно не проводим, спросим дату текстом."""
     src_wh = _batch_src_wh(p)
     if not src_wh:
+        return []
+    batches = db.product_batches_of(src_wh, pid)
+    if p.get("kind") in EXPIRY_REQUIRED_KINDS:
+        dated = [b for b in batches if b["expiry"]]
+        return dated if sum(b["qty"] for b in dated) >= qty else []
+    return batches
+
+
+def _batch_questions(p):
+    """Позиции, для которых нужно спросить партию кнопками: у товара на складе
+    несколько партий, срок не указан явно, выбор ещё не сделан."""
+    need = []
+    choices = p.get("batch_choices") or {}
+    if not _batch_src_wh(p):
         return need
     for i, it in enumerate(p["items"]):
         pid = it.get("product_id")
         if not pid or str(i) in choices or it.get("expiry"):
             continue
-        batches = _dated_batches(src_wh, pid)
-        if len(batches) > 1 and sum(b["qty"] for b in batches) >= it["qty"]:
+        batches = _batch_options(p, pid, it["qty"])
+        if len(batches) > 1:
             need.append((i, it, batches))
     return need
 
@@ -2651,7 +2680,7 @@ def _expiry_questions(p):
     choices = p.get("batch_choices") or {}
     for i, it in enumerate(p["items"]):
         pid = it.get("product_id")
-        if not pid or it.get("expiry") or choices.get(str(i)):
+        if not pid or it.get("expiry") or _choice_batch(choices.get(str(i))):
             continue
         if sum(b["qty"] for b in _dated_batches(src_wh, pid)) < it["qty"]:
             need.append((i, it))
@@ -2684,11 +2713,14 @@ async def _ask_batch(q, p, question):
     # должно после вопроса о партии жить 15 минут. В кнопке — сам срок,
     # а не порядковый номер (за время вопросов список партий мог измениться).
     token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
-    kb = [[InlineKeyboardButton(f"📅 до {b['expiry']} — {b['qty']} шт",
-                                callback_data=f"pbat:{token}:{i}:{b['expiry'] or '~'}")]
-          for b in batches]
-    kb.append([InlineKeyboardButton(f"🔀 Сначала старые (до {batches[0]['expiry']})",
-                                    callback_data=f"pbat:{token}:{i}:fefo")])
+    kb = [[InlineKeyboardButton(
+        (f"📅 до {b['expiry']} — {b['qty']} шт" if b["expiry"]
+         else f"📦 Без срока — {b['qty']} шт"),
+        callback_data=f"pbat:{token}:{i}:{b['expiry'] or BATCH_NO_EXPIRY}")]
+        for b in batches]
+    fefo = ("🔀 Сначала старые"
+            + (f" (до {batches[0]['expiry']})" if batches[0]["expiry"] else ""))
+    kb.append([InlineKeyboardButton(fefo, callback_data=f"pbat:{token}:{i}:fefo")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
     verb = {"transfer": "Какую партию перемещаете?",
             "writeoff": "Какую партию списываете?"}.get(
@@ -2790,8 +2822,12 @@ def _fill_src_batches(p):
         pid = it.get("product_id")
         if not pid:
             continue
-        exp = ("" if it.get("expiry_asked") else (it.get("expiry") or "")) \
-            or choices.get(str(i)) or ""
+        exp = "" if it.get("expiry_asked") else (it.get("expiry") or "")
+        if not exp:
+            picked = _choice_batch(choices.get(str(i)))
+            if picked is not None:
+                it["src_batches"] = [(picked, it["qty"])]
+                continue
         if exp:
             it["src_batches"] = [(exp, it["qty"])]
             continue
@@ -3146,10 +3182,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             # В кнопке закодирован сам срок («~» = партия без срока);
             # сверяем с текущими партиями — устаревший выбор уходит в FEFO.
-            exp = "" if choice == "~" else choice
+            exp = "" if choice == BATCH_NO_EXPIRY else choice
             current = {b["expiry"] for b in db.product_batches_of(
                 _batch_src_wh(p), item.get("product_id") or 0)}
-            choices[idx] = exp if exp in current else ""
+            choices[idx] = (choice if exp in current else "")
         try:
             await _continue_op(q, context, actor, p,
                                q.message.chat.id, q.from_user.id)
