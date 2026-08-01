@@ -355,6 +355,16 @@ def api_usage_since(start_iso: str):
     return row[0], row[1]
 
 
+def api_cache_stats(start_iso: str):
+    """Суммы входных токенов с даты: (без кэша, чтение кэша, запись кэша).
+    Нужны /api для строки о здоровье кэша промпта."""
+    row = connect().execute(
+        "SELECT COALESCE(SUM(input_tokens), 0), COALESCE(SUM(cache_read), 0), "
+        "COALESCE(SUM(cache_write), 0) FROM api_usage WHERE ts >= ?",
+        (start_iso,)).fetchone()
+    return row[0], row[1], row[2]
+
+
 def seed_products(seed: list):
     """Первое заполнение прайса из кода; дальше прайс живёт в базе."""
     conn = connect()

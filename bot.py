@@ -558,6 +558,21 @@ def _build_static_system() -> str:
 STATIC_SYSTEM = _build_static_system()
 
 
+def _static_prompt_problems() -> list:
+    """Самопроверка экономии при старте: статичный блок обязан быть
+    байт-в-байт одинаковым от вызова к вызову и без сегодняшней даты —
+    иначе кэш промпта (90% скидка на правила+прайс) молча перестаёт
+    работать, и каждый запрос платит полную цену. Список проблем пустой,
+    когда всё в порядке; найденное уходит тревогой админу в _post_init."""
+    problems = []
+    if _build_static_system() != _build_static_system():
+        problems.append("статичный блок промпта собирается по-разному "
+                        "от вызова к вызову")
+    if datetime.now(BISHKEK).strftime("%d.%m.%Y") in STATIC_SYSTEM:
+        problems.append("в статичный блок промпта попала сегодняшняя дата")
+    return problems
+
+
 def _refresh_price_dependents():
     """После изменения прайса: пересобрать системный промпт и подсказку Whisper.
     Кэш промпта при этом обновится один раз — это нормально."""
@@ -5656,6 +5671,21 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"За 30 дней: <b>${spent_month:.2f}</b> ({n_month} запросов)",
         f"Модель: {esc(CLAUDE_MODEL)}",
     ]
+    # Здоровье кэша промпта: правила и прайс должны идти по скидке 90%.
+    # Если доля кэша упала — какое-то обновление сломало кэширование, и
+    # каждый запрос платит полную цену; это видно здесь без разработчика.
+    inp, cread, cwrite = db.api_cache_stats(
+        (today - timedelta(days=29)).isoformat(timespec="seconds"))
+    total_in = inp + cread + cwrite
+    if n_month >= 20 and total_in:
+        share = cread * 100 // total_in
+        if share >= 40:
+            lines.append(f"♻️ Кэш промпта работает: {share}% входных токенов "
+                         f"по скидке 90% (за 30 дней)")
+        else:
+            lines.append(f"⚠️ Кэш промпта работает слабо: только {share}% "
+                         f"входных токенов из кэша — запросы дороже обычного. "
+                         f"Покажите это сообщение Джарвису.")
     balance = db.get_setting("api_balance")
     balance_ts = db.get_setting("api_balance_ts")
     if balance and balance_ts:
@@ -6833,6 +6863,16 @@ async def _post_init(app):
                 parse_mode="HTML")
         except Exception:
             log.exception("Не удалось отправить предупреждение о хранилище")
+    for prob in _static_prompt_problems():
+        log.warning("Кэш промпта под угрозой: %s", prob)
+        try:
+            await app.bot.send_message(
+                ADMIN_ID,
+                f"⚠️ Проверка расходов ИИ: {prob}. Кэш промпта может не "
+                f"работать — запросы будут дороже обычного. Покажите это "
+                f"сообщение Джарвису.")
+        except Exception:
+            log.exception("Не удалось отправить предупреждение о кэше промпта")
     app.create_task(evening_summary_loop(app))
     app.create_task(weekly_debt_loop(app))
     app.create_task(daily_backup_loop(app))
