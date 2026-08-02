@@ -408,7 +408,8 @@ def generate_act_pdf(client_name, warehouse_name, rows, start_debt, end_debt,
 def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                          payment=0, is_payment=False, warehouse_name=None,
                          draft=False, watermark=True, doc_title=None,
-                         total_label=None, extra_totals=None) -> io.BytesIO:
+                         total_label=None, extra_totals=None,
+                         doc_number=None) -> io.BytesIO:
     """Красивый PDF: логотип, таблица товаров, итоги.
 
     draft=True не меняет содержимое, только оформление: водяной знак и пометка
@@ -462,6 +463,10 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
             pass
 
     title = doc_title or ("НАКЛАДНАЯ (ЧЕРНОВИК)" if show_mark else "НАКЛАДНАЯ")
+    if doc_number:
+        # Номер операции из журнала: по нему накладную находят в /op и /log
+        # и заменяют («замени накладную №45: ...»).
+        title += f" № {doc_number}"
     story.append(Paragraph(title, title_style))
     story.append(Paragraph(datetime.now(BISHKEK).strftime("%d.%m.%Y"), sub_style))
     story.append(Paragraph(f"Контрагент: <b>{xml_escape(str(client_name))}</b>", sub_style))
