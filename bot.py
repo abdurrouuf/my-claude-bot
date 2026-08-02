@@ -158,6 +158,38 @@ def money(n) -> str:
     return f"{fmt_num(n)} сом"
 
 
+def fmt_usd(x) -> str:
+    """$0.47, $1.7, $87.5 — без хвостовых нулей (fmt_num округляет до целых)."""
+    return f"{float(x):.2f}".rstrip("0").rstrip(".")
+
+
+def usd_rate() -> float:
+    """Курс сом/$ для закупочных цен (settings usd_rate, задаёт админ)."""
+    try:
+        return float(db.get_setting("usd_rate") or 0)
+    except ValueError:
+        return 0.0
+
+
+def buy_markup_pct() -> float:
+    """Накладные расходы на закуп в % (таможня, доставка) — settings."""
+    try:
+        return float(db.get_setting("buy_markup_pct") or 0)
+    except ValueError:
+        return 0.0
+
+
+def buy_som_map() -> dict:
+    """{product_id: закупочная цена в СОМАХ с учётом курса и накладных
+    расходов}. Пусто, если курс не задан. Только для отчётов админа —
+    в промпт ИИ закупочные цены не попадают (секрет + лишние токены)."""
+    rate = usd_rate()
+    if rate <= 0:
+        return {}
+    k = rate * (1 + buy_markup_pct() / 100)
+    return {pid: usd * k for pid, usd in db.products_buy_map().items()}
+
+
 def is_admin(user_row) -> bool:
     return user_row["role"] == "admin"
 
@@ -525,6 +557,26 @@ def _build_static_system() -> str:
                  'и с инвентаризацией (там фактический остаток, а не сколько убрать).')
     parts.append('- Списание проводит только админ — заявка сотрудника уйдёт ему '
                  'на подтверждение, это нормально.')
+    parts.append("")
+    parts.append("=== РЕЖИМ 17: ЗАКУП И КУРС (только админ) ===")
+    parts.append('Закупочная цена товара — слова «закуп», «закупочная цена», '
+                 '«себестоимость» («закупочная цена Дексатоп 50мл 0.47», '
+                 '«закуп Пенстоп-G 100мл 2.5 доллара», можно списком), '
+                 'верни ТОЛЬКО JSON:')
+    parts.append('{"action": "set_buy_price", "currency": "usd", '
+                 '"items": [{"name": "точное название из прайса", '
+                 '"volume": "фасовка", "price": цена_за_штуку}]}')
+    parts.append('- currency: "usd" по умолчанию (закупают в долларах); '
+                 'если явно сказано «сом» — "som".')
+    parts.append('- price — цена за ОДНУ штуку (единицу прайса); количества '
+                 'здесь нет, коробки в штуки не переводи.')
+    parts.append('Курс доллара («курс 88», «курс доллара 87.5») → '
+                 '{"action": "set_usd_rate", "rate": число}')
+    parts.append('Накладные расходы на закуп («накладные расходы 10%», '
+                 '«расходы на растаможку 12 процентов») → '
+                 '{"action": "set_buy_markup", "percent": число}')
+    parts.append('- Не путай с режимом 11: там ПРОДАЖНАЯ цена прайса, здесь — '
+                 'закупочная (слова «закуп», «курс», «расходы»).')
     parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
@@ -2328,6 +2380,97 @@ async def start_change_price(update, context, actor, data):
                                     reply_markup=confirm_kb(token))
 
 
+async def start_set_buy_price(update, context, actor, data):
+    """«Закупочная цена Дексатоп 50мл 0.47» (админ) — в долларах за единицу
+    прайса; «... 41 сом» переводится в доллары по текущему курсу."""
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Закупочные цены задаёт только админ.")
+        return
+    rate = usd_rate()
+    cur = str(data.get("currency") or "usd").lower()
+    if cur == "som" and rate <= 0:
+        await update.message.reply_text(
+            "Сначала задайте курс доллара: напишите, например, «курс 87.5».")
+        return
+    items, missing = [], []
+    for raw in (data.get("items") or []):
+        name = str(raw.get("name") or "")
+        volume = str(raw.get("volume") or "")
+        product = prices.match_product(name, volume)
+        if product is None:
+            missing.append(f"{name} {volume}".strip())
+            continue
+        try:
+            price = float(raw.get("price"))
+        except (TypeError, ValueError):
+            missing.append(f"{name} {volume} (не понял цену)")
+            continue
+        if price <= 0:
+            missing.append(f"{name} {volume} (цена должна быть больше нуля)")
+            continue
+        usd = round(price / rate, 4) if cur == "som" else price
+        items.append({"product_id": product["id"], "name": product["name"],
+                      "volume": product["volume"], "usd": usd})
+    if missing:
+        await update.message.reply_text(
+            "⚠️ Не понял позиции: " + "; ".join(missing) +
+            "\nНичего не менял — напишите ещё раз точнее.")
+        return
+    if not items:
+        await update.message.reply_text("Не понял, каким товарам задать закупочную цену.")
+        return
+    payload = {"kind": "set_buy", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id, "items": items}
+    token = new_pending(payload)
+    lines = ["📥 <b>Закупочные цены</b> (за единицу прайса):", ""]
+    for i, it in enumerate(items, 1):
+        som = f" ≈ {money(it['usd'] * rate)}" if rate > 0 else ""
+        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — "
+                     f"<b>${fmt_usd(it['usd'])}</b>{som}")
+    lines += ["", "Сохранить?"]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML",
+                                    reply_markup=confirm_kb(token))
+
+
+async def start_set_usd_rate(update, context, actor, data):
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Курс доллара задаёт только админ.")
+        return
+    try:
+        rate = float(str(data.get("rate") or "").replace(",", "."))
+    except ValueError:
+        rate = 0
+    if not (1 <= rate <= 1000):
+        await update.message.reply_text(
+            "Не понял курс. Напишите, например: «курс 87.5».")
+        return
+    old = usd_rate()
+    db.set_setting("usd_rate", str(rate))
+    note = f" (был {fmt_usd(old)})" if old > 0 else ""
+    await update.message.reply_text(
+        f"💱 Курс сохранён: {fmt_usd(rate)} сом/${note}.\n"
+        f"Маржа в /margin и /stockcost теперь считается по нему.")
+
+
+async def start_set_buy_markup(update, context, actor, data):
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Накладные расходы задаёт только админ.")
+        return
+    try:
+        pct = float(str(data.get("percent") or "").replace(",", ".").replace("%", ""))
+    except ValueError:
+        pct = -1
+    if not (0 <= pct <= 200):
+        await update.message.reply_text(
+            "Не понял процент. Напишите, например: «накладные расходы 10%».")
+        return
+    db.set_setting("buy_markup_pct", str(pct))
+    await update.message.reply_text(
+        f"📦 Накладные расходы на закуп: +{fmt_usd(pct)}%.\n"
+        f"Себестоимость в /margin и /stockcost = закуп × курс "
+        f"× {fmt_usd(1 + pct / 100)}.")
+
+
 def set_price_summary(p) -> str:
     c = db.client_get(p["client_id"])
     lines = [f"💲 <b>Спеццены — клиент «{esc(c['name'])}» (склад «{esc(p['wh_name'])}»)</b>", ""]
@@ -3549,6 +3692,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Посмотреть: /client {esc(c['name'])}", parse_mode="HTML")
                 await notify_admin(context, actor,
                                    f"спеццены для {c['name']}: {len(p['items'])} поз.")
+            elif p["kind"] == "set_buy":
+                for it in p["items"]:
+                    db.product_set_buy(it["product_id"], it["usd"])
+                await q.edit_message_text(
+                    f"✅ Закупочные цены сохранены ({len(p['items'])} поз.). "
+                    f"Отчёты: /margin, /stockcost, настройки: /rate")
             elif p["kind"] == "set_min":
                 for it in p["items"]:
                     db.set_min_stock(p["wh_id"], it["product_id"], it["qty"])
@@ -3990,6 +4139,12 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             await start_set_price(update, context, actor, data)
         elif action == "change_price":
             await start_change_price(update, context, actor, data)
+        elif action == "set_buy_price":
+            await start_set_buy_price(update, context, actor, data)
+        elif action == "set_usd_rate":
+            await start_set_usd_rate(update, context, actor, data)
+        elif action == "set_buy_markup":
+            await start_set_buy_markup(update, context, actor, data)
         elif action == "add_clients":
             await start_add_clients(update, context, actor, data)
         elif action == "client_alias":
@@ -5820,6 +5975,226 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📊 Экспорт {label}: операции, долги, остатки, кассы")
 
 
+async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Настройки закупа: курс, накладные расходы, сколько цен задано."""
+    if await _require_admin(update) is None:
+        return
+    rate, mk = usd_rate(), buy_markup_pct()
+    n = len(db.products_buy_map())
+    lines = [
+        f"💱 Курс: <b>{fmt_usd(rate) if rate else 'не задан'}</b> сом/$",
+        f"📦 Накладные расходы на закуп: <b>+{fmt_usd(mk)}%</b>",
+        f"📥 Закупочные цены заданы: <b>{n}</b> из {len(prices.PRICE_LIST_DATA)} товаров",
+        "",
+        "Изменить фразой: «курс 88», «накладные расходы 10%»,",
+        "«закупочная цена Дексатоп 50мл 0.47». Отчёты: /margin, /stockcost",
+    ]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+
+
+async def stockcost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Остатки складов в закупочных ценах (только админ): /stockcost [Склад]."""
+    actor = await _require_admin(update)
+    if actor is None:
+        return
+    if not await _require_private(update):
+        return
+    bmap = buy_som_map()
+    if not bmap:
+        await update.message.reply_text(
+            "Курс доллара не задан — напишите «курс 87.5» (см. /rate).")
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if arg and arg.lower() != "all":
+        wh = db.warehouse_by_name(arg)
+        if wh is None:
+            await update.message.reply_text(f"Склад «{esc(arg)}» не найден.",
+                                            parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+    sections, summary = [], []
+    g_buy = g_sale = 0.0
+    for wh in whs:
+        stock = db.stock_map(wh["id"])
+        rows, t_buy, t_sale, unknown = [], 0.0, 0.0, 0
+        for p in prices.PRICE_LIST_DATA:
+            qty = stock.get(p["id"], 0)
+            if qty <= 0:
+                continue
+            sale = qty * p["price"]
+            t_sale += sale
+            b = bmap.get(p["id"])
+            short = f"{p['id']}. {p['name'].split('(')[0].strip()}"
+            if b is None:
+                unknown += 1
+                rows.append([short, p["volume"], qty, "—", "—", money(sale)])
+                continue
+            t_buy += qty * b
+            rows.append([short, p["volume"], qty, fmt_num(b), money(qty * b),
+                         money(sale)])
+        if not rows:
+            summary.append(f"🏬 «{wh['name']}»: пусто")
+            continue
+        foot = (f"Закуп: {money(t_buy)} · Продажа: {money(t_sale)} · "
+                f"Потенциальная наценка: {money(t_sale - t_buy)}")
+        if unknown:
+            foot += f" · без закупа: {unknown} поз. (не в сумме закупа)"
+        sections.append({
+            "title": f"Склад «{wh['name']}»",
+            "headers": ["Товар", "Фасовка", "Остаток", "Закуп/шт",
+                        "Сумма закуп", "Сумма продажа"],
+            "rows": rows, "widths": [58, 22, 17, 19, 28, 28],
+            "footer": foot,
+        })
+        summary.append(f"🏬 «{wh['name']}»: закуп {money(t_buy)}, "
+                       f"продажа {money(t_sale)}")
+        g_buy += t_buy
+        g_sale += t_sale
+    if not sections:
+        await update.message.reply_text("\n".join(summary) or "Склады пусты.")
+        return
+    footer = (f"ВСЕГО: закуп {money(g_buy)} · продажа {money(g_sale)} · "
+              f"наценка {money(g_sale - g_buy)}") if len(sections) > 1 else ""
+    if len(whs) > 1:
+        summary.append(f"💰 Всего по закупу: {money(g_buy)}")
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ОСТАТКИ ПО ЗАКУПОЧНЫМ ЦЕНАМ",
+        f"ОсОО «ВЕТОП» · на {date_str} · курс {fmt_usd(usd_rate())} сом/$"
+        + (f" · накладные +{fmt_usd(buy_markup_pct())}%" if buy_markup_pct() else ""),
+        sections, footer=footer)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"закуп_остатки_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary))
+
+
+async def margin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Прибыль по проданному (только админ): /margin [день|неделя|месяц|все].
+    Выручка по фактическим ценам накладных минус себестоимость по закупу;
+    возвраты вычитаются, списания — отдельной строкой потерь."""
+    actor = await _require_admin(update)
+    if actor is None:
+        return
+    if not await _require_private(update):
+        return
+    bmap = buy_som_map()
+    if not bmap:
+        await update.message.reply_text(
+            "Курс доллара не задан — напишите «курс 87.5» (см. /rate).")
+        return
+    days_back, label = EXPORT_PERIODS["месяц"]
+    if context.args:
+        key = context.args[0].lower()
+        if key in EXPORT_PERIODS:
+            days_back, label = EXPORT_PERIODS[key]
+        else:
+            await update.message.reply_text(
+                "Использование: /margin [день|неделя|месяц|все]")
+            return
+    start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    rev = cost = unknown_rev = wo_cost = 0.0
+    unknown_names = set()
+    by_wh = {}    # wh_id -> [выручка, прибыль]
+    by_prod = {}  # pid -> [шт, выручка, прибыль]
+    n_inv = 0
+    for op in db.operations_since(start.isoformat(timespec="seconds")):
+        if op["type"] not in ("invoice", "return", "writeoff"):
+            continue
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        sign = -1 if op["type"] == "return" else 1
+        if op["type"] == "invoice":
+            n_inv += 1
+        for it in data.get("items", []):
+            pid = it.get("product_id")
+            qty = float(it.get("qty") or 0)
+            b = bmap.get(pid) if pid else None
+            if op["type"] == "writeoff":
+                if b is not None:
+                    wo_cost += qty * b
+                continue
+            amount = qty * float(it.get("price") or 0)
+            if b is None:
+                unknown_rev += sign * amount
+                unknown_names.add(
+                    f"{str(it.get('name') or '').split('(')[0].strip()} "
+                    f"{it.get('volume') or ''}".strip())
+                continue
+            c = sign * qty * b
+            rev += sign * amount
+            cost += c
+            w = by_wh.setdefault(op["warehouse_id"], [0.0, 0.0])
+            w[0] += sign * amount
+            w[1] += sign * amount - c
+            pr = by_prod.setdefault(pid, [0.0, 0.0, 0.0])
+            pr[0] += sign * qty
+            pr[1] += sign * amount
+            pr[2] += sign * amount - c
+    if not n_inv and not by_prod and not unknown_rev:
+        await update.message.reply_text(
+            f"Реальных накладных {label} не было — прибыль считать не по чему. "
+            f"(Черновики в маржу не входят.)")
+        return
+    profit = rev - cost
+    sections = [{
+        "title": "Итог",
+        "headers": ["Показатель", "Сумма"],
+        "rows": [["Выручка (по накладным, минус возвраты)", money(rev)],
+                 ["Себестоимость по закупу", money(cost)],
+                 ["ПРИБЫЛЬ", money(profit)]]
+        + ([["Наценка к закупу", f"{profit / cost * 100:.0f}%"]] if cost > 0 else [])
+        + ([["Списано товара (по закупу)", money(wo_cost)]] if wo_cost else [])
+        + ([["Продажи без закупочной цены (не в прибыли)", money(unknown_rev)]]
+           if unknown_rev else []),
+        "widths": [110, 45],
+    }]
+    if len(by_wh) > 1:
+        rows = []
+        for wh_id, (w_rev, w_profit) in sorted(by_wh.items(),
+                                               key=lambda kv: -kv[1][1]):
+            wh = db.warehouse_by_id(wh_id)
+            rows.append([wh["name"] if wh else f"склад №{wh_id}",
+                         money(w_rev), money(w_profit)])
+        sections.append({"title": "По складам",
+                         "headers": ["Склад", "Выручка", "Прибыль"],
+                         "rows": rows, "widths": [70, 42, 42]})
+    top = sorted(by_prod.items(), key=lambda kv: -kv[1][2])[:15]
+    if top:
+        rows = []
+        for pid, (q, a, pf) in top:
+            p = prices.BY_ID.get(pid)
+            nm = (f"{pid}. {p['name'].split('(')[0].strip()} {p['volume']}"
+                  if p else f"товар №{pid}")
+            rows.append([nm, fmt_num(q), money(a), money(pf)])
+        sections.append({"title": "Топ товаров по прибыли",
+                         "headers": ["Товар", "Продано", "Выручка", "Прибыль"],
+                         "rows": rows, "widths": [72, 22, 30, 30],
+                         "numbered": True})
+    foot_notes = []
+    if unknown_names:
+        shown = ", ".join(sorted(unknown_names)[:6])
+        if len(unknown_names) > 6:
+            shown += f" и ещё {len(unknown_names) - 6}"
+        foot_notes.append(f"Без закупочной цены: {shown} — задайте фразой "
+                          f"«закупочная цена ...».")
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ПРИБЫЛЬ ПО ЗАКУПОЧНЫМ ЦЕНАМ",
+        f"ОсОО «ВЕТОП» · {label} · на {date_str} · курс {fmt_usd(usd_rate())} "
+        f"сом/$" + (f" · накладные +{fmt_usd(buy_markup_pct())}%"
+                    if buy_markup_pct() else ""),
+        sections, footer=" ".join(foot_notes))
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"прибыль_{date_str.replace('.', '')}.pdf"),
+        caption=f"💰 Прибыль {label}: {money(profit)} "
+                f"(выручка {money(rev)}, закуп {money(cost)})")
+
+
 async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Расходы на API Anthropic и остаток от заданного баланса."""
     if await _require_admin(update) is None:
@@ -6973,6 +7348,9 @@ STAFF_COMMANDS = [
     ("start", "Что умеет бот"),
 ]
 ADMIN_COMMANDS = STAFF_COMMANDS + [
+    ("margin", "Прибыль по закупочным ценам"),
+    ("stockcost", "Остатки в закупочных ценах"),
+    ("rate", "Курс доллара и накладные расходы"),
     ("olddebts", "Давно не платили"),
     ("drafts", "Сводка черновиков"),
     ("abc", "АВС-анализ товаров и клиентов"),
@@ -7049,6 +7427,11 @@ if __name__ == "__main__":
     db.init(ADMIN_ID, WAREHOUSE_NAMES, STAFF)
     if db.seed_products(prices.SEED_DATA):
         log.info("Прайс перенесён в базу (%d позиций)", len(prices.SEED_DATA))
+    import buy_prices_data
+    if db.seed_buy_prices(buy_prices_data.BUY_USD,
+                          buy_prices_data.INITIAL_USD_RATE):
+        log.info("Закупочные цены инвойса F260403 заселены (%d поз.)",
+                 len(buy_prices_data.BUY_USD))
     prices.set_data(db.products_active())
     _refresh_price_dependents()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
@@ -7077,6 +7460,9 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("api", api_cmd))
+    app.add_handler(CommandHandler("margin", margin_cmd))
+    app.add_handler(CommandHandler("stockcost", stockcost_cmd))
+    app.add_handler(CommandHandler("rate", rate_cmd))
     app.add_handler(CommandHandler("drafts", drafts_cmd))
     app.add_handler(CommandHandler("pricelog", pricelog_cmd))
     app.add_handler(CommandHandler("promises", promises_cmd))

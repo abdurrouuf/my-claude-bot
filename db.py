@@ -283,6 +283,10 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             conn.execute("ALTER TABLE draft_log ADD COLUMN items TEXT")
         if "full_mode" not in _columns(conn, "warehouses"):
             conn.execute("ALTER TABLE warehouses ADD COLUMN full_mode INTEGER NOT NULL DEFAULT 0")
+        if "buy_usd" not in _columns(conn, "products"):
+            # Закупочная цена в долларах (видна только админу в /margin и
+            # /stockcost); NULL — закуп неизвестен.
+            conn.execute("ALTER TABLE products ADD COLUMN buy_usd REAL")
         if "feed_chat_id" not in _columns(conn, "warehouses") and \
            "owner_id" not in _columns(conn, "warehouses"):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_id INTEGER")
@@ -383,6 +387,45 @@ def products_active():
         "SELECT id, name, volume, box, price FROM products WHERE active=1 ORDER BY id"
     ).fetchall()
     return [dict(r) for r in rows]
+
+
+def seed_buy_prices(seed: dict, initial_rate: str):
+    """Одноразовое заселение закупочных цен из инвойса F260403 (флаг в
+    settings). Вызывается ПОСЛЕ seed_products — на пустом прайсе просто
+    подождёт следующего старта. Курс сидируется, только если не задан."""
+    conn = connect()
+    with _lock, conn:
+        conn.execute("INSERT OR IGNORE INTO settings(key, value) "
+                     "VALUES('usd_rate', ?)", (initial_rate,))
+        if conn.execute("SELECT 1 FROM settings WHERE key='buy_prices_f260403'"
+                        ).fetchone():
+            return False
+        if conn.execute("SELECT 1 FROM products LIMIT 1").fetchone() is None:
+            return False
+        for pid, usd in seed.items():
+            # Не затираем цену, которую админ уже задал вручную.
+            conn.execute("UPDATE products SET buy_usd=? WHERE id=? "
+                         "AND buy_usd IS NULL", (usd, pid))
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                     "VALUES('buy_prices_f260403', '1')")
+        return True
+
+
+def products_buy_map():
+    """{product_id: закупочная цена USD} — только товары с известным закупом."""
+    rows = connect().execute(
+        "SELECT id, buy_usd FROM products WHERE buy_usd IS NOT NULL").fetchall()
+    return {r["id"]: r["buy_usd"] for r in rows}
+
+
+def product_set_buy(product_id: int, usd: float):
+    conn = connect()
+    with _lock, conn:
+        if conn.execute("SELECT 1 FROM products WHERE id=?",
+                        (product_id,)).fetchone() is None:
+            raise ValueError(f"товар №{product_id} не найден")
+        conn.execute("UPDATE products SET buy_usd=? WHERE id=?",
+                     (usd, product_id))
 
 
 def product_set_price(product_id: int, new_price: float, user_id: int):
