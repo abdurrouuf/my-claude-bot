@@ -61,13 +61,17 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
         client = db.client_get(op["client_id"]) if op["client_id"] else None
         total = ""
         payment = ""
-        if op["type"] == "invoice":
-            total = data.get("total", "")
-            payment = data.get("payment", "") or ""
-        elif op["type"] in ("payment", "handover"):
-            payment = data.get("amount", "")
-        elif op["type"] in ("return", "writeoff"):
-            total = -data.get("total", 0)
+        # У отменённых операций суммы не заполняем: сумма по колонке в
+        # Excel должна сходиться с учётом, а сторнированные суммы в ней
+        # завышали итог (сумма видна в «Описании», статус — «отменена»).
+        if op["status"] == "done":
+            if op["type"] == "invoice":
+                total = data.get("total", "")
+                payment = data.get("payment", "") or ""
+            elif op["type"] in ("payment", "handover"):
+                payment = data.get("amount", "")
+            elif op["type"] in ("return", "writeoff"):
+                total = -data.get("total", 0)
         ws.append([
             op["id"], dt, OP_TYPES.get(op["type"], op["type"]),
             user["name"] if user else op["user_id"],
@@ -108,6 +112,20 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
                 amount = qty * p["price"]
                 grand += amount
                 ws.append([wh["name"], p["name"], p["volume"], qty, p["price"], amount])
+        # Товар, выведенный из прайса, но с остатком: раньше молча выпадал
+        # из экспорта, и остатки «не бились» с /stock.
+        known = {p["id"] for p in prices.PRICE_LIST_DATA}
+        for pid, qty in sorted(smap.items()):
+            if qty and pid not in known:
+                row = db.connect().execute(
+                    "SELECT name, volume, price FROM products WHERE id=?",
+                    (pid,)).fetchone()
+                name = (row["name"] + " (вне прайса)") if row else f"товар №{pid} (вне прайса)"
+                price = row["price"] if row else 0
+                amount = qty * price
+                grand += amount
+                ws.append([wh["name"], name, row["volume"] if row else "",
+                           qty, price, amount])
     ws.append([])
     ws.append(["", "ИТОГО по прайсу", "", "", "", grand])
     ws.cell(row=ws.max_row, column=2).font = Font(bold=True)
@@ -117,10 +135,13 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
     ws = wb.create_sheet("Кассы")
     _sheet_header(ws, ["Сотрудник", "Наличные на руках, сом"], [20, 24])
     total_cash = 0.0
-    for u in db.list_users():
+    # Включая уволенных: несданная касса бывшего сотрудника — всё ещё
+    # деньги компании, раньше она молча пропадала из экспорта.
+    for u in db.list_users(active_only=False):
         cash = db.cash_on_hand(u["id"])
         if cash:
-            ws.append([u["name"], cash])
+            name = u["name"] if u["active"] else f"{u['name']} (уволен)"
+            ws.append([name, cash])
             total_cash += cash
     ws.append([])
     ws.append(["ИТОГО", total_cash])
