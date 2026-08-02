@@ -106,6 +106,11 @@ CREATE TABLE IF NOT EXISTS settings(
     key   TEXT PRIMARY KEY,
     value TEXT
 );
+CREATE TABLE IF NOT EXISTS job_log(
+    job   TEXT NOT NULL,   -- рассылка + дата, например "evening:2026-08-02"
+    ts    TEXT NOT NULL,
+    UNIQUE(job)
+);
 CREATE TABLE IF NOT EXISTS products(
     id     INTEGER PRIMARY KEY,
     name   TEXT NOT NULL,
@@ -246,6 +251,38 @@ def _migrate_price_order(conn):
                  "VALUES('price_order_v2', '1')")
 
 
+def _migrate_price_items(conn):
+    """Дополнение перенумерации 21.07.2026: _migrate_price_order правил в
+    журнале только stock_deltas, а items[*].product_id оставался со СТАРЫМИ
+    номерами — /margin считал бы себестоимость старых операций по чужому
+    товару (аудит 02.08.2026). Чиним по имени+фасовке (они при перенумерации
+    не менялись): product_id позиции приводится к номеру товара из products.
+    Операциям после перенумерации ничего не меняет (номера уже совпадают)."""
+    if conn.execute("SELECT 1 FROM settings WHERE key='price_order_v2_items'"
+                    ).fetchone():
+        return
+    name_map = {(r["name"].lower(), r["volume"].lower()): r["id"]
+                for r in conn.execute("SELECT id, name, volume FROM products")}
+    for op in conn.execute("SELECT id, data FROM operations").fetchall():
+        try:
+            data = json.loads(op["data"])
+        except (TypeError, ValueError):
+            continue
+        changed = False
+        for it in data.get("items") or []:
+            key = (str(it.get("name") or "").lower(),
+                   str(it.get("volume") or "").lower())
+            pid = name_map.get(key)
+            if pid and it.get("product_id") and it["product_id"] != pid:
+                it["product_id"] = pid
+                changed = True
+        if changed:
+            conn.execute("UPDATE operations SET data=? WHERE id=?",
+                         (json.dumps(data, ensure_ascii=False), op["id"]))
+    conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                 "VALUES('price_order_v2_items', '1')")
+
+
 def _migrate_batches(conn):
     """Одноразово заводит партии для складов, загруженных до партионного
     учёта: каждый остаток становится одной партией со сроком из
@@ -293,6 +330,7 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_title TEXT")
         _migrate_owner_warehouses(conn)
         _migrate_price_order(conn)
+        _migrate_price_items(conn)
         _migrate_batches(conn)
         # Починка сроков с «двухцифровым» годом из Excel (04.30 -> 1930):
         # настоящих сроков в 19xx не бывает, безопасно переносим в 20xx.
@@ -338,6 +376,22 @@ def set_setting(key: str, value: str):
 def get_setting(key: str):
     row = connect().execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
     return row["value"] if row else None
+
+
+def claim_daily_job(job_key: str) -> bool:
+    """Атомарная заявка «эту рассылку шлю я». При перекрытии деплоев два
+    экземпляра бота живут одновременно и оба доходят до часа отправки —
+    сводки задваивались. База у них одна (Volume), поэтому первый, кто
+    вставил ключ (рассылка+дата), отправляет; второму вернётся False."""
+    conn = connect()
+    with _lock, conn:
+        try:
+            conn.execute("INSERT INTO job_log(job, ts) VALUES(?,?)",
+                         (job_key,
+                          datetime.now(BISHKEK).isoformat(timespec="seconds")))
+            return True
+        except sqlite3.IntegrityError:
+            return False
 
 
 def record_api_usage(model: str, input_tokens: int, output_tokens: int,
