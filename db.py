@@ -443,16 +443,18 @@ def products_active():
     return [dict(r) for r in rows]
 
 
-def seed_buy_prices(seed: dict, initial_rate: str):
-    """Одноразовое заселение закупочных цен из инвойса F260403 (флаг в
-    settings). Вызывается ПОСЛЕ seed_products — на пустом прайсе просто
-    подождёт следующего старта. Курс сидируется, только если не задан."""
+def seed_buy_prices(seed: dict, initial_rate: str,
+                    flag: str = "buy_prices_f260403"):
+    """Одноразовое заселение закупочных цен из инвойса завода (свой флаг
+    в settings на каждый инвойс). Вызывается ПОСЛЕ seed_products — на
+    пустом прайсе просто подождёт следующего старта. Курс сидируется,
+    только если не задан."""
     conn = connect()
     with _lock, conn:
         conn.execute("INSERT OR IGNORE INTO settings(key, value) "
                      "VALUES('usd_rate', ?)", (initial_rate,))
-        if conn.execute("SELECT 1 FROM settings WHERE key='buy_prices_f260403'"
-                        ).fetchone():
+        if conn.execute("SELECT 1 FROM settings WHERE key=?",
+                        (flag,)).fetchone():
             return False
         if conn.execute("SELECT 1 FROM products LIMIT 1").fetchone() is None:
             return False
@@ -461,7 +463,7 @@ def seed_buy_prices(seed: dict, initial_rate: str):
             conn.execute("UPDATE products SET buy_usd=? WHERE id=? "
                          "AND buy_usd IS NULL", (usd, pid))
         conn.execute("INSERT OR REPLACE INTO settings(key, value) "
-                     "VALUES('buy_prices_f260403', '1')")
+                     "VALUES(?, '1')", (flag,))
         return True
 
 
