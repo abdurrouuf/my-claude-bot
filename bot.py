@@ -7550,6 +7550,11 @@ if __name__ == "__main__":
                           buy_prices_data.INITIAL_USD_RATE):
         log.info("Закупочные цены инвойса F260403 заселены (%d поз.)",
                  len(buy_prices_data.BUY_USD))
+    if db.seed_buy_prices(buy_prices_data.BUY_USD_TQ20251223,
+                          buy_prices_data.INITIAL_USD_RATE,
+                          flag="buy_prices_tq20251223"):
+        log.info("Закупочные цены контракта TQ20251223C заселены (%d поз.)",
+                 len(buy_prices_data.BUY_USD_TQ20251223))
     prices.set_data(db.products_active())
     _refresh_price_dependents()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()

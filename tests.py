@@ -35,6 +35,9 @@ def _fresh_db():
     db.init(ADMIN, bot.WAREHOUSE_NAMES, bot.STAFF)
     db.seed_products(prices.SEED_DATA)
     db.seed_buy_prices(buy_prices_data.BUY_USD, buy_prices_data.INITIAL_USD_RATE)
+    db.seed_buy_prices(buy_prices_data.BUY_USD_TQ20251223,
+                       buy_prices_data.INITIAL_USD_RATE,
+                       flag="buy_prices_tq20251223")
     prices.set_data(db.products_active())
     wh = db.warehouse_by_name("Каракол")
     conn = db.connect()
@@ -173,8 +176,14 @@ def test_buy_prices_seed_and_map():
     _fresh_db()
     assert bot.usd_rate() == 87.5
     bm = bot.buy_som_map()
-    assert len(bm) == len(buy_prices_data.BUY_USD)
+    # два инвойса без пересечений по товарам
+    both = {**buy_prices_data.BUY_USD, **buy_prices_data.BUY_USD_TQ20251223}
+    assert not (set(buy_prices_data.BUY_USD)
+                & set(buy_prices_data.BUY_USD_TQ20251223))
+    assert len(bm) == len(both)
     assert abs(bm[16] - 0.47 * 87.5) < 0.01
+    assert abs(bm[76] - 0.54 * 87.5) < 0.01   # Албенивер — со своего завода
+    assert bm[76] != bm[10]                   # и НЕ равен Альтоперу
     db.set_setting("buy_markup_pct", "10")
     assert abs(bot.buy_som_map()[16] - 0.47 * 87.5 * 1.1) < 0.01
     db.set_setting("buy_markup_pct", "0")
