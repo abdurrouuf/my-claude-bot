@@ -194,6 +194,18 @@ def is_admin(user_row) -> bool:
     return user_row["role"] == "admin"
 
 
+def is_training_wh(wh) -> bool:
+    """Учебный склад-полигон (имя начинается с «Учеб», договорённость
+    03.08.2026): секции в отчётах показываются, но в общие итоги /report,
+    /margin и /stockcost учебные цифры не входят — полигон можно держать
+    постоянно, не пачкая настоящие деньги."""
+    return str(wh["name"]).strip().lower().startswith("учеб")
+
+
+def training_wh_ids() -> set:
+    return {w["id"] for w in db.all_warehouses() if is_training_wh(w)}
+
+
 def can_transfer(user_row) -> bool:
     return user_row["role"] in ("admin", "senior")
 
@@ -3214,8 +3226,53 @@ async def _continue_op(q, context, actor, p, chat_id, user_id):
         await _finish_writeoff(q, context, actor, p)
     elif p["kind"] == "return":
         await _finish_return(q, context, actor, p)
+    elif p["kind"] == "amend_invoice":
+        await _finish_amend(q, context, actor, p)
     else:
         await _finish_invoice(q, context, actor, p)
+
+
+async def _finish_amend(q, context, actor, p):
+    """Проведение замены/дополнения накладной после выбора партий."""
+    try:
+        # Сторно старой и проведение новой — одна транзакция в базе.
+        op_id, client_label, old_debt, total, summary = commit_invoice(
+            p, replace_op_id=p["old_op_id"])
+    except ValueError as e:
+        await q.edit_message_text(
+            f"⚠️ Не удалось заменить накладную №{p['old_op_id']}: {esc(str(e))}",
+            parse_mode="HTML")
+        return
+    # Замена УЖЕ в базе — сбой уведомлений/PDF не должен выглядеть как
+    # «не проведено», иначе повтор даст «уже отменена» и панику (тот же
+    # класс бага, что чинили в _finish_invoice 27.07; аудит 02.08.2026).
+    try:
+        await q.edit_message_text(
+            f"✅ Накладная №{p['old_op_id']} отменена, вместо неё проведена "
+            f"№{op_id}.")
+        await send_invoice_pdf(context, p["chat_id"], client_label, p,
+                               old_debt, total, op_id=op_id)
+        await notify_admin(context, actor,
+                           f"замена накладной №{p['old_op_id']} → №{op_id}: {summary}")
+        actor_name = db.get_user(p.get("op_user_id") or p["user_id"])["name"]
+        await feed_invoice_pdf(
+            context, p["wh_id"], client_label, p, old_debt, total,
+            caption=(f"🔁 <b>{esc(actor_name)}</b> — {esc(summary)}\n"
+                     f"Замена накладной №{p['old_op_id']}"),
+            exclude_chat_id=p["chat_id"], op_id=op_id)
+        await alert_low_stock(context, [
+            (p["wh_id"], it["product_id"], -it["qty"])
+            for it in p["items"] if it.get("product_id")])
+    except Exception:
+        log.exception("Замена №%s→№%s проведена, уведомления не дошли",
+                      p["old_op_id"], op_id)
+        try:
+            await q.edit_message_text(
+                f"✅ Замена ПРОВЕДЕНА (№{p['old_op_id']} → №{op_id}), "
+                f"но часть уведомлений/PDF не отправилась. Повторно "
+                f"проводить НЕ нужно — документ: /op {op_id}")
+        except Exception:
+            pass
 
 
 async def _finish_return(q, context, actor, p):
@@ -3841,46 +3898,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if lack:
                     await q.edit_message_text(lack_message(lack), parse_mode="HTML")
                     return
-                try:
-                    # Сторно старой и проведение новой — одна транзакция в базе.
-                    op_id, client_label, old_debt, total, summary = commit_invoice(
-                        p, replace_op_id=p["old_op_id"])
-                except ValueError as e:
-                    await q.edit_message_text(
-                        f"⚠️ Не удалось заменить накладную №{p['old_op_id']}: {esc(str(e))}",
-                        parse_mode="HTML")
-                else:
-                    # Замена УЖЕ в базе — сбой уведомлений/PDF не должен
-                    # выглядеть как «не проведено», иначе повтор даст «уже
-                    # отменена» и панику (тот же класс бага, что чинили в
-                    # _finish_invoice 27.07; аудит 02.08.2026).
-                    try:
-                        await q.edit_message_text(
-                            f"✅ Накладная №{p['old_op_id']} отменена, вместо неё проведена "
-                            f"№{op_id}.")
-                        await send_invoice_pdf(context, p["chat_id"], client_label, p,
-                                               old_debt, total, op_id=op_id)
-                        await notify_admin(context, actor,
-                                           f"замена накладной №{p['old_op_id']} → №{op_id}: {summary}")
-                        actor_name = db.get_user(p.get("op_user_id") or p["user_id"])["name"]
-                        await feed_invoice_pdf(
-                            context, p["wh_id"], client_label, p, old_debt, total,
-                            caption=(f"🔁 <b>{esc(actor_name)}</b> — {esc(summary)}\n"
-                                     f"Замена накладной №{p['old_op_id']}"),
-                            exclude_chat_id=p["chat_id"], op_id=op_id)
-                        await alert_low_stock(context, [
-                            (p["wh_id"], it["product_id"], -it["qty"])
-                            for it in p["items"] if it.get("product_id")])
-                    except Exception:
-                        log.exception("Замена №%s→№%s проведена, уведомления не дошли",
-                                      p["old_op_id"], op_id)
-                        try:
-                            await q.edit_message_text(
-                                f"✅ Замена ПРОВЕДЕНА (№{p['old_op_id']} → №{op_id}), "
-                                f"но часть уведомлений/PDF не отправилась. Повторно "
-                                f"проводить НЕ нужно — документ: /op {op_id}")
-                        except Exception:
-                            pass
+                # Партии: если у товара несколько сроков, спрашиваем кнопками,
+                # из какой партии продано — как у обычной накладной (раньше
+                # замена молча списывала FEFO; просьба владельца 03.08.2026).
+                await _continue_op(q, context, actor, p,
+                                   q.message.chat.id, q.from_user.id)
             elif p["kind"] == "load_wh":
                 data, _src = _stock_load_data(p["wh_name"])
                 if data is None:
@@ -5468,12 +5490,16 @@ def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
                              "numbered": True, "footer": note})
         summary.append(f"📊 «{wh['name']}»: продажи {money(d['sales'])}, "
                        f"деньги {money(d['money'])}")
-        grand_sales += d["sales"]
-        grand_money += d["money"]
+        if not is_training_wh(wh):
+            grand_sales += d["sales"]
+            grand_money += d["money"]
     footer = ""
+    has_training = any(is_training_wh(w) for w in whs)
     if len(whs) > 1:
-        footer = f"ИТОГО: продажи {money(grand_sales)} · деньги {money(grand_money)}"
-        summary.append(f"💰 Итого: продажи {money(grand_sales)}, деньги {money(grand_money)}")
+        mark = " (без учебного склада)" if has_training else ""
+        footer = f"ИТОГО{mark}: продажи {money(grand_sales)} · деньги {money(grand_money)}"
+        summary.append(f"💰 Итого{mark}: продажи {money(grand_sales)}, "
+                       f"деньги {money(grand_money)}")
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
     pdf = generate_report_pdf("ОТЧЁТ ПО СКЛАДАМ",
                               f"ОсОО «ВЕТОП» · {label} · на {date_str}",
@@ -5950,15 +5976,33 @@ async def monthly_deadstock_loop(app):
         if first_this > now:
             target = first_this
         await asyncio.sleep((target - now).total_seconds())
+        stamp = datetime.now(BISHKEK).strftime("%Y-%m")
         try:
-            if not db.claim_daily_job(
-                    f"deadstock:{datetime.now(BISHKEK).strftime('%Y-%m')}"):
-                continue
-            text = build_deadstock(db.all_warehouses(), DEADSTOCK_DAYS)
-            if text:
-                await send_long_bot(app.bot, ADMIN_ID, text)
+            if db.claim_daily_job(f"deadstock:{stamp}"):
+                text = build_deadstock(db.all_warehouses(), DEADSTOCK_DAYS)
+                if text:
+                    await send_long_bot(app.bot, ADMIN_ID, text)
         except Exception:
             log.exception("Ошибка отчёта о мёртвом товаре")
+        try:
+            # Итог прибыли за прошедший календарный месяц (решение
+            # владельца 03.08.2026) — без напоминаний, 1-го числа.
+            if db.claim_daily_job(f"margin_month:{stamp}"):
+                now2 = datetime.now(BISHKEK)
+                first_this = now2.replace(day=1, hour=0, minute=0,
+                                          second=0, microsecond=0)
+                prev_last = first_this - timedelta(days=1)
+                first_prev = prev_last.replace(day=1)
+                pdf, caption, filename = build_margin_report(
+                    first_prev.isoformat(timespec="seconds"),
+                    first_this.isoformat(timespec="seconds"),
+                    f"за {prev_last.strftime('%m.%Y')}")
+                if pdf is not None:
+                    await app.bot.send_document(
+                        ADMIN_ID, document=InputFile(pdf, filename=filename),
+                        caption="🗓 Итог месяца\n" + caption)
+        except Exception:
+            log.exception("Ошибка месячного отчёта прибыли")
 
 
 def overdue_rows(warehouses, min_days: int):
@@ -6077,6 +6121,75 @@ async def send_debt_alerts(bot):
             log.warning("Не удалось отправить напоминание %s: %s", u["name"], e)
 
 
+def expiry_alert_report(warehouses):
+    """PDF «Сроки на исходе»: просроченные партии (кандидаты на списание)
+    и партии, истекающие в ближайшие 3 месяца (продавать первыми).
+    Учебные склады пропускаются. None — тревожиться не о чем."""
+    now = datetime.now(BISHKEK)
+    soon = now + timedelta(days=92)
+    sections = []
+    tot_expired = tot_soon = 0
+    for wh in warehouses:
+        if is_training_wh(wh):
+            continue
+        rows, n_expired, n_soon = [], 0, 0
+        for r in db.expiry_list(wh["id"]):
+            if r["qty"] <= 0 or not r["expiry"]:
+                continue
+            d = _expiry_key_to_date(r["expiry"])
+            if d is None or d > soon:
+                continue
+            p = prices.BY_ID.get(r["product_id"])
+            label = (p["name"].split("(")[0].strip() if p
+                     else f"товар №{r['product_id']}")
+            volume = p["volume"] if p else ""
+            if d <= now:
+                status = "ПРОСРОЧЕНО — списать"
+                n_expired += 1
+            else:
+                status = "продавать первым"
+                n_soon += 1
+            rows.append([r["expiry"], label, volume, f"{r['qty']} шт", status])
+        if rows:
+            sections.append({
+                "title": f"Склад «{wh['name']}»",
+                "headers": ["Срок", "Товар", "Фасовка", "Кол-во", "Что делать"],
+                "rows": rows, "widths": [22, 62, 24, 20, 39], "numbered": True,
+                "footer": f"Просрочено: {n_expired} · истекает скоро: {n_soon}",
+            })
+            tot_expired += n_expired
+            tot_soon += n_soon
+    if not sections:
+        return None
+    date_str = now.strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "СРОКИ НА ИСХОДЕ",
+        f"ОсОО «ВЕТОП» · просрочка и ближайшие 3 месяца · на {date_str}",
+        sections,
+        footer=f"ИТОГО: просрочено {tot_expired} партий · на исходе {tot_soon}")
+    return pdf, tot_expired, tot_soon
+
+
+async def send_expiry_alerts(bot):
+    """Еженедельно админу: что просрочено и что продавать первым."""
+    report = expiry_alert_report(db.all_warehouses())
+    if not report:
+        return
+    pdf, n_expired, n_soon = report
+    date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
+    caption = "📅 Сроки годности на исходе"
+    if n_expired:
+        caption += f"\n‼️ Просрочено: {n_expired} партий — спишите («спиши …»)"
+    if n_soon:
+        caption += f"\n⚠️ Истекают в 3 месяца: {n_soon} партий — продавать первыми"
+    try:
+        await bot.send_document(
+            ADMIN_ID, document=InputFile(pdf, filename=f"сроки_тревога_{date_str}.pdf"),
+            caption=caption)
+    except Exception as e:
+        log.warning("Не удалось отправить тревогу о сроках: %s", e)
+
+
 async def send_backup(bot):
     """Копия базы админу в личку."""
     import tempfile
@@ -6185,7 +6298,9 @@ async def stockcost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         whs = [wh]
     else:
-        whs = db.visible_warehouses(actor)
+        # Учебный полигон — не настоящие деньги: в сводный отчёт не входит
+        # (посмотреть его можно явно: /stockcost Учебный).
+        whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)]
     sections, summary = [], []
     g_buy = g_sale = 0.0
     for wh in whs:
@@ -6284,14 +6399,36 @@ async def margin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
         hour=0, minute=0, second=0, microsecond=0)
+    pdf, caption, filename = build_margin_report(
+        start.isoformat(timespec="seconds"), None, label)
+    if pdf is None:
+        await update.message.reply_text(caption)
+        return
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=filename), caption=caption)
+
+
+def build_margin_report(start_iso: str, end_iso, label: str):
+    """PDF прибыли за период [start_iso, end_iso). Возвращает
+    (pdf, подпись, имя_файла) или (None, текст-почему, None).
+    end_iso=None — по сейчас. Общая сборка для /margin и месячного
+    автоотчёта."""
+    bmap = buy_som_map()
+    if not bmap:
+        return None, "Курс доллара не задан — напишите «курс 87.5» (см. /rate).", None
     rev = cost = unknown_rev = wo_cost = 0.0
     wo_unknown = 0
     unknown_names = set()
     by_wh = {}    # wh_id -> [выручка, прибыль]
     by_prod = {}  # pid -> [шт, выручка, прибыль]
     n_inv = 0
-    for op in db.operations_since(start.isoformat(timespec="seconds")):
+    skip_whs = training_wh_ids()  # учебный полигон — не настоящие деньги
+    for op in db.operations_since(start_iso):
         if op["type"] not in ("invoice", "return", "writeoff"):
+            continue
+        if end_iso and op["ts"] >= end_iso:
+            continue
+        if op["warehouse_id"] in skip_whs:
             continue
         try:
             data = json.loads(op["data"])
@@ -6329,10 +6466,8 @@ async def margin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             pr[2] += sign * amount - c
     if (not n_inv and not by_prod and not unknown_rev
             and not wo_cost and not wo_unknown):
-        await update.message.reply_text(
-            f"Реальных накладных {label} не было — прибыль считать не по чему. "
-            f"(Черновики в маржу не входят.)")
-        return
+        return (None, f"Реальных накладных {label} не было — прибыль считать "
+                      f"не по чему. (Черновики в маржу не входят.)", None)
     profit = rev - cost
     sections = [{
         "title": "Итог",
@@ -6371,6 +6506,8 @@ async def margin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                          "rows": rows, "widths": [72, 22, 30, 30],
                          "numbered": True})
     foot_notes = []
+    if skip_whs:
+        foot_notes.append("Учебный склад в прибыль не входит.")
     if unknown_names:
         shown = ", ".join(sorted(unknown_names)[:6])
         if len(unknown_names) > 6:
@@ -6384,10 +6521,9 @@ async def margin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"сом/$" + (f" · накладные +{fmt_usd(buy_markup_pct())}%"
                     if buy_markup_pct() else ""),
         sections, footer=" ".join(foot_notes))
-    await update.message.reply_document(
-        document=InputFile(pdf, filename=f"прибыль_{date_str.replace('.', '')}.pdf"),
-        caption=f"💰 Прибыль {label}: {money(profit)} "
-                f"(выручка {money(rev)}, закуп {money(cost)})")
+    caption = (f"💰 Прибыль {label}: {money(profit)} "
+               f"(выручка {money(rev)}, закуп {money(cost)})")
+    return pdf, caption, f"прибыль_{date_str.replace('.', '')}.pdf"
 
 
 async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -6517,13 +6653,19 @@ async def weekly_debt_loop(app):
         if target <= now:
             target += timedelta(days=7)
         await asyncio.sleep((target - now).total_seconds())
+        today = datetime.now(BISHKEK).date().isoformat()
         try:
-            if not db.claim_daily_job(
-                    f"debts:{datetime.now(BISHKEK).date().isoformat()}"):
-                continue
-            await send_debt_alerts(app.bot)
+            if db.claim_daily_job(f"debts:{today}"):
+                await send_debt_alerts(app.bot)
         except Exception:
             log.exception("Ошибка напоминания о долгах")
+        try:
+            # Понедельничная тревога о сроках годности (решение владельца
+            # 03.08.2026): просрочка и партии ближайших 3 месяцев.
+            if db.claim_daily_job(f"expiry_alert:{today}"):
+                await send_expiry_alerts(app.bot)
+        except Exception:
+            log.exception("Ошибка тревоги о сроках годности")
 
 
 LOG_TYPE_ICONS = {"invoice": "🧾", "payment": "💵", "transfer": "📦",
