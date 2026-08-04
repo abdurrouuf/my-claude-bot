@@ -327,6 +327,30 @@ def test_group_commands_scoped_to_feed_warehouse():
     asyncio.run(run())
 
 
+def test_return_requires_expiry():
+    wh = _fresh_db()
+    _load(wh, {16: 50, 28: 30},
+          {(wh["id"], 16): [("10.2027", 50)]})
+    # возврат без срока — бот должен спросить срок для каждой позиции
+    p = {"kind": "return", "user_id": ADMIN, "wh_id": wh["id"],
+         "wh_name": wh["name"], "client_id": 1, "client_name": "Тест",
+         "items": [_item(16, 5, 180), _item(28, 2, 440)], "warnings": []}
+    need = bot._expiry_questions(p)
+    assert [i for i, _ in need] == [0, 1]
+    # партии кнопками у возврата не спрашиваются (товар приходит, не уходит)
+    assert bot._batch_questions(p) == []
+    # срок указан у первой — спросится только вторая
+    p["items"][0]["expiry"] = "11.2028"
+    assert [i for i, _ in bot._expiry_questions(p)] == [1]
+    p["items"][1]["expiry"] = "12.2027"
+    assert bot._expiry_questions(p) == []
+    # у перемещения поведение прежнее: датированных хватает — не спрашиваем
+    t = {"kind": "transfer", "user_id": ADMIN, "wh_id": wh["id"],
+         "wh_name": wh["name"], "from_wh_id": wh["id"],
+         "items": [_item(16, 5, 180)], "warnings": []}
+    assert bot._expiry_questions(t) == []
+
+
 def test_margin_op_id_only_for_invoice_actions():
     # op_id, случайно приехавший в оплату, не должен отключать выбор склада
     for action, expected in (("replace_invoice", True), ("amend_invoice", True),
