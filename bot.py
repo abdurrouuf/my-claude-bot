@@ -291,6 +291,29 @@ def confirm_kb(token: str) -> InlineKeyboardMarkup:
     ]])
 
 
+async def _group_only_feed_whs(update, actor):
+    """Область отчётной команды в ГРУППЕ: только склад(ы) этого чата-ленты,
+    и только доступные автору (просьба владельца 03.08.2026 — «в общем чате
+    показывать только этот склад, а не все»). Аргумент-склад в группе
+    игнорируется. Возвращает (склады, in_group): в личке — (None, False);
+    в группе без привязки/доступа отказ уже отправлен — ([], True)."""
+    chat = update.effective_chat
+    if chat is None or chat.type == "private":
+        return None, False
+    whs = [w for w in db.warehouses_of_feed(chat.id)
+           if db.can_use_warehouse(actor, w["id"])]
+    if not whs:
+        try:
+            await update.message.reply_text(
+                "🔒 В группе я показываю только склад этого чата. Тут склад "
+                "не привязан (или у вас нет к нему доступа) — напишите мне "
+                "в личку.")
+        except Exception:
+            pass
+        return [], True
+    return whs, True
+
+
 async def _require_private(update) -> bool:
     """Отчёты с чувствительными данными (телефоны, долги, кассы, журнал) —
     только в личке: в группе PDF увидели бы все участники чата, в том числе
@@ -5000,6 +5023,12 @@ async def _stock_cmd(update, context, with_prices):
     actor = await get_actor(update)
     if actor is None:
         return
+    # В чате склада — только склад этого чата, без кнопок выбора.
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group:
+        if whs_group:
+            await _stock_report(update, context, actor, whs_group, with_prices)
+        return
     arg = " ".join(context.args).strip() if context.args else ""
     if arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
@@ -5045,13 +5074,16 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
-    # Долги и телефоны клиентов — только в личке (та же логика, что закрыла
-    # /clients и /invoices аудитом 27.07: в группе PDF увидят все участники,
-    # в том числе по чужим складам).
-    if not await _require_private(update):
+    # В чате-ленте склада показываем ТОЛЬКО склад этого чата (просьба
+    # владельца 03.08.2026) — команда команды склада, чужие склады и их
+    # телефоны в группу не попадают. В прочих группах — отказ (аудит 27.07).
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group and not whs_group:
         return
     arg = " ".join(context.args).strip() if context.args else ""
-    if arg and arg.lower() != "all":
+    if in_group:
+        whs = whs_group
+    elif arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
         if wh is None or not db.can_use_warehouse(actor, wh["id"]):
             await update.message.reply_text(
@@ -5325,7 +5357,13 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             days_back, label = PERIODS[w]
         else:
             wh_words.append(word)
-    if wh_words:
+    # В чате склада — только склад этого чата (период из аргументов работает).
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group:
+        if not whs_group:
+            return
+        whs = whs_group
+    elif wh_words:
         wh = db.warehouse_by_name(" ".join(wh_words))
         if wh is None or not db.can_use_warehouse(actor, wh["id"]):
             await update.message.reply_text(
@@ -7272,8 +7310,14 @@ async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    # В чате склада — только склад этого чата.
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
     name = " ".join(context.args or [])
-    if name and name.lower() != "all":
+    if in_group:
+        if not whs_group:
+            return
+        whs = whs_group
+    elif name and name.lower() != "all":
         wh = db.warehouse_by_name(name)
         if wh is None or not db.can_use_warehouse(actor, wh["id"]):
             await update.message.reply_text(

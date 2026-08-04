@@ -286,6 +286,47 @@ def test_migrate_price_items_fixes_old_ids():
     assert fixed["items"][0]["product_id"] == 16  # восстановлен по имени
 
 
+def test_group_commands_scoped_to_feed_warehouse():
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET feed_chat_id=-100500 WHERE id=?",
+                 (wh["id"],))
+    conn.commit()
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd(chat_id, chat_type):
+        return SimpleNamespace(
+            effective_chat=SimpleNamespace(id=chat_id, type=chat_type),
+            message=Msg())
+
+    async def run():
+        daniyar = db.get_user(DANIYAR)   # склад Каракол — доступ есть
+        azamat = db.get_user(AZAMAT)     # склад Манас — доступа нет
+        # в чате-ленте Каракола: Данияр видит только Каракол
+        whs, in_group = await bot._group_only_feed_whs(
+            upd(-100500, "supergroup"), daniyar)
+        assert in_group and [w["id"] for w in whs] == [wh["id"]]
+        # Азамат в том же чате — отказ
+        whs, in_group = await bot._group_only_feed_whs(
+            upd(-100500, "supergroup"), azamat)
+        assert in_group and whs == [] and "личку" in replies[-1]
+        # чужая группа без привязки — отказ
+        whs, in_group = await bot._group_only_feed_whs(
+            upd(-42, "supergroup"), daniyar)
+        assert in_group and whs == []
+        # личка — обычное поведение
+        whs, in_group = await bot._group_only_feed_whs(
+            upd(1, "private"), daniyar)
+        assert not in_group and whs is None
+    asyncio.run(run())
+
+
 def test_margin_op_id_only_for_invoice_actions():
     # op_id, случайно приехавший в оплату, не должен отключать выбор склада
     for action, expected in (("replace_invoice", True), ("amend_invoice", True),
