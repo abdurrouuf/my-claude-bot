@@ -351,6 +351,35 @@ def test_return_requires_expiry():
     assert bot._expiry_questions(t) == []
 
 
+def test_training_wh_excluded():
+    wh = _fresh_db()
+    conn = db.connect()
+    conn.execute("INSERT INTO warehouses(name, full_mode) VALUES('Учебный', 1)")
+    conn.commit()
+    uch = db.warehouse_by_name("Учебный")
+    assert bot.is_training_wh(uch) and not bot.is_training_wh(wh)
+    assert bot.training_wh_ids() == {uch["id"]}
+    # операции на обоих складах — в прибыли только настоящий склад
+    for w, qty in ((wh, 10), (uch, 7)):
+        _load(w, {16: 100})
+        _invoice(w, ADMIN, f"К{w['id']}", [_item(16, qty, 180)])
+    from datetime import datetime, timedelta
+    start = (datetime.now(bot.BISHKEK) - timedelta(days=1)).isoformat(
+        timespec="seconds")
+    _, caption, _ = bot.build_margin_report(start, None, "тест")
+    assert "1'800" in caption  # 10 шт, без учебных 7
+    # тревога о сроках: просрочка на учебном не тревожит
+    db.commit_operation(ADMIN, "inventory", uch["id"], None, "п",
+                        [(uch["id"], 28, 20)], [], {},
+                        batch_plan={(uch["id"], 28): [("01.2026", 20)]})
+    assert bot.expiry_alert_report(db.all_warehouses()) is None
+    db.commit_operation(ADMIN, "inventory", wh["id"], None, "п",
+                        [(wh["id"], 28, 20)], [], {},
+                        batch_plan={(wh["id"], 28): [("05.2026", 20)]})
+    rep = bot.expiry_alert_report(db.all_warehouses())
+    assert rep is not None and rep[1] == 1  # одна просроченная партия
+
+
 def test_margin_op_id_only_for_invoice_actions():
     # op_id, случайно приехавший в оплату, не должен отключать выбор склада
     for action, expected in (("replace_invoice", True), ("amend_invoice", True),
