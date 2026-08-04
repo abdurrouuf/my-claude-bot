@@ -482,7 +482,8 @@ def _build_static_system() -> str:
     parts.append('- price бери из прайса; если сотрудник сам явно написал цену возврата '
                  '(например «по 85») — поставь её и "price_explicit": true.')
     parts.append('- "expiry": срок годности, если указан рядом с товаром '
-                 '(«срок 11.2028», «11/28») — строкой "MM.YYYY"; нет — null.')
+                 '(«срок 11.2028», «11/28») — строкой "MM.YYYY"; нет — null '
+                 '(бот сам спросит срок с упаковки, это нормально).')
     parts.append('- Коробки переводи в штуки как обычно. Возврат подтверждает админ.')
     parts.append("")
     parts.append("=== РЕЖИМ 10: ТЕЛЕФОН КЛИЕНТА ===")
@@ -3024,6 +3025,10 @@ def _batch_questions(p):
     несколько партий, срок не указан явно, выбор ещё не сделан."""
     need = []
     choices = p.get("batch_choices") or {}
+    # Возврат КЛАДЁТ товар на склад — партии склада тут ни при чём,
+    # у него спрашивается срок с упаковки текстом (_expiry_questions).
+    if p.get("kind") == "return":
+        return need
     if not _batch_src_wh(p):
         return need
     for i, it in enumerate(p["items"]):
@@ -3047,8 +3052,18 @@ AWAIT_EXPIRY = {}
 def _expiry_questions(p):
     """Позиции, по которым срок годности неизвестен: датированных партий на
     складе-источнике не хватает на списываемое количество. Такую операцию
-    не проводим, пока сотрудник не назовёт срок с упаковки."""
+    не проводим, пока сотрудник не назовёт срок с упаковки.
+
+    Возврат (решение владельца 03.08.2026, вариант «как у списания»):
+    срок обязателен для КАЖДОЙ позиции без явного срока — упаковка
+    физически в руках, раньше возврат молча падал в ближайшую датированную
+    партию и /expiry привирал."""
     need = []
+    if p.get("kind") == "return":
+        for i, it in enumerate(p["items"]):
+            if it.get("product_id") and not it.get("expiry"):
+                need.append((i, it))
+        return need
     if p.get("kind") not in EXPIRY_REQUIRED_KINDS:
         return need
     src_wh = _batch_src_wh(p)
@@ -3095,15 +3110,20 @@ async def _ask_expiry(q, context, p, question, chat_id, user_id):
     p["awaiting_expiry"] = i
     token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
     src_name = p.get("from_wh_name") or p.get("wh_name")
-    what = "перемещение" if p["kind"] == "transfer" else "списание"
-    src_wh = _batch_src_wh(p)
-    dated = sum(b["qty"] for b in _dated_batches(src_wh, it.get("product_id") or 0))
-    if dated:
-        why = (f"Датированных партий на складе «{esc(src_name)}» хватает "
-               f"только на {dated} шт из {it['qty']}.")
+    what = {"transfer": "перемещение", "writeoff": "списание",
+            "return": "возврат"}.get(p["kind"], "операцию")
+    if p["kind"] == "return":
+        why = ("Возврат кладёт товар на склад — посмотрите срок годности "
+               "на упаковке возвращаемого товара.")
     else:
-        why = (f"На складе «{esc(src_name)}» у этого товара не записан "
-               f"срок годности.")
+        src_wh = _batch_src_wh(p)
+        dated = sum(b["qty"] for b in _dated_batches(src_wh, it.get("product_id") or 0))
+        if dated:
+            why = (f"Датированных партий на складе «{esc(src_name)}» хватает "
+                   f"только на {dated} шт из {it['qty']}.")
+        else:
+            why = (f"На складе «{esc(src_name)}» у этого товара не записан "
+                   f"срок годности.")
     head = (f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
             f"{why}\n\n")
     ask = (f"Посмотрите на упаковку и напишите срок ответным сообщением — "
@@ -3192,8 +3212,40 @@ async def _continue_op(q, context, actor, p, chat_id, user_id):
         await _finish_transfer(q, context, actor, p)
     elif p["kind"] == "writeoff":
         await _finish_writeoff(q, context, actor, p)
+    elif p["kind"] == "return":
+        await _finish_return(q, context, actor, p)
     else:
         await _finish_invoice(q, context, actor, p)
+
+
+async def _finish_return(q, context, actor, p):
+    """Проведение возврата после вопросов о сроке годности."""
+    op_id, client_label, old_debt, total, summary = commit_return(p)
+    # Возврат УЖЕ в базе — сбой уведомлений/PDF не должен выглядеть как
+    # «не проведено» (тот же принцип, что в _finish_invoice).
+    try:
+        await q.edit_message_text(f"✅ Возврат №{op_id} проведён.")
+        await send_return_pdf(context, p["chat_id"], client_label, p, old_debt, total)
+        if p.get("approver_id"):
+            try:
+                await context.bot.send_message(
+                    p["chat_id"],
+                    f"✅ Админ подтвердил возврат (операция №{op_id}).",
+                    parse_mode="HTML")
+            except Exception:
+                log.warning("Не удалось уведомить заявителя")
+        actor_name = db.get_user(p["user_id"])["name"]
+        note = "Подтвердил админ" if p.get("approver_id") else ""
+        await feed_operation(context, op_id, actor_name, "🔙", note,
+                             exclude_chat_id=p["chat_id"])
+    except Exception:
+        log.exception("Возврат №%s проведён, уведомления не дошли", op_id)
+        try:
+            await q.edit_message_text(
+                f"✅ Возврат №{op_id} ПРОВЕДЁН, но часть уведомлений/PDF не "
+                f"отправилась. Повторно проводить НЕ нужно — детали: /op {op_id}")
+        except Exception:
+            pass
 
 
 async def _finish_invoice(q, context, actor, p):
@@ -3711,21 +3763,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await feed_operation(context, op_id, actor_name, "💰",
                                      exclude_chat_id=p["chat_id"])
             elif p["kind"] == "return":
-                op_id, client_label, old_debt, total, summary = commit_return(p)
-                await q.edit_message_text(f"✅ Возврат №{op_id} проведён.")
-                await send_return_pdf(context, p["chat_id"], client_label, p, old_debt, total)
-                if p.get("approver_id"):
-                    try:
-                        await context.bot.send_message(
-                            p["chat_id"],
-                            f"✅ Админ подтвердил возврат (операция №{op_id}).",
-                            parse_mode="HTML")
-                    except Exception:
-                        log.warning("Не удалось уведомить заявителя")
-                actor_name = db.get_user(p["user_id"])["name"]
-                note = "Подтвердил админ" if p.get("approver_id") else ""
-                await feed_operation(context, op_id, actor_name, "🔙", note,
-                                     exclude_chat_id=p["chat_id"])
+                # Срок годности возврата обязателен (решение владельца
+                # 03.08.2026): позиции без срока — вопрос текстом, потом
+                # проведение (_finish_return).
+                await _continue_op(q, context, actor, p,
+                                   q.message.chat.id, q.from_user.id)
             elif p["kind"] == "inventory":
                 op_id, summary = commit_inventory(p)
                 if op_id is None:
