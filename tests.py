@@ -351,6 +351,28 @@ def test_return_requires_expiry():
     assert bot._expiry_questions(t) == []
 
 
+def test_view_only_access():
+    """Доступ-просмотр (/watch): отчёты видны, операции запрещены."""
+    wh = _fresh_db()   # Каракол
+    beka = 5808155644
+    u = db.get_user(beka)
+    db.grant_access(beka, wh["id"], view_only=True)
+    # видит, но не проводит
+    assert db.can_view_warehouse(u, wh["id"])
+    assert not db.can_use_warehouse(u, wh["id"])
+    assert wh["id"] in [w["id"] for w in db.visible_warehouses(u)]
+    assert wh["id"] not in [w["id"] for w in db.operable_warehouses(u)]
+    # resolve_warehouse (операции) отказывает с понятным текстом
+    wh_res, err = bot.resolve_warehouse(u, wh["name"])
+    assert wh_res is None and "ПРОСМОТР" in err, err
+    # повторный /access превращает просмотр в полный доступ
+    db.grant_access(beka, wh["id"], view_only=False)
+    assert db.can_use_warehouse(db.get_user(beka), wh["id"])
+    # /noaccess снимает
+    db.revoke_access(beka, wh["id"])
+    assert not db.can_view_warehouse(db.get_user(beka), wh["id"])
+
+
 def test_staff_config_not_resurrected_on_deploy():
     """/remove и /noaccess для штатных сотрудников должны переживать деплой:
     повторный db.init (каждое обновление бота) не воскрешает active и не
