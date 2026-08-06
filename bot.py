@@ -217,11 +217,9 @@ async def get_actor(update: Update):
         return None
     row = db.get_user(tg_user.id)
     if row is None or not row["active"]:
-        msg = update.effective_message
-        chat = update.effective_chat
-        # В группах не отвечаем чужим — не шумим в чатах-лентах складов.
-        if msg and chat and chat.type == "private":
-            await msg.reply_text("⛔ У вас нет доступа к этому боту.")
+        # Посторонним — ПОЛНАЯ тишина, и в группах, и в личке (решение
+        # владельца 07.08.2026): молчащий бот не интересен любопытным.
+        # Раньше в личке отвечали «⛔ нет доступа».
         return None
     return row
 

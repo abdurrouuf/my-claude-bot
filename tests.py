@@ -469,6 +469,34 @@ def test_unknown_command_hint():
     asyncio.run(run())
 
 
+def test_stranger_full_silence():
+    """Посторонний не получает НИЧЕГО — ни в личке, ни в группе."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    replies = []
+
+    class Msg:
+        text = "привет"
+
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd(user_id, chat_type):
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=user_id),
+            effective_message=Msg(),
+            effective_chat=SimpleNamespace(id=1, type=chat_type))
+
+    async def run():
+        assert await bot.get_actor(upd(999999, "private")) is None
+        assert await bot.get_actor(upd(999999, "supergroup")) is None
+        assert replies == []                      # полная тишина
+        row = await bot.get_actor(upd(DANIYAR, "private"))
+        assert row is not None and row["active"]  # свои работают как раньше
+    asyncio.run(run())
+
+
 def test_margin_op_id_only_for_invoice_actions():
     # op_id, случайно приехавший в оплату, не должен отключать выбор склада
     for action, expected in (("replace_invoice", True), ("amend_invoice", True),
