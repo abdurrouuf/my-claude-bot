@@ -347,23 +347,30 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             name = cfg["name"]
             role = "admin" if uid == admin_id else cfg.get("role", "employee")
             row = conn.execute("SELECT * FROM users WHERE id=?", (uid,)).fetchone()
-            if row is None:
+            created = row is None
+            if created:
                 conn.execute("INSERT INTO users(id, name, role, active) VALUES(?,?,?,1)",
                              (uid, name, role))
-            else:
-                conn.execute("UPDATE users SET active=1, name=? WHERE id=?", (name, uid))
+            # Существующая запись НЕ трогается: раньше каждый деплой ставил
+            # active=1 и возвращал доступы из STAFF — команды /remove и
+            # /noaccess молча откатывались при следующем обновлении бота
+            # (всплыло 03.08.2026 на отпуске Жуми). Конфиг STAFF применяется
+            # только при первом создании; дальше рулят команды админа.
             if uid == admin_id:
-                conn.execute("UPDATE users SET role='admin' WHERE id=?", (uid,))
+                conn.execute("UPDATE users SET role='admin', active=1 WHERE id=?",
+                             (uid,))
             wh = conn.execute("SELECT id FROM warehouses WHERE name=?",
                               (cfg.get("warehouse", ""),)).fetchone()
             if wh:
                 conn.execute("UPDATE users SET default_wh=? WHERE id=? AND default_wh IS NULL",
                              (wh["id"], uid))
-            for aname in cfg.get("access", []):
-                aw = conn.execute("SELECT id FROM warehouses WHERE name=?", (aname,)).fetchone()
-                if aw:
-                    conn.execute("INSERT OR IGNORE INTO access(user_id, warehouse_id) VALUES(?,?)",
-                                 (uid, aw["id"]))
+            if created:
+                for aname in cfg.get("access", []):
+                    aw = conn.execute("SELECT id FROM warehouses WHERE name=?",
+                                      (aname,)).fetchone()
+                    if aw:
+                        conn.execute("INSERT OR IGNORE INTO access(user_id, warehouse_id) "
+                                     "VALUES(?,?)", (uid, aw["id"]))
 
 
 def set_setting(key: str, value: str):
