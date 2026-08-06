@@ -109,6 +109,35 @@ def _watermark(font_bold_name):
     return draw
 
 
+def _report_brand(font_name):
+    """Фирменная рамка отчётных PDF (просьба владельца 04.08.2026):
+    маленькое лого в правом верхнем углу и контакты в подвале —
+    на КАЖДОЙ странице."""
+    def draw(canvas, doc):
+        from reportlab.lib.utils import ImageReader
+        page_w, page_h = doc.pagesize
+        canvas.saveState()
+        logo = _find_logo()
+        if logo:
+            try:
+                img = ImageReader(logo)
+                iw, ih = img.getSize()
+                w = 22 * mm
+                h = w * ih / iw
+                canvas.drawImage(img, page_w - 14 * mm - w,
+                                 page_h - 5 * mm - h,
+                                 width=w, height=h, mask="auto")
+            except Exception:
+                pass
+        canvas.setFont(font_name, 7.5)
+        canvas.setFillColor(colors.HexColor("#1b5e20"))
+        canvas.drawCentredString(
+            page_w / 2, 6 * mm,
+            "ОсОО «ВЕТОП» · +996 700 99 88 11 · +996 700 887 666 · vettop@inbox.ru")
+        canvas.restoreState()
+    return draw
+
+
 def generate_report_pdf(title: str, subtitle: str, sections: list,
                         footer: str = "") -> io.BytesIO:
     """Универсальный фирменный PDF-отчёт (остатки, долги, сроки и т.п.).
@@ -182,7 +211,8 @@ def generate_report_pdf(title: str, subtitle: str, sections: list,
         story.append(Spacer(1, 3*mm))
     if footer:
         story.append(Paragraph(xml_escape(footer), foot_style))
-    doc.build(story)
+    brand = _report_brand(font_name)
+    doc.build(story, onFirstPage=brand, onLaterPages=brand)
     buffer.seek(0)
     return buffer
 
