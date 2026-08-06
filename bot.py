@@ -340,6 +340,49 @@ async def _require_private(update) -> bool:
     return True
 
 
+KNOWN_COMMANDS: set = set()  # заполняется в main() из зарегистрированных команд
+
+
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Опечатка в команде (/infobd вместо /dbinfo) — подсказываем ближайшие
+    команды (просьба владельца 07.08.2026: бот молчал на опечатку, выглядело
+    как поломка). Отвечаем только сотрудникам; в группе — только если команда
+    адресована именно нашему боту (/команда@имябота), чтобы не встревать
+    в команды других ботов чата."""
+    msg = update.effective_message
+    if msg is None or not msg.text or not msg.text.startswith("/"):
+        return
+    raw = msg.text.split()[0][1:]
+    cmd, _, target = raw.partition("@")
+    if update.effective_chat and update.effective_chat.type != "private":
+        if target.lower() != (context.bot.username or "").lower():
+            return
+    tg_user = update.effective_user
+    row = db.get_user(tg_user.id) if tg_user else None
+    if row is None or not row["active"]:
+        return  # незнакомцам не подсказываем — как и везде, тишина
+    cmd_l = cmd.lower()
+    if not cmd_l or cmd_l in KNOWN_COMMANDS:
+        return
+    matches = difflib.get_close_matches(cmd_l, sorted(KNOWN_COMMANDS),
+                                        n=3, cutoff=0.6)
+    # Перестановка букв целиком (/infobd -> /dbinfo) difflib может недооценить
+    for known in KNOWN_COMMANDS:
+        if known not in matches and sorted(known) == sorted(cmd_l):
+            matches.insert(0, known)
+    if matches:
+        hint = " или ".join("/" + m for m in matches[:3])
+        text = (f"🤔 Не знаю команду /{esc(cmd_l)}. "
+                f"Возможно, вы имели в виду {hint}?")
+    else:
+        text = (f"🤔 Не знаю команду /{esc(cmd_l)}. "
+                "Список команд — в /start.")
+    try:
+        await msg.reply_text(text)
+    except Exception:
+        pass
+
+
 async def notify_admin(context, actor_row, text: str):
     """Дублирует админу каждую операцию, проведённую не им самим."""
     if actor_row["id"] == ADMIN_ID:
@@ -7885,6 +7928,12 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("warehouses", warehouses_cmd))
     app.add_handler(CommandHandler("feed", feed_cmd))
     app.add_handler(CommandHandler("nofeed", nofeed_cmd))
+    # Список известных команд для подсказки при опечатке (/infobd -> /dbinfo)
+    for h in app.handlers.get(0, []):
+        if isinstance(h, CommandHandler):
+            KNOWN_COMMANDS.update(h.commands)
+    app.add_handler(MessageHandler(
+        filters.COMMAND & filters.UpdateType.MESSAGE, unknown_command))
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(
         filters.TEXT & ~filters.COMMAND & filters.UpdateType.MESSAGE, handle_message))

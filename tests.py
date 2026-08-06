@@ -421,6 +421,54 @@ def test_training_wh_excluded():
     assert rep is not None and rep[1] == 1  # одна просроченная партия
 
 
+def test_unknown_command_hint():
+    """Опечатка в команде: подсказка сотруднику, тишина чужим и в группах."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    bot.KNOWN_COMMANDS.update({"dbinfo", "stock", "debts", "report", "start"})
+    replies = []
+
+    class Msg:
+        def __init__(self, text):
+            self.text = text
+
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd(text, user_id=ADMIN, chat_type="private"):
+        return SimpleNamespace(
+            effective_message=Msg(text),
+            effective_chat=SimpleNamespace(id=1, type=chat_type),
+            effective_user=SimpleNamespace(id=user_id))
+
+    ctx = SimpleNamespace(bot=SimpleNamespace(username="vetop_bot"))
+
+    async def run():
+        # /infobd — перестановка букв, подсказывается /dbinfo
+        await bot.unknown_command(upd("/infobd"), ctx)
+        assert "/dbinfo" in replies[-1]
+        # /stok — близкая опечатка
+        await bot.unknown_command(upd("/stok"), ctx)
+        assert "/stock" in replies[-1]
+        # совсем непохожее — общий ответ со ссылкой на /start
+        await bot.unknown_command(upd("/qwerty123"), ctx)
+        assert "/start" in replies[-1]
+        n = len(replies)
+        # известная команда — не наш случай, молчим
+        await bot.unknown_command(upd("/dbinfo"), ctx)
+        # незнакомец — тишина
+        await bot.unknown_command(upd("/infobd", user_id=999999), ctx)
+        # группа без обращения к боту — тишина (команда могла быть чужому боту)
+        await bot.unknown_command(upd("/infobd", chat_type="supergroup"), ctx)
+        assert len(replies) == n
+        # группа с явным обращением @vetop_bot — подсказываем
+        await bot.unknown_command(
+            upd("/infobd@vetop_bot", chat_type="supergroup"), ctx)
+        assert "/dbinfo" in replies[-1]
+    asyncio.run(run())
+
+
 def test_margin_op_id_only_for_invoice_actions():
     # op_id, случайно приехавший в оплату, не должен отключать выбор склада
     for action, expected in (("replace_invoice", True), ("amend_invoice", True),
