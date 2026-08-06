@@ -351,6 +351,25 @@ def test_return_requires_expiry():
     assert bot._expiry_questions(t) == []
 
 
+def test_staff_config_not_resurrected_on_deploy():
+    """/remove и /noaccess для штатных сотрудников должны переживать деплой:
+    повторный db.init (каждое обновление бота) не воскрешает active и не
+    возвращает доступы из STAFF (баг всплыл 03.08.2026, отпуск Жуми)."""
+    _fresh_db()
+    zhumi = 607647629
+    db.deactivate_user(zhumi)
+    kb = db.warehouse_by_name("Кара-Балта")
+    db.revoke_access(zhumi, kb["id"])
+    db.init(ADMIN, bot.WAREHOUSE_NAMES, bot.STAFF)   # «деплой»
+    row = db.get_user(zhumi)
+    assert row["active"] == 0, "/remove откатился деплоем"
+    assert kb["id"] not in [w["id"] for w in db.access_warehouses(zhumi)], \
+        "/noaccess откатился деплоем"
+    # админ при этом жив и роль на месте
+    assert db.get_user(ADMIN)["active"] == 1
+    assert db.get_user(ADMIN)["role"] == "admin"
+
+
 def test_training_wh_excluded():
     wh = _fresh_db()
     conn = db.connect()
