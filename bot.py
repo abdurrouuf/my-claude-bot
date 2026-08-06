@@ -313,7 +313,7 @@ async def _group_only_feed_whs(update, actor):
     if chat is None or chat.type == "private":
         return None, False
     whs = [w for w in db.warehouses_of_feed(chat.id)
-           if db.can_use_warehouse(actor, w["id"])]
+           if db.can_view_warehouse(actor, w["id"])]
     if not whs:
         try:
             await update.message.reply_text(
@@ -865,8 +865,12 @@ def resolve_warehouse(actor, wh_name: str):
         wh = db.warehouse_by_name(wh_name)
         if wh is None:
             return None, f"Склад «{esc(wh_name)}» не найден. Доступные: " + \
-                ", ".join(f"«{esc(w['name'])}»" for w in db.visible_warehouses(actor))
+                ", ".join(f"«{esc(w['name'])}»" for w in db.operable_warehouses(actor))
         if not db.can_use_warehouse(actor, wh["id"]):
+            if db.can_view_warehouse(actor, wh["id"]):
+                return None, (f"👁 У вас доступ к складу «{esc(wh['name'])}» только "
+                              "на ПРОСМОТР — операции проводит команда склада "
+                              "(или админ).")
             return None, f"⛔ У вас нет доступа к складу «{esc(wh['name'])}»."
         return wh, None
     own = db.warehouse_of(actor["id"])
@@ -1214,10 +1218,9 @@ async def _invoice_by_op_id(update, actor, op_id_raw):
     if wh is None:
         await update.message.reply_text("Склад этой накладной не найден.")
         return None, None
-    if (not is_admin(actor)
-            and wh["id"] not in [w["id"] for w in db.visible_warehouses(actor)]):
+    if not is_admin(actor) and not db.can_use_warehouse(actor, wh["id"]):
         await update.message.reply_text(
-            "⛔ Эта накладная с недоступного вам склада.")
+            "⛔ Эта накладная со склада, где вы не проводите операции.")
         return None, None
     return op, wh
 
@@ -1454,10 +1457,10 @@ async def start_set_phone(update, context, actor, data):
     exact = db.client_exact(wh["id"], client_name)
     if exact is None and not wh_name:
         # Склад не указан, и на складе по умолчанию клиента нет — ищем точное
-        # имя по всем доступным складам (как у псевдонимов: «телефон Туратбека»
-        # из лички админа должен найти клиента Каракола).
+        # имя по всем ОПЕРАЦИОННЫМ складам (запись телефона — не просмотр;
+        # у админа это все склады).
         hits = []
-        for w in db.visible_warehouses(actor):
+        for w in db.operable_warehouses(actor):
             c_ = db.client_exact(w["id"], client_name)
             if c_ is not None:
                 hits.append((w, c_))
@@ -1534,7 +1537,7 @@ async def start_handover(update, context, actor, data):
     # родной Бишкек на черновиках, но торгует на Кара-Балте; инцидент
     # 27.07.2026 — бот отвечал «переходный период»).
     if transition_blocked(actor) and not any(
-            w["full_mode"] for w in db.visible_warehouses(actor)):
+            w["full_mode"] for w in db.operable_warehouses(actor)):
         await update.message.reply_text(TRANSITION_HINT)
         return
     try:
@@ -3627,7 +3630,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 wh = db.warehouse_by_id(int(parts[2]))
             except (ValueError, IndexError):
                 wh = None
-            if wh is None or not db.can_use_warehouse(owner_row, wh["id"]):
+            if wh is None or not db.can_view_warehouse(owner_row, wh["id"]):
                 await q.edit_message_text("Склад не найден или нет доступа.")
                 return
             whs = [wh]
@@ -4268,7 +4271,7 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
     if (data.get("action") in WAREHOUSE_ACTIONS and not is_admin(actor)
             and not op_id_given
             and not str(data.get("warehouse") or "").strip()):
-        whs = db.visible_warehouses(actor)
+        whs = db.operable_warehouses(actor)
         if len(whs) > 1:
             payload = {"kind": "pick_wh", "user_id": actor["id"],
                        "chat_id": update.effective_chat.id,
@@ -5050,7 +5053,7 @@ async def stockat_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(usage)
         return
     wh = db.warehouse_by_name(wh_name)
-    if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+    if wh is None or not db.can_view_warehouse(actor, wh["id"]):
         await update.message.reply_text(
             f"Склад «{esc(wh_name)}» не найден или нет доступа.", parse_mode="HTML")
         return
@@ -5096,7 +5099,7 @@ async def _stock_cmd(update, context, with_prices):
     arg = " ".join(context.args).strip() if context.args else ""
     if arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
@@ -5149,7 +5152,7 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = whs_group
     elif arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
@@ -5209,7 +5212,7 @@ async def invoices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     wh_name = " ".join(args).strip()
     if wh_name and wh_name.lower() != "all":
         wh = db.warehouse_by_name(wh_name)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(wh_name)}» не найден или нет доступа.", parse_mode="HTML")
             return
@@ -5285,7 +5288,7 @@ async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     arg = " ".join(context.args).strip() if context.args else ""
     if arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
@@ -5429,7 +5432,7 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = whs_group
     elif wh_words:
         wh = db.warehouse_by_name(" ".join(wh_words))
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(' '.join(wh_words))}» не найден или нет доступа.\n"
                 "Использование: /report [Склад] [день|неделя|месяц]",
@@ -7010,15 +7013,20 @@ async def list_users_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"(родной: «{wh_label}»)")
         else:
             extra_access = db.access_warehouses(u["id"])
+            full = [w for w in extra_access if not w["view_only"]]
+            watch = [w for w in extra_access if w["view_only"]]
             line = (f"{role_icons.get(u['role'], '👤')} <b>{esc(u['name'])}</b> "
                     f"(<code>{u['id']}</code>) — {role_names.get(u['role'], 'сотрудник')}, "
                     f"склад «{wh_label}»")
-            if extra_access:
-                line += " + доступ: " + ", ".join(f"«{esc(w['name'])}»" for w in extra_access)
+            if full:
+                line += " + доступ: " + ", ".join(f"«{esc(w['name'])}»" for w in full)
+            if watch:
+                line += " + просмотр: " + ", ".join(f"«{esc(w['name'])}»" for w in watch)
         lines.append(line)
     lines.append("")
     lines.append("Родной склад — куда идут операции, если склад не указан "
-                 "в сообщении.")
+                 "в сообщении. «Просмотр» — видит отчёты склада, но операции "
+                 "там не проводит (/watch Имя Склад).")
     await send_long(update.message, "\n".join(lines))
 
 
@@ -7083,6 +7091,38 @@ async def access_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.grant_access(u["id"], wh["id"])
     await update.message.reply_text(
         f"✅ <b>{esc(u['name'])}</b> получил доступ к складу «{esc(wh['name'])}».", parse_mode="HTML")
+
+
+async def watch_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Доступ-просмотр: сотрудник видит отчёты склада (/stock, /debts,
+    /report, /expiry и т.д.), но операции проводить не может. Сделан для
+    Беки-снабженца (03.08.2026). Забрать — /noaccess Имя Склад."""
+    if await _require_admin(update) is None:
+        return
+    args = context.args
+    if len(args) < 2:
+        await update.message.reply_text(
+            "Использование: /watch Имя Склад — доступ только на просмотр\n"
+            "Пример: /watch Бека Манас. Забрать: /noaccess Бека Манас")
+        return
+    u = db.user_by_ref(args[0])
+    if u is None:
+        await update.message.reply_text(f"Сотрудник «{esc(args[0])}» не найден.", parse_mode="HTML")
+        return
+    wh = db.warehouse_by_name(" ".join(args[1:]))
+    if wh is None:
+        await update.message.reply_text(
+            "Склад не найден. Склады: " + ", ".join(f"«{esc(w['name'])}»" for w in db.all_warehouses()),
+            parse_mode="HTML")
+        return
+    own = db.warehouse_of(u["id"])
+    if own and own["id"] == wh["id"]:
+        await update.message.reply_text("Это его собственный склад — там у него полный доступ.")
+        return
+    db.grant_access(u["id"], wh["id"], view_only=True)
+    await update.message.reply_text(
+        f"👁 <b>{esc(u['name'])}</b> видит отчёты склада «{esc(wh['name'])}» "
+        f"(только просмотр — операции проводить не может).", parse_mode="HTML")
 
 
 async def noaccess_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7506,7 +7546,7 @@ async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = whs_group
     elif name and name.lower() != "all":
         wh = db.warehouse_by_name(name)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(name)}» не найден или нет доступа.", parse_mode="HTML")
             return
@@ -7711,6 +7751,7 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("users", "Команда и доступы"),
     ("grant", "Сделать старшим: /grant Имя"),
     ("access", "Дать доступ к складу"),
+    ("watch", "Доступ-просмотр: видит отчёты, не проводит"),
     ("fullmode", "Полный режим склада"),
     ("loadwh", "Стартовая загрузка остатков"),
     ("resetwh", "ПОЛНЫЙ сброс склада"),
@@ -7836,6 +7877,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("grant", grant_cmd))
     app.add_handler(CommandHandler("ungrant", ungrant_cmd))
     app.add_handler(CommandHandler("access", access_cmd))
+    app.add_handler(CommandHandler("watch", watch_cmd))
     app.add_handler(CommandHandler("noaccess", noaccess_cmd))
     app.add_handler(CommandHandler("whname", whname_cmd))
     app.add_handler(CommandHandler("setwh", setwh_cmd))

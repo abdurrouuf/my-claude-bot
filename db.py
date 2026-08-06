@@ -320,6 +320,11 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             conn.execute("ALTER TABLE draft_log ADD COLUMN items TEXT")
         if "full_mode" not in _columns(conn, "warehouses"):
             conn.execute("ALTER TABLE warehouses ADD COLUMN full_mode INTEGER NOT NULL DEFAULT 0")
+        if "view_only" not in _columns(conn, "access"):
+            # Доступ-просмотр (03.08.2026): сотрудник видит отчёты склада,
+            # но операции проводить не может (Бека проверяет чужие склады).
+            conn.execute("ALTER TABLE access ADD COLUMN view_only "
+                         "INTEGER NOT NULL DEFAULT 0")
         if "buy_usd" not in _columns(conn, "products"):
             # Закупочная цена в долларах (видна только админу в /margin и
             # /stockcost); NULL — закуп неизвестен.
@@ -855,11 +860,14 @@ def warehouses_of_feed(chat_id: int):
     ).fetchall()
 
 
-def grant_access(uid: int, wh_id: int):
+def grant_access(uid: int, wh_id: int, view_only: bool = False):
+    """Полный доступ или просмотр; повторный вызов меняет тип доступа."""
     conn = connect()
     with _lock, conn:
         conn.execute("INSERT OR IGNORE INTO access(user_id, warehouse_id) VALUES(?,?)",
                      (uid, wh_id))
+        conn.execute("UPDATE access SET view_only=? WHERE user_id=? AND warehouse_id=?",
+                     (1 if view_only else 0, uid, wh_id))
 
 
 def revoke_access(uid: int, wh_id: int):
@@ -868,16 +876,18 @@ def revoke_access(uid: int, wh_id: int):
         conn.execute("DELETE FROM access WHERE user_id=? AND warehouse_id=?", (uid, wh_id))
 
 
-def access_warehouses(uid: int):
-    return connect().execute(
-        "SELECT w.* FROM access a JOIN warehouses w ON w.id=a.warehouse_id "
-        "WHERE a.user_id=? ORDER BY w.name",
-        (uid,),
-    ).fetchall()
+def access_warehouses(uid: int, include_view: bool = True):
+    """Выданные склады; include_view=False — только с правом операций."""
+    q = ("SELECT w.*, a.view_only FROM access a "
+         "JOIN warehouses w ON w.id=a.warehouse_id WHERE a.user_id=?")
+    if not include_view:
+        q += " AND a.view_only=0"
+    return connect().execute(q + " ORDER BY w.name", (uid,)).fetchall()
 
 
-def visible_warehouses(user_row):
-    """Склады, которые пользователь видит: свой + выданные (админ — все)."""
+def visible_warehouses(user_row, include_view: bool = True):
+    """Склады, которые пользователь ВИДИТ в отчётах: свой + выданные,
+    включая доступ-просмотр (админ — все)."""
     if user_row["role"] == "admin":
         return all_warehouses()
     result, seen = [], set()
@@ -885,14 +895,26 @@ def visible_warehouses(user_row):
     if own:
         result.append(own)
         seen.add(own["id"])
-    for w in access_warehouses(user_row["id"]):
+    for w in access_warehouses(user_row["id"], include_view=include_view):
         if w["id"] not in seen:
             result.append(w)
             seen.add(w["id"])
     return result
 
 
+def operable_warehouses(user_row):
+    """Склады, где пользователь может ПРОВОДИТЬ операции: свой + полные
+    доступы; склады-просмотры сюда не входят."""
+    return visible_warehouses(user_row, include_view=False)
+
+
 def can_use_warehouse(user_row, wh_id: int) -> bool:
+    """Право ПРОВОДИТЬ операции на складе (просмотр не считается)."""
+    return any(w["id"] == wh_id for w in operable_warehouses(user_row))
+
+
+def can_view_warehouse(user_row, wh_id: int) -> bool:
+    """Право ВИДЕТЬ отчёты склада (полный доступ или просмотр)."""
     return any(w["id"] == wh_id for w in visible_warehouses(user_row))
 
 
