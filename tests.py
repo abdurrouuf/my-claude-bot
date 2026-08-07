@@ -469,6 +469,27 @@ def test_unknown_command_hint():
     asyncio.run(run())
 
 
+def test_cash_pdf_sections():
+    """/cash — PDF: секция движений, подбор сотрудника по имени."""
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    _invoice(wh, DANIYAR, "Клиент К", [_item(16, 5, 180)], payment=900)
+    u = db.get_user(DANIYAR)
+    cash, n_moves, sec = bot._cash_section(u)
+    assert cash == 900 and n_moves == 1
+    assert sec["rows"][0][1] == "+900" and "Сейчас на руках: 900 сом" in sec["footer"]
+    # подбор по имени: точное, регистр, опечатка, неизвестное
+    users = db.list_users()
+    assert bot._match_employee("Данияр", users)["id"] == DANIYAR
+    assert bot._match_employee("данияр", users)["id"] == DANIYAR
+    assert bot._match_employee("Данеяр", users)["id"] == DANIYAR
+    assert bot._match_employee("никто такой", users) is None
+    # PDF собирается
+    from invoice_pdf import generate_report_pdf
+    pdf = generate_report_pdf("КАССА СОТРУДНИКА", "тест", [sec])
+    assert pdf.getvalue().startswith(b"%PDF")
+
+
 def test_feed_chat_migration():
     """Группа стала супергруппой (id сменился) — привязка ленты переезжает."""
     wh = _fresh_db()

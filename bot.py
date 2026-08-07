@@ -1651,51 +1651,87 @@ async def start_handover(update, context, actor, data):
         f"Касса уменьшится, когда он подтвердит приём денег.", parse_mode="HTML")
 
 
-def _cash_all_text() -> str:
-    lines = ["💰 <b>Наличные на руках у сотрудников:</b>"]
-    total = 0.0
-    for u in db.list_users():
-        cash = db.cash_on_hand(u["id"])
-        if not cash:
-            continue
-        mark = " 👑" if u["role"] == "admin" else ""
-        lines.append(f"👤 {esc(u['name'])}{mark}: <b>{money(cash)}</b>")
-        total += cash
-    if len(lines) == 1:
-        return "💰 Кассы пусты — вся выручка сдана."
-    lines.append("")
-    lines.append(f"💰 Всего в кассах: <b>{money(total)}</b>")
-    return "\n".join(lines)
-
-
 _AMOUNT_IN_SUMMARY_RE = re.compile(r"\s*(?:[—–-]|\+)?\s*[\d'’]+\s*сом")
 
 
-def _cash_employee_text(u) -> str:
-    """Касса сотрудника: движения хронологически (последнее — внизу), итог в конце."""
+def _cash_section(u, limit=15):
+    """Секция PDF: движения кассы сотрудника хронологически (последнее внизу).
+    Возвращает (касса, число движений, секция)."""
     cash = db.cash_on_hand(u["id"])
-    moves = db.cash_movements(u["id"], 10)
-    lines = [f"💰 <b>Касса — {esc(u['name'])}</b>"]
-    if moves:
-        lines.append("")
-        lines.append("Движения (последнее — внизу):")
-        for op, amt in reversed(moves):
-            try:
-                d = datetime.fromisoformat(op["ts"]).strftime("%d.%m %H:%M")
-            except ValueError:
-                d = op["ts"]
-            sign = "+" if amt > 0 else "−"
-            # Сумму из описания убираем — она уже показана крупно в строке выше
-            what = _AMOUNT_IN_SUMMARY_RE.sub("", op["summary"], count=1).strip()
-            lines.append("")
-            lines.append(f"<b>{sign}{fmt_num(abs(amt))}</b> · {d}")
-            lines.append(esc(what))
-    else:
-        lines.append("")
-        lines.append("Движений по кассе ещё не было.")
-    lines.append("")
-    lines.append(f"💰 Итого сейчас на руках: <b>{money(cash)}</b>")
-    return "\n".join(lines)
+    moves = db.cash_movements(u["id"], limit)
+    rows = []
+    for op, amt in reversed(moves):
+        try:
+            d = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            d = op["ts"]
+        sign = "+" if amt > 0 else "−"
+        # Сумму из описания убираем — она уже показана в колонке «Сумма»
+        what = _AMOUNT_IN_SUMMARY_RE.sub("", op["summary"], count=1).strip()
+        rows.append([d, f"{sign}{fmt_num(abs(amt))}", what])
+    sec = {"title": f"{u['name']} — движения (последнее внизу)",
+           "headers": ["Дата", "Сумма", "Операция"],
+           "rows": rows or [["—", "—", "движений по кассе ещё не было"]],
+           "widths": [30, 26, 126],
+           "footer": f"Сейчас на руках: {money(cash)}"}
+    return cash, len(moves), sec
+
+
+async def _send_cash_pdf(message, target=None):
+    """Касса PDF-файлом (просьба владельца 07.08.2026: «не список, а сразу
+    PDF»). target — один сотрудник, None — все кассы одним файлом."""
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    if target is not None:
+        cash, n_moves, sec = _cash_section(target, limit=20)
+        if not n_moves and not cash:
+            await message.reply_text(
+                f"💰 Касса — {esc(target['name'])}: пусто, движений ещё не было.",
+                parse_mode="HTML")
+            return
+        pdf = generate_report_pdf(
+            "КАССА СОТРУДНИКА",
+            f"ОсОО «ВЕТОП» · {target['name']} · на {date_str}", [sec])
+        fname = safe_filename(f"касса_{target['name']}_{date_str.replace('.', '')}.pdf")
+        await message.reply_document(
+            document=InputFile(pdf, filename=fname),
+            caption=f"💰 Касса — {target['name']}: на руках {money(cash)}")
+        return
+    summary_rows, sections, total = [], [], 0.0
+    for u in db.list_users():
+        cash, n_moves, sec = _cash_section(u, limit=10)
+        if not n_moves and not cash:
+            continue
+        mark = " (админ)" if u["role"] == "admin" else ""
+        summary_rows.append([u["name"] + mark, money(cash)])
+        total += cash
+        sections.append(sec)
+    if not sections:
+        await message.reply_text("💰 Кассы пусты — вся выручка сдана.")
+        return
+    sections.insert(0, {"title": "Наличные на руках",
+                        "headers": ["Сотрудник", "На руках"],
+                        "rows": summary_rows, "widths": [120, 62],
+                        "footer": f"Всего в кассах: {money(total)}"})
+    pdf = generate_report_pdf("КАССЫ СОТРУДНИКОВ",
+                              f"ОсОО «ВЕТОП» · на {date_str}", sections)
+    await message.reply_document(
+        document=InputFile(pdf, filename=f"кассы_{date_str.replace('.', '')}.pdf"),
+        caption=f"💰 В кассах всего: {money(total)}")
+
+
+def _match_employee(arg: str, users):
+    """Сотрудник по имени из аргумента (/cash Данияр): регистр не важен,
+    небольшие опечатки прощаются; неоднозначность = не найден (кнопки)."""
+    a = arg.lower()
+    for u in users:
+        if u["name"].lower() == a:
+            return u
+    sub = [u for u in users if a in u["name"].lower()]
+    if len(sub) == 1:
+        return sub[0]
+    names = {u["name"].lower(): u for u in users}
+    close = difflib.get_close_matches(a, list(names), n=1, cutoff=0.7)
+    return names[close[0]] if close else None
 
 
 async def cash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1705,11 +1741,23 @@ async def cash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_private(update):
         return
     if is_admin(actor):
+        users = db.list_users()
+        employees = [u for u in users if u["role"] != "admin"]
+        # /cash Данияр — сразу PDF этого сотрудника; /cash все — общий PDF
+        arg = " ".join(context.args).strip() if context.args else ""
+        if arg:
+            if arg.lower() in ("все", "всех", "all"):
+                await _send_cash_pdf(update.message)
+                return
+            u = _match_employee(arg, users)
+            if u is not None:
+                await _send_cash_pdf(update.message, u)
+                return
+            # имя не распознали — покажем кнопки выбора
         # Кнопки: каждый сотрудник по отдельности + все сразу
         # (просьба владельца 21.07.2026).
-        employees = [u for u in db.list_users() if u["role"] != "admin"]
         if not employees:
-            await send_long(update.message, _cash_all_text())
+            await _send_cash_pdf(update.message)
             return
         payload = {"kind": "pick_cash", "user_id": actor["id"],
                    "chat_id": update.effective_chat.id}
@@ -3717,21 +3765,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             p.get("with_prices", False))
         return
 
-    if kind == "pc":  # выбор кассы: сотрудник или все сразу
+    if kind == "pc":  # выбор кассы: сотрудник или все сразу (ответ — PDF)
         PENDING.pop(token, None)
         await q.answer()
-        if len(parts) > 2 and parts[2] == "all":
-            text = _cash_all_text()
-        else:
+        target = None
+        if not (len(parts) > 2 and parts[2] == "all"):
             try:
-                u = db.get_user(int(parts[2]))
+                target = db.get_user(int(parts[2]))
             except (ValueError, IndexError):
-                u = None
-            if u is None:
+                target = None
+            if target is None:
                 await q.edit_message_text("Сотрудник не найден.")
                 return
-            text = _cash_employee_text(u)
-        await q.edit_message_text(text, parse_mode="HTML")
+        label = (f"💰 Касса — {esc(target['name'])}" if target
+                 else "💰 Кассы всех сотрудников")
+        try:
+            await q.edit_message_text(label, parse_mode="HTML")
+        except Exception:
+            pass
+        await _send_cash_pdf(q.message, target)
         return
 
     if kind == "pk":  # выбран существующий клиент
