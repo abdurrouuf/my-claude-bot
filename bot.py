@@ -381,6 +381,36 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def on_chat_migrated(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Группа стала супергруппой — Telegram меняет id чата, и привязка
+    ленты (/feed) молча слетала: команды в чате отвечали «склад не привязан»,
+    лента операций пропадала. Теперь привязка переезжает автоматически."""
+    msg = update.effective_message
+    if msg is None:
+        return
+    if msg.migrate_to_chat_id:            # служебное сообщение в СТАРОМ чате
+        old_id, new_id = msg.chat.id, msg.migrate_to_chat_id
+    elif msg.migrate_from_chat_id:        # служебное сообщение в НОВОМ чате
+        old_id, new_id = msg.migrate_from_chat_id, msg.chat.id
+    else:
+        return
+    names = db.migrate_feed_chat(old_id, new_id)
+    if not names:
+        return                            # второе из двух служебных сообщений
+    log.info("Чат %s переехал в %s, лента складов перенесена: %s",
+             old_id, new_id, ", ".join(names))
+    try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            "ℹ️ Групповой чат «" + esc(msg.chat.title or str(new_id))
+            + "» переехал в супергруппу — привязка ленты складов ("
+            + ", ".join(f"«{esc(n)}»" for n in names)
+            + ") перенесена автоматически, ничего делать не нужно.",
+            parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не удалось сообщить админу о переезде чата: %s", e)
+
+
 async def notify_admin(context, actor_row, text: str):
     """Дублирует админу каждую операцию, проведённую не им самим."""
     if actor_row["id"] == ADMIN_ID:
@@ -7942,5 +7972,6 @@ if __name__ == "__main__":
         (filters.VOICE | filters.AUDIO) & filters.UpdateType.MESSAGE, handle_voice))
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.UpdateType.MESSAGE, handle_db_file))
+    app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_chat_migrated))
     print("Бот запущен...")
     app.run_polling(stop_signals=None)

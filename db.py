@@ -843,6 +843,20 @@ def set_feed_chat(wh_id: int, chat_id, chat_title=None):
                      (chat_id, chat_title, wh_id))
 
 
+def migrate_feed_chat(old_chat_id: int, new_chat_id: int):
+    """Группа Telegram «переехала» в супергруппу — у чата сменился id.
+    Переносит привязку ленты на новый id. Возвращает имена складов."""
+    conn = connect()
+    with _lock, conn:
+        rows = conn.execute(
+            "SELECT name FROM warehouses WHERE feed_chat_id=?",
+            (old_chat_id,)).fetchall()
+        if rows:
+            conn.execute("UPDATE warehouses SET feed_chat_id=? WHERE feed_chat_id=?",
+                         (new_chat_id, old_chat_id))
+    return [r["name"] for r in rows]
+
+
 def unlink_feed_chat(chat_id: int):
     """Отвязывает все склады от данного чата. Возвращает имена отвязанных."""
     conn = connect()

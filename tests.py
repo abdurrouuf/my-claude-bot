@@ -469,6 +469,22 @@ def test_unknown_command_hint():
     asyncio.run(run())
 
 
+def test_feed_chat_migration():
+    """Группа стала супергруппой (id сменился) — привязка ленты переезжает."""
+    wh = _fresh_db()
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET feed_chat_id=-500 WHERE id=?", (wh["id"],))
+    conn.commit()
+    # первое служебное сообщение переносит привязку
+    assert db.migrate_feed_chat(-500, -100500) == [wh["name"]]
+    assert [w["id"] for w in db.warehouses_of_feed(-100500)] == [wh["id"]]
+    assert db.warehouses_of_feed(-500) == []
+    # второе (дубль из нового чата) уже ничего не находит — без двойного алерта
+    assert db.migrate_feed_chat(-500, -100500) == []
+    # чат без привязки — тишина
+    assert db.migrate_feed_chat(-42, -100042) == []
+
+
 def test_stranger_full_silence():
     """Посторонний не получает НИЧЕГО — ни в личке, ни в группе."""
     import asyncio
