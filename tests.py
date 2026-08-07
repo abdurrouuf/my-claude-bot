@@ -488,6 +488,21 @@ def test_cash_pdf_sections():
     from invoice_pdf import generate_report_pdf
     pdf = generate_report_pdf("КАССА СОТРУДНИКА", "тест", [sec])
     assert pdf.getvalue().startswith(b"%PDF")
+    # имя файла оканчивается на «.pdf»: safe_filename съедала точку,
+    # телефон не открывал файл (скриншот владельца 07.08.2026)
+    import asyncio
+    from types import SimpleNamespace
+    sent = {}
+
+    class M:
+        async def reply_document(self, document=None, caption=None, **kw):
+            sent["filename"] = document.filename
+
+        async def reply_text(self, *a, **kw):
+            pass
+
+    asyncio.run(bot._send_cash_pdf(M(), u))
+    assert sent["filename"].endswith(".pdf"), sent["filename"]
 
 
 def test_feed_chat_migration():

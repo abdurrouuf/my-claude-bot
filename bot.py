@@ -1691,7 +1691,10 @@ async def _send_cash_pdf(message, target=None):
         pdf = generate_report_pdf(
             "КАССА СОТРУДНИКА",
             f"ОсОО «ВЕТОП» · {target['name']} · на {date_str}", [sec])
-        fname = safe_filename(f"касса_{target['name']}_{date_str.replace('.', '')}.pdf")
+        # safe_filename чистит имя БЕЗ расширения — точку «.pdf» она съедает,
+        # и телефон не открывал файл (скриншот владельца 07.08.2026)
+        fname = safe_filename(
+            f"касса_{target['name']}_{date_str.replace('.', '')}") + ".pdf"
         await message.reply_document(
             document=InputFile(pdf, filename=fname),
             caption=f"💰 Касса — {target['name']}: на руках {money(cash)}")
