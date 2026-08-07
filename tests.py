@@ -505,6 +505,35 @@ def test_cash_pdf_sections():
     assert sent["filename"].endswith(".pdf"), sent["filename"]
 
 
+def test_cash_since_zero_handover():
+    """/cash показывает движения только после инкассации «под ноль»."""
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    _invoice(wh, DANIYAR, "Клиент А", [_item(16, 2, 180)], payment=5000)
+    _invoice(wh, DANIYAR, "Клиент Б", [_item(16, 2, 180)], payment=2600)
+    # сдал всё — касса ровно ноль
+    db.commit_operation(DANIYAR, "handover", wh["id"], None,
+                        "Инкассация: Данияр сдал 7'600 сом", [], [],
+                        {"amount": 7600})
+    moves, since = db.cash_movements_since_zero(DANIYAR)
+    assert moves == [] and since is not None      # после обнуления — пусто
+    # новые операции после обнуления
+    _invoice(wh, DANIYAR, "Клиент В", [_item(16, 2, 180)], payment=900)
+    moves, since = db.cash_movements_since_zero(DANIYAR)
+    assert since is not None and [amt for _, amt in moves] == [900]
+    cash, n_moves, sec = bot._cash_section(db.get_user(DANIYAR))
+    assert cash == 900 and n_moves == 1
+    assert "после инкассации" in sec["title"]
+    # частичная сдача (не под ноль) — история не отрезается
+    db.commit_operation(DANIYAR, "handover", wh["id"], None,
+                        "Инкассация: Данияр сдал 400 сом", [], [],
+                        {"amount": 400})
+    moves, since = db.cash_movements_since_zero(DANIYAR)
+    assert [amt for _, amt in moves] == [-400, 900]
+    # а до первой инкассации истории вообще не было бы видно
+    assert all(amt != 5000 for _, amt in moves)
+
+
 def test_feed_chat_migration():
     """Группа стала супергруппой (id сменился) — привязка ленты переезжает."""
     wh = _fresh_db()

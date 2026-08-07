@@ -1656,9 +1656,13 @@ _AMOUNT_IN_SUMMARY_RE = re.compile(r"\s*(?:[—–-]|\+)?\s*[\d'’]+\s*сом")
 
 def _cash_section(u, limit=15):
     """Секция PDF: движения кассы сотрудника хронологически (последнее внизу).
+    Показываются движения ПОСЛЕ последней инкассации «под ноль» (просьба
+    владельца 07.08.2026); если такой не было — последние limit движений.
     Возвращает (касса, число движений, секция)."""
     cash = db.cash_on_hand(u["id"])
-    moves = db.cash_movements(u["id"], limit)
+    moves, since = db.cash_movements_since_zero(u["id"])
+    if since is None:
+        moves = moves[:limit]
     rows = []
     for op, amt in reversed(moves):
         try:
@@ -1669,9 +1673,19 @@ def _cash_section(u, limit=15):
         # Сумму из описания убираем — она уже показана в колонке «Сумма»
         what = _AMOUNT_IN_SUMMARY_RE.sub("", op["summary"], count=1).strip()
         rows.append([d, f"{sign}{fmt_num(abs(amt))}", what])
-    sec = {"title": f"{u['name']} — движения (последнее внизу)",
+    if since:
+        try:
+            since_str = datetime.fromisoformat(since).strftime("%d.%m.%Y")
+        except ValueError:
+            since_str = since
+        title = f"{u['name']} — движения после инкассации {since_str} (последнее внизу)"
+        empty = "движений после инкассации ещё не было"
+    else:
+        title = f"{u['name']} — движения (последнее внизу)"
+        empty = "движений по кассе ещё не было"
+    sec = {"title": title,
            "headers": ["Дата", "Сумма", "Операция"],
-           "rows": rows or [["—", "—", "движений по кассе ещё не было"]],
+           "rows": rows or [["—", "—", empty]],
            "widths": [30, 26, 126],
            "footer": f"Сейчас на руках: {money(cash)}"}
     return cash, len(moves), sec
@@ -1685,7 +1699,8 @@ async def _send_cash_pdf(message, target=None):
         cash, n_moves, sec = _cash_section(target, limit=20)
         if not n_moves and not cash:
             await message.reply_text(
-                f"💰 Касса — {esc(target['name'])}: пусто, движений ещё не было.",
+                f"💰 Касса — {esc(target['name'])}: 0 сом, новых движений нет "
+                "(всё сдано либо движений ещё не было).",
                 parse_mode="HTML")
             return
         pdf = generate_report_pdf(

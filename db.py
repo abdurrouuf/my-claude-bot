@@ -1069,7 +1069,21 @@ def cash_movements(user_id: int, limit: int = 10):
     return out
 
 
-def client_operations(cid: int):
+def cash_movements_since_zero(user_id: int, cap: int = 100):
+    """Движения кассы ПОСЛЕ последней инкассации, обнулившей кассу
+    (просьба владельца 07.08.2026: старые движения после сдачи «под ноль»
+    в /cash не нужны). Возвращает (moves, since_ts): moves — новые первыми;
+    since_ts — время обнулившей инкассации, None = не найдена (тогда
+    moves — просто последние cap движений)."""
+    moves = cash_movements(user_id, cap)
+    running = cash_on_hand(user_id)   # баланс ПОСЛЕ самой новой операции
+    out = []
+    for op, amt in moves:             # новые -> старые
+        if op["type"] == "handover" and abs(running) < 0.005:
+            return out, op["ts"]      # эта инкассация оставила ровно ноль
+        out.append((op, amt))
+        running -= amt                # баланс после предыдущей операции
+    return out, None
     """Все проведённые операции клиента по порядку."""
     return connect().execute(
         "SELECT * FROM operations WHERE client_id=? AND status='done' ORDER BY id",
