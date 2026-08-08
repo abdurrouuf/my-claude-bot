@@ -6906,7 +6906,7 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Хронологический порядок: старые сверху, новые снизу — как в чате
     # (просьба владельца 25.07.2026).
     ops = list(reversed(ops))
-    sections, cancelled = [], 0
+    sections, cancelled, money_sum = [], 0, 0.0
     rows, last_day = [], None
 
     def flush(day):
@@ -6928,20 +6928,40 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
             last_day = day
         u = db.get_user(op["user_id"])
         who = u["name"] if u else str(op["user_id"])
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            data = {}
         summary = op["summary"]
-        if op["status"] == "cancelled":
-            cancelled += 1
-            summary = f"ОТМЕНЕНА · {summary}"
         type_label = LOG_TYPE_NAMES.get(op["type"], op["type"])
-        if op["type"] == "invoice":
+        if op["type"] == "invoice" and data.get("payment"):
             # Накладная с деньгами сразу — честный тип (замечание
             # владельца 08.08.2026: «написано только накладная, но там
             # ещё же есть приход»)
-            try:
-                if json.loads(op["data"]).get("payment"):
-                    type_label = "Накладная + приход"
-            except (ValueError, TypeError):
-                pass
+            type_label = "Накладная + приход"
+        if op_type == "payment":
+            # В фильтре «приходы» показываем ДЕНЬГИ, а не накладную
+            # (замечание владельца 08.08.2026: «зачем мне тут накладная?»)
+            amt = (data.get("amount") if op["type"] == "payment"
+                   else data.get("payment")) or 0
+            if op["type"] == "invoice":
+                c = db.client_get(op["client_id"]) if op["client_id"] else None
+                if c is not None:
+                    type_label = "Приход при накладной"
+                    wh_ = (db.warehouse_by_id(op["warehouse_id"])
+                           if op["warehouse_id"] else None)
+                    summary = (f"Приход: {c['name']} — {fmt_num(amt)} сом "
+                               f"при накладной №{op['id']}"
+                               + (f" (склад {wh_['name']})" if wh_ else ""))
+                    if (data.get("old_debt") is not None
+                            and data.get("total") is not None):
+                        summary += _debt_suffix(
+                            data["old_debt"] + data["total"] - amt)
+            if op["status"] != "cancelled":
+                money_sum += amt
+        if op["status"] == "cancelled":
+            cancelled += 1
+            summary = f"ОТМЕНЕНА · {summary}"
         rows.append([str(op["id"]), tm, who, type_label, summary])
     flush(last_day)
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
@@ -6949,6 +6969,8 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if op_type:
         sub += f" · {LOG_FILTER_LABELS[op_type]}"
     footer = f"Операций в журнале: {len(ops)}"
+    if op_type == "payment":
+        footer += f" · принято денег: {money(money_sum)}"
     if cancelled:
         footer += f" · из них отменено: {cancelled}"
     pdf = generate_report_pdf(
