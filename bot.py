@@ -5920,6 +5920,7 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
         inv_data, pay_sum, transfers = [], 0.0, 0
         ret_sum, ret_count = 0.0, 0
         wo_sum, wo_count = 0.0, 0
+        hand_sum, hand_by = 0.0, {}
         for op in ops:
             try:
                 data = json.loads(op["data"])
@@ -5935,6 +5936,10 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
             elif op["type"] == "writeoff" and op["warehouse_id"] == wh["id"]:
                 wo_sum += data.get("total", 0)
                 wo_count += 1
+            elif op["type"] == "handover" and op["warehouse_id"] == wh["id"]:
+                amt = data.get("amount", 0)
+                hand_sum += amt
+                hand_by[op["user_id"]] = hand_by.get(op["user_id"], 0) + amt
             elif op["type"] == "transfer" and wh["id"] in db.operation_warehouses(op):
                 transfers += 1
         sales = sum(d.get("total", 0) for d in inv_data)
@@ -5944,14 +5949,19 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
             for it in d.get("items", []):
                 key = f"{it.get('name', '')} {it.get('volume', '')}".strip()
                 top[key] = top.get(key, 0) + (it.get("qty") or 0)
+        hand_list = []
+        for uid, amt in hand_by.items():
+            u = db.get_user(uid)
+            hand_list.append((u["name"] if u else str(uid), amt))
         out.append({
             "wh": wh, "n_inv": len(inv_data), "sales": sales,
             "money": inv_payments + pay_sum, "debt_added": sales - inv_payments,
             "ret_count": ret_count, "ret_sum": ret_sum, "transfers": transfers,
             "wo_count": wo_count, "wo_sum": wo_sum,
+            "hand_sum": hand_sum, "hand_list": hand_list,
             "top": sorted(top.items(), key=lambda x: -x[1]),
             "empty": (not inv_data and not pay_sum and not transfers
-                      and not ret_count and not wo_count),
+                      and not ret_count and not wo_count and not hand_sum),
         })
     return out
 
@@ -6017,6 +6027,9 @@ def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
             rows.append(["Списания", f"{d['wo_count']} на {money(d['wo_sum'])}"])
         if d["transfers"]:
             rows.append(["Приходы/перемещения", str(d["transfers"])])
+        if d["hand_sum"]:
+            who = ", ".join(f"{money(a)} ({n})" for n, a in d["hand_list"])
+            rows.append(["Сдано выручки", who])
         sections.append({"title": f"Склад «{wh['name']}»",
                          "headers": ["Показатель", "Значение"],
                          "rows": rows, "widths": [80, 87]})
@@ -6035,8 +6048,12 @@ def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
                              "rows": [[n, f"{q} шт"] for n, q in shown],
                              "widths": [130, 37],
                              "numbered": True, "footer": note})
-        summary.append(f"📊 «{wh['name']}»: продажи {money(d['sales'])}, "
-                       f"деньги {money(d['money'])}")
+        line = (f"📊 «{wh['name']}»: продажи {money(d['sales'])}, "
+                f"деньги {money(d['money'])}")
+        if d["hand_sum"]:
+            line += "\n💵 Сдано выручки: " + ", ".join(
+                f"{money(a)} ({n})" for n, a in d["hand_list"])
+        summary.append(line)
         if not is_training_wh(wh):
             grand_sales += d["sales"]
             grand_money += d["money"]
@@ -6079,6 +6096,8 @@ async def send_evening_summaries(bot):
                 bits.append(f"продажи {money(d['sales'])}")
             if d["money"]:
                 bits.append(f"деньги {money(d['money'])}")
+            if d.get("hand_sum"):
+                bits.append(f"сдано выручки {money(d['hand_sum'])}")
             if bits:
                 tail_lines.append(
                     f"🌙 «{d['wh']['name']}» вчера после сводки: "
