@@ -5898,17 +5898,23 @@ PERIODS = {
 }
 
 
-def report_data(warehouses, days_back: int, last_hours: int = None):
+def report_data(warehouses, days_back: int, last_hours: int = None,
+                start_dt=None, end_dt=None):
     """Цифры отчёта по складам за период (для текста и PDF).
 
-    last_hours — скользящее окно «последние N часов» (для вечерней сводки:
-    окно «с полуночи» теряло операции после часа отправки)."""
-    if last_hours:
+    last_hours — скользящее окно «последние N часов»;
+    start_dt/end_dt — явные границы (для «хвоста» вчерашнего вечера
+    в календарной сводке дня, решение владельца 08.08.2026)."""
+    if start_dt is not None:
+        start = start_dt
+    elif last_hours:
         start = datetime.now(BISHKEK) - timedelta(hours=last_hours)
     else:
         start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
             hour=0, minute=0, second=0, microsecond=0)
-    ops = db.operations_since(start.isoformat(timespec="seconds"))
+    ops = db.operations_since(
+        start.isoformat(timespec="seconds"),
+        end_dt.isoformat(timespec="seconds") if end_dt else None)
     out = []
     for wh in warehouses:
         inv_data, pay_sum, transfers = [], 0.0, 0
@@ -6054,12 +6060,42 @@ async def send_evening_summaries(bot):
     for wh in db.all_warehouses():
         if wh["feed_chat_id"]:
             by_chat.setdefault(wh["feed_chat_id"], []).append(wh)
+    now = datetime.now(BISHKEK)
+    midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_cut = midnight - timedelta(hours=24 - SUMMARY_HOUR)
     for chat_id, whs in by_chat.items():
-        # Скользящие сутки: окно «с полуночи» теряло операции после 20:00 —
-        # они не попадали ни в сегодняшнюю сводку, ни в завтрашнюю.
-        pdf, caption = build_report_pdf(whs, 0, "за сутки", last_hours=24)
+        # КАЛЕНДАРНЫЙ день с полуночи (решение владельца 08.08.2026:
+        # скользящие сутки показывали вчерашние вечерние деньги как
+        # сегодняшние). Операции «вчера после сводки» (20:00–полночь)
+        # не теряются — идут отдельной строкой в подписи.
+        pdf, caption = build_report_pdf(whs, 0, "за день")
+        tail = report_data(whs, 0, start_dt=yesterday_cut, end_dt=midnight)
+        tail_lines = []
+        for d in tail:
+            if d.get("empty"):
+                continue
+            bits = []
+            if d["sales"]:
+                bits.append(f"продажи {money(d['sales'])}")
+            if d["money"]:
+                bits.append(f"деньги {money(d['money'])}")
+            if bits:
+                tail_lines.append(
+                    f"🌙 «{d['wh']['name']}» вчера после сводки: "
+                    + ", ".join(bits))
         if pdf is None:
+            if tail_lines:
+                # Сегодня пусто, но вчерашний вечер не должен пропасть
+                try:
+                    await bot.send_message(
+                        chat_id, "🌆 Итоги дня: операций сегодня не было.\n"
+                        + "\n".join(tail_lines))
+                except Exception as e:
+                    log.warning("Не удалось отправить сводку в %s: %s",
+                                chat_id, e)
             continue  # день без операций — не шумим
+        if tail_lines:
+            caption += "\n" + "\n".join(tail_lines)
         wh_ids = {w["id"] for w in whs}
         cash_lines = []
         for u in db.list_users():

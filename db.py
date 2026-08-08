@@ -1459,12 +1459,15 @@ def last_invoice_for_client(client_id: int):
         "AND client_id=? ORDER BY id DESC LIMIT 1", (client_id,)).fetchone()
 
 
-def operations_since(start_iso: str):
-    """Проведённые операции начиная с даты (ISO), по возрастанию."""
-    return connect().execute(
-        "SELECT * FROM operations WHERE status='done' AND ts >= ? ORDER BY id",
-        (start_iso,),
-    ).fetchall()
+def operations_since(start_iso: str, end_iso: str = None):
+    """Проведённые операции начиная с даты (ISO), по возрастанию;
+    end_iso — необязательная правая граница (не включается)."""
+    q = "SELECT * FROM operations WHERE status='done' AND ts >= ?"
+    params = [start_iso]
+    if end_iso:
+        q += " AND ts < ?"
+        params.append(end_iso)
+    return connect().execute(q + " ORDER BY id", params).fetchall()
 
 
 def operations_all_since(start_iso: str):
