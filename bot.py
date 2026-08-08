@@ -1257,6 +1257,9 @@ async def start_invoice(update, context, actor, data, draft=False):
 
 CERT_CAPTION_RE = re.compile(r"^\s*сертификат(?:ы)?\s*(?:на\s+)?(.*)$",
                              re.IGNORECASE | re.DOTALL)
+# «сертификат поставки F260403» — файл на ВСЮ поставку, без привязки
+# к препарату (просьба владельца 08.08.2026: один PDF на поставку)
+CERT_SUPPLY_RE = re.compile(r"^поставк\w*\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
 
 def _cert_short_names():
@@ -1317,6 +1320,15 @@ async def _handle_cert_upload(update, file_id, kind, file_name, caption):
             "Подпишите файл так: «сертификат Альтопен» (несколько препаратов — "
             "через запятую, примечание — после тире: «сертификат Альтопен — "
             "поставка 07.2026»).")
+        return
+    m_sup = CERT_SUPPLY_RE.match(rest)
+    if m_sup:
+        label = " ".join(m_sup.group(1).split())
+        name = f"Поставка {label}"
+        db.cert_add(name, file_id, kind, file_name, note)
+        await update.message.reply_text(
+            f"✅ Сертификат сохранён: {name}\n"
+            f"Сотрудники получат его командой /cert поставка {label}")
         return
     ok, bad = [], []
     for part in [p.strip() for p in rest.split(",") if p.strip()]:
