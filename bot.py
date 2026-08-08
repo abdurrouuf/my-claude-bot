@@ -1261,6 +1261,39 @@ CERT_CAPTION_RE = re.compile(r"^\s*сертификат(?:ы)?\s*(?:на\s+)?(.*
 # к препарату (просьба владельца 08.08.2026: один PDF на поставку)
 CERT_SUPPLY_RE = re.compile(r"^поставк\w*\s+(.+)$", re.IGNORECASE | re.DOTALL)
 
+# Последний файл админа в личке: подпись «сертификат …» часто приходит
+# ОТДЕЛЬНЫМ сообщением после файла (так удобнее с телефона, случай
+# владельца 08.08.2026 — файл молча игнорировался, текст уходил в ИИ).
+CERT_PENDING_DOC = {}              # (chat_id, user_id) -> данные файла
+CERT_PENDING_TTL = 15 * 60
+
+
+def _remember_cert_doc(update, file_id, kind, file_name):
+    key = (update.effective_chat.id, update.effective_user.id)
+    CERT_PENDING_DOC[key] = {"file_id": file_id, "kind": kind,
+                             "file_name": file_name, "ts": time.time()}
+
+
+async def cert_text_reply(update, actor, text) -> bool:
+    """Текст «сертификат …» в личке (не подпись к файлу). Админ с недавно
+    присланным файлом — привязываем файл; иначе подсказка. True = учтено."""
+    key = (update.effective_chat.id, update.effective_user.id)
+    pend = CERT_PENDING_DOC.get(key)
+    if is_admin(actor) and pend and time.time() - pend["ts"] <= CERT_PENDING_TTL:
+        CERT_PENDING_DOC.pop(key, None)
+        await _handle_cert_upload(update, pend["file_id"], pend["kind"],
+                                  pend["file_name"], text)
+        return True
+    if is_admin(actor):
+        await update.message.reply_text(
+            "Получить сертификат: /cert Название (список: /cert).\n"
+            "Добавить: пришлите файл с подписью «сертификат Название» — "
+            "или сначала файл, а подпись следующим сообщением.")
+    else:
+        await update.message.reply_text(
+            "Сертификаты выдаёт команда /cert Название.\nЧто есть: /cert")
+    return True
+
 
 def _cert_short_names():
     """Названия препаратов без фасовок и расшифровок в скобках."""
@@ -4698,6 +4731,15 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _handle_cert_upload(update, update.message.photo[-1].file_id,
                                       "photo", None, caption)
         return
+    if is_admin(actor):
+        # Запомним фото на случай, если подпись «сертификат …» придёт
+        # следующим сообщением (обычная обработка продолжается)
+        if update.message.document is not None:
+            _remember_cert_doc(update, update.message.document.file_id,
+                               "document", update.message.document.file_name)
+        elif update.message.photo:
+            _remember_cert_doc(update, update.message.photo[-1].file_id,
+                               "photo", None)
     draft = False
     m = DRAFT_RE.match(caption)
     if m:
@@ -5116,6 +5158,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Слушаю! После «Джарвис» напишите операцию, например: "
                 "«Джарвис, Асель приход 5000».")
+            return
+    # «сертификат …» текстом в личке — не для ИИ: либо подпись к только что
+    # присланному файлу (владелец шлёт файл и подпись отдельно, 08.08.2026),
+    # либо подсказка про /cert. Бесплатно и без фантазий ИИ.
+    if not quiet and CERT_CAPTION_RE.match(text) and len(text.split()) <= 25:
+        if await cert_text_reply(update, actor, text):
             return
     draft = False
     m = DRAFT_RE.match(text)
@@ -7878,6 +7926,11 @@ async def handle_db_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                   doc.file_name, caption)
         return
     if not (doc.file_name or "").lower().endswith(".db"):
+        # Файл без подписи: запомним — подпись «сертификат …» может прийти
+        # следующим сообщением (владелец шлёт с телефона по отдельности)
+        a = await get_actor(update)
+        if a is not None and is_admin(a):
+            _remember_cert_doc(update, doc.file_id, "document", doc.file_name)
         return
     actor = await get_actor(update)
     if actor is None:
