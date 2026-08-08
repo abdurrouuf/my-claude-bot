@@ -6882,8 +6882,17 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if op["status"] == "cancelled":
             cancelled += 1
             summary = f"ОТМЕНЕНА · {summary}"
-        rows.append([str(op["id"]), tm, who,
-                     LOG_TYPE_NAMES.get(op["type"], op["type"]), summary])
+        type_label = LOG_TYPE_NAMES.get(op["type"], op["type"])
+        if op["type"] == "invoice":
+            # Накладная с деньгами сразу — честный тип (замечание
+            # владельца 08.08.2026: «написано только накладная, но там
+            # ещё же есть приход»)
+            try:
+                if json.loads(op["data"]).get("payment"):
+                    type_label = "Накладная + приход"
+            except (ValueError, TypeError):
+                pass
+        rows.append([str(op["id"]), tm, who, type_label, summary])
     flush(last_day)
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
     who_label = "все сотрудники" if is_admin(actor) else actor["name"]
@@ -6937,7 +6946,10 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                   "transfer": "Перемещение / приход товара",
                   "inventory": "Инвентаризация", "return": "Возврат",
                   "handover": "Сдача выручки", "writeoff": "Списание"}
-    info = [["Тип", type_names.get(op["type"], op["type"])],
+    type_label = type_names.get(op["type"], op["type"])
+    if op["type"] == "invoice" and data.get("payment"):
+        type_label = "Накладная + приход"
+    info = [["Тип", type_label],
             ["Статус", "❌ ОТМЕНЕНА" if op["status"] == "cancelled"
              else "проведена"],
             ["Дата", ts],
@@ -7012,7 +7024,7 @@ async def op_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     status_mark = " (ОТМЕНЕНА)" if op["status"] == "cancelled" else ""
     pdf = generate_report_pdf(
         f"ОПЕРАЦИЯ №{op['id']}{status_mark}",
-        f"ОсОО «ВЕТОП» · {type_names.get(op['type'], op['type'])} · {ts}",
+        f"ОсОО «ВЕТОП» · {type_label} · {ts}",
         sections)
     icon = LOG_TYPE_ICONS.get(op["type"], "▫️")
     caption = f"{icon} №{op['id']} · {op['summary']}"
