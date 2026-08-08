@@ -6836,6 +6836,24 @@ LOG_TYPE_NAMES = {"invoice": "Накладная", "payment": "Оплата",
                   "return": "Возврат", "handover": "Сдача выручки",
                   "writeoff": "Списание"}
 
+# Слова-фильтры /log по типу операции: /log Азамат накладные 50
+LOG_TYPE_FILTERS = {
+    "накладные": "invoice", "накладная": "invoice",
+    "приходы": "payment", "приход": "payment",
+    "оплаты": "payment", "оплата": "payment",
+    "возвраты": "return", "возврат": "return",
+    "списания": "writeoff", "списание": "writeoff",
+    "перемещения": "transfer", "перемещение": "transfer",
+    "инкассации": "handover", "инкассация": "handover", "сдачи": "handover",
+    "инвентаризации": "inventory", "инвентаризация": "inventory",
+}
+LOG_FILTER_LABELS = {
+    "invoice": "только накладные", "payment": "только приходы денег",
+    "return": "только возвраты", "writeoff": "только списания",
+    "transfer": "только перемещения", "handover": "только сдачи выручки",
+    "inventory": "только инвентаризации",
+}
+
 
 async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
@@ -6843,15 +6861,46 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if not await _require_private(update):
         return
-    try:
-        # Нижняя граница обязательна: отрицательный LIMIT в SQLite означает
-        # «без лимита» — /log -5 выгружал бы весь журнал за всю историю.
-        n = max(1, min(int(context.args[0]), 100)) if context.args else 20
-    except ValueError:
-        n = 20
-    ops = db.recent_operations(n, None if is_admin(actor) else actor["id"])
+    # Аргументы в любом порядке: число (сколько), тип операции, имя
+    # сотрудника (только админ): /log Азамат накладные 50
+    n, op_type, name_words = 20, None, []
+    for a in (context.args or []):
+        try:
+            # Нижняя граница обязательна: отрицательный LIMIT в SQLite
+            # означает «без лимита» — /log -5 выгружал бы весь журнал.
+            n = max(1, min(int(a), 100))
+            continue
+        except ValueError:
+            pass
+        t = LOG_TYPE_FILTERS.get(a.lower())
+        if t:
+            op_type = t
+        else:
+            name_words.append(a)
+    target_id = None if is_admin(actor) else actor["id"]
+    who_label = "все сотрудники" if is_admin(actor) else actor["name"]
+    if name_words:
+        u = _match_employee(" ".join(name_words), db.list_users())
+        if u is None:
+            await update.message.reply_text(
+                f"Сотрудник «{esc(' '.join(name_words))}» не найден.\n"
+                "Пример: /log Азамат накладные 50", parse_mode="HTML")
+            return
+        if not is_admin(actor) and u["id"] != actor["id"]:
+            await update.message.reply_text(
+                "Чужие операции видит только администратор — /log без имени "
+                "покажет ваши.")
+            return
+        target_id, who_label = u["id"], u["name"]
+    ops = db.recent_operations(n, target_id, op_type)
     if not ops:
-        await update.message.reply_text("Журнал пуст.")
+        if op_type or name_words:
+            await update.message.reply_text(
+                f"Операций не найдено ({esc(who_label)}"
+                + (f", {LOG_FILTER_LABELS[op_type]}" if op_type else "")
+                + ").", parse_mode="HTML")
+        else:
+            await update.message.reply_text("Журнал пуст.")
         return
     # Хронологический порядок: старые сверху, новые снизу — как в чате
     # (просьба владельца 25.07.2026).
@@ -6895,18 +6944,26 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
         rows.append([str(op["id"]), tm, who, type_label, summary])
     flush(last_day)
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
-    who_label = "все сотрудники" if is_admin(actor) else actor["name"]
+    sub = f"ОсОО «ВЕТОП» · последние {len(ops)} · {who_label}"
+    if op_type:
+        sub += f" · {LOG_FILTER_LABELS[op_type]}"
     footer = f"Операций в журнале: {len(ops)}"
     if cancelled:
         footer += f" · из них отменено: {cancelled}"
     pdf = generate_report_pdf(
-        "ЖУРНАЛ ОПЕРАЦИЙ",
-        f"ОсОО «ВЕТОП» · последние {len(ops)} · {who_label} · на {date_str}",
+        "ЖУРНАЛ ОПЕРАЦИЙ", sub + f" · на {date_str}",
         sections, footer=footer)
     caption = f"🗒 Последние операции: {len(ops)} (новые внизу)"
+    if op_type or target_id is not None and is_admin(actor):
+        caption = (f"🗒 {who_label}"
+                   + (f", {LOG_FILTER_LABELS[op_type]}" if op_type else "")
+                   + f": {len(ops)} операций (новые внизу)")
     if is_admin(actor):
         caption += "\nОтменить: /undo Номер"
-    caption += "\nБольше: /log 50 · подробности: /op Номер"
+        caption += "\nФильтры: /log Азамат накладные 50"
+    else:
+        caption += "\nБольше: /log 50"
+    caption += " · подробности: /op Номер"
     await update.message.reply_document(
         document=InputFile(pdf, filename=f"журнал_{date_str.replace('.', '')}.pdf"),
         caption=caption)

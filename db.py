@@ -1361,16 +1361,21 @@ def operations_all_since(start_iso: str):
     ).fetchall()
 
 
-def recent_operations(limit: int = 10, user_id=None):
-    conn = connect()
-    if user_id is None:
-        return conn.execute(
-            "SELECT * FROM operations ORDER BY id DESC LIMIT ?", (limit,)
-        ).fetchall()
-    return conn.execute(
-        "SELECT * FROM operations WHERE user_id=? ORDER BY id DESC LIMIT ?",
-        (user_id, limit),
-    ).fetchall()
+def recent_operations(limit: int = 10, user_id=None, op_type=None):
+    """Последние операции журнала; user_id/op_type — необязательные фильтры
+    (фильтры /log Азамат накладные, просьба владельца 08.08.2026)."""
+    conds, params = [], []
+    if user_id is not None:
+        conds.append("user_id=?")
+        params.append(user_id)
+    if op_type:
+        conds.append("type=?")
+        params.append(op_type)
+    q = "SELECT * FROM operations"
+    if conds:
+        q += " WHERE " + " AND ".join(conds)
+    params.append(limit)
+    return connect().execute(q + " ORDER BY id DESC LIMIT ?", params).fetchall()
 
 
 def operation_warehouses(op_row) -> list:

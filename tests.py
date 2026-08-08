@@ -532,6 +532,29 @@ def test_act_statement_invoice_with_payment():
     assert pdf.getvalue().startswith(b"%PDF")
 
 
+def test_log_filters():
+    """/log Азамат накладные — фильтры журнала по сотруднику и типу."""
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    _invoice(wh, DANIYAR, "Клиент Л", [_item(16, 2, 180)], payment=100)
+    c = db.client_exact(wh["id"], "Клиент Л")
+    bot.commit_payment({"user_id": DANIYAR, "wh_id": wh["id"],
+                        "wh_name": wh["name"], "client_id": c["id"],
+                        "amount": 200})
+    db.commit_operation(AZAMAT, "handover", wh["id"], None,
+                        "Инкассация: сдал", [], [], {"amount": 50})
+    assert {o["type"] for o in db.recent_operations(50, DANIYAR)} == \
+        {"invoice", "payment"}
+    pays = db.recent_operations(50, DANIYAR, "payment")
+    assert len(pays) == 1 and pays[0]["type"] == "payment"
+    assert db.recent_operations(50, None, "handover")[0]["user_id"] == AZAMAT
+    assert db.recent_operations(50, DANIYAR, "handover") == []
+    # слова-фильтры понимают единственное и множественное число
+    assert bot.LOG_TYPE_FILTERS["накладные"] == "invoice"
+    assert bot.LOG_TYPE_FILTERS["возврат"] == "return"
+    assert bot.LOG_TYPE_FILTERS["приходы"] == "payment"
+
+
 def test_summary_debt_suffix():
     """Сводка операции показывает долг клиента после неё (лента, /log)."""
     wh = _fresh_db()
