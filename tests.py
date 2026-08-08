@@ -532,6 +532,26 @@ def test_act_statement_invoice_with_payment():
     assert pdf.getvalue().startswith(b"%PDF")
 
 
+def test_writeoff_pdf_and_summary():
+    """Акт списания PDF; сводка без «(не указана)» при пустой причине."""
+    wh = _fresh_db()
+    _load(wh, {16: 100}, {(wh["id"], 16): [("10.2027", 100)]})
+    p = {"kind": "writeoff", "user_id": ADMIN, "wh_id": wh["id"],
+         "wh_name": wh["name"], "reason": "не указана",
+         "items": [{**_item(16, 82, 180), "src_batches": [("10.2027", 82)]}]}
+    op_id, summary, total = bot.commit_writeoff(p)
+    assert summary.startswith("Списание: ") and "не указана" not in summary
+    assert total == 82 * 180 and db.stock_qty(wh["id"], 16) == 18
+    pdf = bot._writeoff_pdf(p, op_id, total)
+    assert pdf.getvalue().startswith(b"%PDF")
+    # с причиной — причина в сводке
+    p2 = {"kind": "writeoff", "user_id": ADMIN, "wh_id": wh["id"],
+          "wh_name": wh["name"], "reason": "просрочка",
+          "items": [_item(16, 3, 180)]}
+    _, s2, _ = bot.commit_writeoff(p2)
+    assert s2.startswith("Списание (просрочка): ")
+
+
 def test_certs():
     """Сертификаты соответствия: хранение, поиск препарата, удаление."""
     _fresh_db()
