@@ -532,6 +532,26 @@ def test_act_statement_invoice_with_payment():
     assert pdf.getvalue().startswith(b"%PDF")
 
 
+def test_client_word_order():
+    """«Чооров Кубан» = «Кубан Чооров»: перестановка слов имени находит
+    клиента, двойник не создаётся (случай Беки на выезде 08.08.2026)."""
+    wh = _fresh_db()
+    _load(wh, {16: 50})
+    _invoice(wh, DANIYAR, "Кубан Чооров", [_item(16, 1, 180)], debt=148000)
+    c = db.client_exact(wh["id"], "Чооров Кубан")
+    assert c is not None and c["name"] == "Кубан Чооров"
+    # регистр не мешает
+    assert db.client_exact(wh["id"], "чооров кубан")["name"] == "Кубан Чооров"
+    # и в кандидатах-кнопках перестановка тоже есть (первой)
+    cands = db.fuzzy_clients(wh["id"], "Чооров Кубан")
+    assert cands and cands[0]["name"] == "Кубан Чооров"
+    # одно слово — как раньше, без сюрпризов
+    assert db.client_exact(wh["id"], "Кубан") is None
+    # два клиента с одинаковым набором слов — авто-совпадения нет
+    _invoice(wh, DANIYAR, "Чооров Кубан", [_item(16, 1, 180)])
+    assert db.client_exact(wh["id"], "Кубан Чооров")["name"] == "Кубан Чооров"
+
+
 def test_log_filters():
     """/log Азамат накладные — фильтры журнала по сотруднику и типу."""
     wh = _fresh_db()

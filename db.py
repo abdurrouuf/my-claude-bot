@@ -994,8 +994,15 @@ def client_get(cid: int):
     return connect().execute("SELECT * FROM clients WHERE id=?", (cid,)).fetchone()
 
 
+def _name_key(s: str) -> str:
+    """Имя как набор слов: «Чооров Кубан» и «Кубан Чооров» — один ключ."""
+    return " ".join(sorted(s.lower().split()))
+
+
 def client_exact(wh_id: int, name: str):
-    """Клиент по точному имени ИЛИ псевдониму («Виктория» → «Вика Уманец»)."""
+    """Клиент по точному имени ИЛИ псевдониму («Виктория» → «Вика Уманец»),
+    ИЛИ по тем же словам в другом порядке («Чооров Кубан» = «Кубан Чооров»,
+    случай Беки на выезде 08.08.2026 — бот предлагал создать двойника)."""
     name = name.strip()
     conn = connect()
     row = conn.execute(
@@ -1003,10 +1010,30 @@ def client_exact(wh_id: int, name: str):
     ).fetchone()
     if row is not None:
         return row
-    return conn.execute(
+    row = conn.execute(
         "SELECT c.* FROM client_aliases a JOIN clients c ON c.id = a.client_id "
         "WHERE c.warehouse_id=? AND a.alias=?", (wh_id, name)
     ).fetchone()
+    if row is not None:
+        return row
+    if " " not in name:
+        return None
+    # Перестановка слов: считаем совпадением, только если такой клиент
+    # ровно один (двусмысленность решают кнопки похожих в fuzzy_clients).
+    key = _name_key(name)
+    cands = {}
+    for r in conn.execute("SELECT * FROM clients WHERE warehouse_id=?", (wh_id,)):
+        if _name_key(r["name"]) == key:
+            cands[r["id"]] = r
+    for r in conn.execute(
+            "SELECT a.alias, c.* FROM client_aliases a "
+            "JOIN clients c ON c.id = a.client_id WHERE c.warehouse_id=?",
+            (wh_id,)):
+        if _name_key(r["alias"]) == key:
+            cands[r["id"]] = r
+    if len(cands) == 1:
+        return next(iter(cands.values()))
+    return None
 
 
 def add_client_alias(client_id: int, alias: str):
@@ -1153,14 +1180,21 @@ def fuzzy_clients(wh_id: int, name: str, n: int = 3):
             "SELECT a.alias, c.* FROM client_aliases a "
             "JOIN clients c ON c.id = a.client_id WHERE c.warehouse_id=?", (wh_id,)):
         mapping.setdefault(r["alias"].lower(), r)
-    matches = difflib.get_close_matches(name.strip().lower(), list(mapping), n=n, cutoff=0.6)
+    query = name.strip().lower()
+    matches = difflib.get_close_matches(query, list(mapping), n=n, cutoff=0.6)
+    # Перестановку слов difflib недооценивает («чооров кубан» ↔ «кубан
+    # чооров» ≈ 0.58 < порога) — сравниваем ещё и отсортированные слова;
+    # такие совпадения показываем первыми.
+    qkey = _name_key(query)
+    perm = [k for k in mapping if k not in matches and
+            difflib.SequenceMatcher(None, qkey, _name_key(k)).ratio() >= 0.85]
     out, seen = [], set()
-    for m in matches:
+    for m in perm + matches:
         r = mapping[m]
         if r["id"] not in seen:
             seen.add(r["id"])
             out.append(r)
-    return out
+    return out[:n]
 
 
 # ---------- Операции (журнал + атомарное применение) ----------
