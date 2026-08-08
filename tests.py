@@ -505,6 +505,33 @@ def test_cash_pdf_sections():
     assert sent["filename"].endswith(".pdf"), sent["filename"]
 
 
+def test_act_statement_invoice_with_payment():
+    """Акт сверки: накладная с приходом — одна строка (товар+ и оплата−),
+    долг сходится. Заодно охраняет db.client_operations (инцидент 08.08:
+    правка соседней функции случайно стёрла её заголовок — /act и /client
+    падали, тесты молчали)."""
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    # стартовый долг 34'300 + накладная 1'800
+    (_, _, _, _, _), _ = _invoice(wh, DANIYAR, "Эркинбу эже",
+                                  [_item(16, 10, 180)], debt=34300)
+    c = db.client_exact(wh["id"], "Эркинбу эже")
+    # накладная 11'200 с приходом 5'000 (как №140 у Азамата)
+    _invoice(wh, DANIYAR, c["name"], [_item(16, 8, 1400)], payment=5000,
+             client_id=c["id"])
+    rows, start = bot.client_statement(c["id"])
+    assert start == 0 and len(rows) == 2
+    d1, doc1, plus1, minus1, bal1 = rows[0]
+    d2, doc2, plus2, minus2, bal2 = rows[1]
+    assert plus1 == 1800 and minus1 == 0 and bal1 == 36100
+    assert plus2 == 11200 and minus2 == 5000 and bal2 == 42300
+    assert db.client_get(c["id"])["debt"] == 42300
+    # PDF собирается
+    from invoice_pdf import generate_act_pdf
+    pdf = generate_act_pdf(c["name"], wh["name"], rows, start, 42300, "тест")
+    assert pdf.getvalue().startswith(b"%PDF")
+
+
 def test_cash_since_zero_handover():
     """/cash показывает движения только после инкассации «под ноль»."""
     wh = _fresh_db()
