@@ -3158,7 +3158,11 @@ def commit_writeoff(p):
             plan.setdefault((p["wh_id"], pid), []).append((exp, q_))
     stock_deltas = [(p["wh_id"], pid, -q) for pid, q in qty_by_pid.items()]
     total = sum(it["qty"] * it.get("price", 0) for it in p["items"])
-    summary = (f"Списание ({p['reason']}): склад {p['wh_name']}, "
+    reason = (p.get("reason") or "").strip()
+    # Без причины — просто «Списание:», а не «Списание (не указана):»
+    head = f"Списание ({reason})" if reason and reason != "не указана" \
+        else "Списание"
+    summary = (f"{head}: склад {p['wh_name']}, "
                f"{len(p['items'])} поз. на {fmt_num(total)} сом")
     extra = {"items": [{k: it.get(k) for k in ("name", "volume", "qty", "box_qty",
                                                "price", "expiry", "product_id")}
@@ -3762,6 +3766,36 @@ def _fill_src_batches(p):
         it["src_batches"] = rows_
 
 
+def _writeoff_pdf(p, op_id, total):
+    """Акт списания PDF — состав виден в ленте склада (просьба владельца
+    08.08.2026: «в общий чат — PDF-файл с составом списания»)."""
+    rows = []
+    for it in p["items"]:
+        srcs = it.get("src_batches") or []
+        if len(srcs) > 1:
+            exp_cell = [f"{e or 'без срока'} — {q_} шт" for e, q_ in srcs]
+        elif srcs:
+            exp_cell = srcs[0][0] or "без срока"
+        else:
+            exp_cell = it.get("expiry") or "—"
+        price = it.get("price") or 0
+        rows.append([str(it["name"]).split("(")[0].strip(),
+                     str(it.get("volume") or ""), f"{it['qty']} шт",
+                     fmt_num(price), fmt_num(price * it["qty"]), exp_cell])
+    reason = (p.get("reason") or "").strip()
+    sub = (f"ОсОО «ВЕТОП» · склад {p['wh_name']} · "
+           + datetime.now(BISHKEK).strftime("%d.%m.%Y"))
+    if reason and reason != "не указана":
+        sub += f" · причина: {reason}"
+    return generate_report_pdf(
+        f"АКТ СПИСАНИЯ № {op_id}", sub,
+        [{"title": "Списанный товар",
+          "headers": ["Товар", "Фасовка", "Кол-во", "Цена", "Сумма", "Срок"],
+          "rows": rows, "widths": [46, 20, 18, 16, 21, 36],
+          "numbered": True}],
+        footer=f"Итого списано: {money(total)} (по ценам прайса)")
+
+
 async def _finish_writeoff(q, context, actor, p):
     """Проведение списания после выбора партий и уточнения сроков."""
     # Перепроверка остатка на кнопке: заявка сотрудника могла ждать админа
@@ -3795,8 +3829,31 @@ async def _finish_writeoff(q, context, actor, p):
                 log.warning("Не удалось уведомить заявителя о списании")
         else:
             await notify_admin(context, actor, summary)
-        await feed_operation(context, op_id, db.get_user(p["user_id"])["name"],
-                             "🗑", exclude_chat_id=p["chat_id"])
+        # Акт списания PDF: нажавшему кнопку и в ленту склада одним
+        # сообщением со сводкой в подписи (просьба владельца 08.08.2026)
+        fname = f"акт_списания_{op_id}.pdf"
+        try:
+            await context.bot.send_document(
+                chat_id=q.message.chat.id,
+                document=InputFile(_writeoff_pdf(p, op_id, total),
+                                   filename=fname),
+                caption=f"🗑 Акт списания №{op_id}")
+        except Exception as e:
+            log.warning("Не удалось отправить акт списания: %s", e)
+        wh_row = db.warehouse_by_id(p["wh_id"])
+        if (wh_row and wh_row["feed_chat_id"]
+                and wh_row["feed_chat_id"] not in (p["chat_id"],
+                                                   q.message.chat.id)):
+            actor_name = db.get_user(p["user_id"])["name"]
+            try:
+                await context.bot.send_document(
+                    chat_id=wh_row["feed_chat_id"],
+                    document=InputFile(_writeoff_pdf(p, op_id, total),
+                                       filename=fname),
+                    caption=f"🗑 <b>{esc(actor_name)}</b> — {esc(summary)}",
+                    parse_mode="HTML")
+            except Exception as e:
+                log.warning("Не удалось отправить акт в ленту склада: %s", e)
         await alert_low_stock(context, [
             (p["wh_id"], it["product_id"], -it["qty"])
             for it in p["items"] if it.get("product_id")])
