@@ -532,6 +532,33 @@ def test_act_statement_invoice_with_payment():
     assert pdf.getvalue().startswith(b"%PDF")
 
 
+def test_certs():
+    """Сертификаты соответствия: хранение, поиск препарата, удаление."""
+    _fresh_db()
+    # подбор препарата: точное короткое имя, подстрока, опечатка
+    name, _ = bot._cert_product_match("альтопен")
+    assert name == "АЛЬТОПЕН"
+    name, cands = bot._cert_product_match("альтопен-фор")
+    assert name is None and any("ФОРТЕ" in c for c in cands)  # уточнение
+    # опечатка «альтапен»: в прайсе есть и АЛЬТОПЕР — бот не гадает,
+    # а предлагает уточнить, показывая обоих кандидатов
+    name, cands = bot._cert_product_match("альтапен")
+    assert name is None and "АЛЬТОПЕН" in cands and "АЛЬТОПЕР" in cands
+    # хранение: новые первыми, список, удаление
+    db.cert_add("АЛЬТОПЕН", "FILE1", "document", "cert.pdf", "поставка 07.2026")
+    db.cert_add("АЛЬТОПЕН", "FILE2", "photo")
+    certs = db.certs_of("АЛЬТОПЕН")
+    assert [c["file_id"] for c in certs] == ["FILE2", "FILE1"]
+    assert certs[1]["note"] == "поставка 07.2026"
+    assert db.cert_names() == [("АЛЬТОПЕН", 2)]
+    # регистр не важен (коллация NOCASEU)
+    assert len(db.certs_of("альтопен")) == 2
+    # разбор подписи: «сертификат на Альтопен — поставка 07.2026»
+    m = bot.CERT_CAPTION_RE.match("Сертификат на Альтопен — поставка 07.2026")
+    assert m and m.group(1).strip() == "Альтопен — поставка 07.2026"
+    assert db.certs_delete("АЛЬТОПЕН") == 2 and db.cert_names() == []
+
+
 def test_client_word_order():
     """«Чооров Кубан» = «Кубан Чооров»: перестановка слов имени находит
     клиента, двойник не создаётся (случай Беки на выезде 08.08.2026)."""

@@ -140,6 +140,16 @@ CREATE TABLE IF NOT EXISTS product_batches(
     qty          INTEGER NOT NULL DEFAULT 0,
     UNIQUE(warehouse_id, product_id, expiry)
 );
+CREATE TABLE IF NOT EXISTS product_certs(
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_name TEXT NOT NULL COLLATE NOCASEU,  -- препарат (без фасовки)
+    file_id      TEXT NOT NULL,                  -- файл на серверах Telegram
+    file_kind    TEXT NOT NULL DEFAULT 'document',  -- document | photo
+    file_name    TEXT,
+    note         TEXT,                           -- напр. «поставка 07.2026»
+    ts           TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_certs_name ON product_certs(product_name);
 CREATE TABLE IF NOT EXISTS promises(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT NOT NULL,
@@ -1046,6 +1056,41 @@ def add_client_alias(client_id: int, alias: str):
 def client_aliases_list(client_id: int) -> list:
     return [r["alias"] for r in connect().execute(
         "SELECT alias FROM client_aliases WHERE client_id=? ORDER BY alias", (client_id,))]
+
+
+# ---------- Сертификаты соответствия ----------
+
+def cert_add(product_name: str, file_id: str, file_kind: str = "document",
+             file_name=None, note=None):
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT INTO product_certs(product_name, file_id, file_kind, "
+            "file_name, note, ts) VALUES(?,?,?,?,?,?)",
+            (product_name.strip(), file_id, file_kind, file_name, note,
+             datetime.now(BISHKEK).isoformat(timespec="seconds")))
+
+
+def certs_of(product_name: str):
+    """Сертификаты препарата, новые первыми (свежая поставка сверху)."""
+    return connect().execute(
+        "SELECT * FROM product_certs WHERE product_name=? ORDER BY id DESC",
+        (product_name.strip(),)).fetchall()
+
+
+def cert_names():
+    """[(препарат, сколько сертификатов)] — у кого есть хоть один."""
+    return [(r["product_name"], r["n"]) for r in connect().execute(
+        "SELECT product_name, COUNT(*) n FROM product_certs "
+        "GROUP BY product_name ORDER BY product_name")]
+
+
+def certs_delete(product_name: str) -> int:
+    conn = connect()
+    with _lock, conn:
+        cur = conn.execute("DELETE FROM product_certs WHERE product_name=?",
+                           (product_name.strip(),))
+        return cur.rowcount
 
 
 def cash_on_hand(user_id: int) -> float:
