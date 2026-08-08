@@ -1249,6 +1249,172 @@ async def start_invoice(update, context, actor, data, draft=False):
                                     reply_markup=InlineKeyboardMarkup(rows))
 
 
+# ---------- Сертификаты соответствия ----------
+# На каждый препарат/поставку есть сертификат минсельхоза (просьба владельца
+# 08.08.2026): админ шлёт боту PDF/фото с подписью «сертификат Название»,
+# сотрудники получают его командой /cert Название и пересылают клиентам.
+# Файл храним на серверах Telegram (file_id) — база не растёт.
+
+CERT_CAPTION_RE = re.compile(r"^\s*сертификат(?:ы)?\s*(?:на\s+)?(.*)$",
+                             re.IGNORECASE | re.DOTALL)
+
+
+def _cert_short_names():
+    """Названия препаратов без фасовок и расшифровок в скобках."""
+    names, seen = [], set()
+    for pr in prices.PRICE_LIST_DATA:
+        nm = pr["name"].split("(")[0].strip()
+        if nm and nm.lower() not in seen:
+            seen.add(nm.lower())
+            names.append(nm)
+    for nm, _ in db.cert_names():   # препараты со старыми сертификатами
+        if nm.lower() not in seen:
+            seen.add(nm.lower())
+            names.append(nm)
+    return names
+
+
+def _cert_product_match(query: str):
+    """Препарат по названию: точно → подстрока → difflib.
+    Возвращает (имя | None, кандидаты для уточнения)."""
+    q = query.strip().lower()
+    if not q:
+        return None, []
+    names = _cert_short_names()
+    for nm in names:
+        if nm.lower() == q:
+            return nm, []
+    subs = [nm for nm in names if q in nm.lower()]
+    if len(subs) == 1:
+        return subs[0], []
+    if subs:
+        return None, subs[:6]
+    by_lower = {nm.lower(): nm for nm in names}
+    close = difflib.get_close_matches(q, list(by_lower), n=3, cutoff=0.6)
+    if len(close) == 1:
+        return by_lower[close[0]], []
+    return None, [by_lower[c] for c in close]
+
+
+async def _handle_cert_upload(update, file_id, kind, file_name, caption):
+    """PDF/фото с подписью «сертификат …» от админа — сохранить привязку."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    if not is_admin(actor):
+        await update.message.reply_text(
+            "Сертификаты добавляет только администратор.")
+        return
+    m = CERT_CAPTION_RE.match(caption)
+    rest = (m.group(1) if m else "").strip()
+    note = None
+    for dash in ("—", " - ", "–"):
+        if dash in rest:
+            rest, note = [x.strip() for x in rest.split(dash, 1)]
+            break
+    if not rest:
+        await update.message.reply_text(
+            "Подпишите файл так: «сертификат Альтопен» (несколько препаратов — "
+            "через запятую, примечание — после тире: «сертификат Альтопен — "
+            "поставка 07.2026»).")
+        return
+    ok, bad = [], []
+    for part in [p.strip() for p in rest.split(",") if p.strip()]:
+        name, cands = _cert_product_match(part)
+        if name is None:
+            hint = f" (похоже на: {', '.join(cands)})" if cands else ""
+            bad.append(part + hint)
+        else:
+            db.cert_add(name, file_id, kind, file_name, note)
+            ok.append(name)
+    lines = []
+    if ok:
+        lines.append("✅ Сертификат сохранён: " + ", ".join(ok))
+        lines.append(f"Сотрудники получат его командой /cert {ok[0].lower()}")
+    if bad:
+        lines.append("⚠️ Не распознал препарат: " + "; ".join(bad)
+                     + ". Напишите название как в прайсе.")
+    await update.message.reply_text("\n".join(lines))
+
+
+async def cert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/cert Название — прислать сертификат соответствия препарата."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    args = list(context.args or [])
+    send_all = False
+    if args and args[-1].lower() in ("все", "всё", "all"):
+        send_all = True
+        args = args[:-1]
+    query = " ".join(args).strip()
+    if not query:
+        have = db.cert_names()
+        if not have:
+            await update.message.reply_text(
+                "📜 Сертификатов в боте пока нет.\n"
+                "Админ добавляет их так: прислать боту PDF или фото с подписью "
+                "«сертификат Название препарата».")
+            return
+        lines = ["📜 Сертификаты есть на препараты:"]
+        lines += [f"• {nm}" + (f" — {k} шт" if k > 1 else "")
+                  for nm, k in have]
+        lines += ["", "Получить: /cert Название"]
+        await send_long(update.message, "\n".join(lines))
+        return
+    name, cands = _cert_product_match(query)
+    if name is None:
+        if cands:
+            await update.message.reply_text(
+                "Уточните препарат: " + ", ".join(cands))
+        else:
+            await update.message.reply_text(
+                f"Препарат «{query}» не нашёл. Список с сертификатами: /cert")
+        return
+    certs = db.certs_of(name)
+    if not certs:
+        await update.message.reply_text(
+            f"На «{name}» сертификата в боте пока нет. Что есть: /cert")
+        return
+    for c in (certs if send_all else certs[:1]):
+        cap = f"📜 Сертификат: {name}"
+        if c["note"]:
+            cap += f" — {c['note']}"
+        try:
+            cap += " (добавлен " + datetime.fromisoformat(
+                c["ts"]).strftime("%d.%m.%Y") + ")"
+        except ValueError:
+            pass
+        if c["file_kind"] == "photo":
+            await update.message.reply_photo(c["file_id"], caption=cap)
+        else:
+            await update.message.reply_document(c["file_id"], caption=cap)
+    if not send_all and len(certs) > 1:
+        await update.message.reply_text(
+            f"Это самый свежий из {len(certs)}. Прислать все: "
+            f"/cert {name.lower()} все")
+
+
+async def certdel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/certdel Название — админ удаляет сертификаты препарата."""
+    if await _require_admin(update) is None:
+        return
+    query = " ".join(context.args or []).strip()
+    if not query:
+        await update.message.reply_text("Использование: /certdel Название")
+        return
+    name, cands = _cert_product_match(query)
+    if name is None:
+        await update.message.reply_text(
+            "Уточните препарат: " + ", ".join(cands) if cands
+            else f"Препарат «{query}» не нашёл.")
+        return
+    n = db.certs_delete(name)
+    await update.message.reply_text(
+        f"🗑 Удалено сертификатов «{name}»: {n}." if n
+        else f"У «{name}» сертификатов не было.")
+
+
 # ---------- Телефон клиента ----------
 
 def amend_summary(p, old_total: float) -> str:
@@ -4509,6 +4675,17 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if actor is None:
         return
     caption = (update.message.caption or "").strip()
+    if CERT_CAPTION_RE.match(caption):
+        # Фото сертификата от админа — сохранить, в ИИ не отправлять
+        if update.message.document is not None:
+            await _handle_cert_upload(update, update.message.document.file_id,
+                                      "document",
+                                      update.message.document.file_name,
+                                      caption)
+        elif update.message.photo:
+            await _handle_cert_upload(update, update.message.photo[-1].file_id,
+                                      "photo", None, caption)
+        return
     draft = False
     m = DRAFT_RE.match(caption)
     if m:
@@ -4988,6 +5165,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/act Имя — акт сверки в PDF",
         "/price — прайс-лист",
         "/pricepdf — красивый PDF-прайс для отправки клиентам",
+        "/cert Название — сертификат соответствия препарата (для клиентов)",
         "/log — журнал последних операций PDF-файлом (/log 50 — больше)",
         "/undo — отменить свою последнюю операцию (в течение часа)",
         "➕ <b>Дополнить накладную</b>: <i>добавь в последнюю накладную Мустанга: "
@@ -7679,7 +7857,15 @@ async def handle_db_file(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or update.effective_chat.type != "private":
         return
     doc = update.message.document
-    if doc is None or not (doc.file_name or "").lower().endswith(".db"):
+    if doc is None:
+        return
+    caption = (update.message.caption or "").strip()
+    if CERT_CAPTION_RE.match(caption):
+        # PDF сертификата от админа («сертификат Альтопен») — сохранить
+        await _handle_cert_upload(update, doc.file_id, "document",
+                                  doc.file_name, caption)
+        return
+    if not (doc.file_name or "").lower().endswith(".db"):
         return
     actor = await get_actor(update)
     if actor is None:
@@ -8114,6 +8300,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("loadkarakol", loadwh_cmd))
     app.add_handler(CommandHandler("resetwh", resetwh_cmd))
     app.add_handler(CommandHandler("expiry", expiry_cmd))
+    app.add_handler(CommandHandler("cert", cert_cmd))
+    app.add_handler(CommandHandler("certdel", certdel_cmd))
     app.add_handler(CommandHandler("apibalance", apibalance_cmd))
     app.add_handler(CommandHandler("log", show_log))
     app.add_handler(CommandHandler("op", op_cmd))
