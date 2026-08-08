@@ -1084,6 +1084,9 @@ def cash_movements_since_zero(user_id: int, cap: int = 100):
         out.append((op, amt))
         running -= amt                # баланс после предыдущей операции
     return out, None
+
+
+def client_operations(cid: int):
     """Все проведённые операции клиента по порядку."""
     return connect().execute(
         "SELECT * FROM operations WHERE client_id=? AND status='done' ORDER BY id",
