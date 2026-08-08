@@ -1044,6 +1044,16 @@ def invoice_summary(p) -> str:
     return "\n".join(lines)
 
 
+def _debt_suffix(new_debt: float) -> str:
+    """Хвост сводки операции: долг клиента после неё — виден сразу в ленте,
+    уведомлении админу и /log (просьба владельца 08.08.2026)."""
+    if new_debt > 0:
+        return f", долг: {fmt_num(new_debt)} сом"
+    if new_debt < 0:
+        return f", переплата: {fmt_num(-new_debt)} сом"
+    return ", долг погашен"
+
+
 def commit_invoice(p, replace_op_id=None):
     """Проводит накладную: клиент, остатки, долг, журнал. Возвращает детали для PDF.
 
@@ -1104,6 +1114,7 @@ def commit_invoice(p, replace_op_id=None):
     summary = f"Накладная: {client_label} — {fmt_num(total)} сом (склад {p['wh_name']})"
     if p["payment"]:
         summary += f", приход {fmt_num(p['payment'])} сом"
+    summary += _debt_suffix(old_debt + total - p["payment"])
     extra = {
         "items": [{**{k: it[k] for k in ("name", "volume", "qty", "price",
                                          "box_qty")},
@@ -1860,7 +1871,8 @@ def commit_return(p):
                                             + it["qty"])
     stock_deltas = [(p["wh_id"], pid, q) for pid, q in qty_by_pid.items()]
     batch_plan = _arrival_batch_plan(p["wh_id"], p["items"])
-    summary = f"Возврат: {c['name']} — {fmt_num(total)} сом (склад {p['wh_name']})"
+    summary = (f"Возврат: {c['name']} — {fmt_num(total)} сом "
+               f"(склад {p['wh_name']})" + _debt_suffix(old_debt - total))
     extra = {
         "items": [{**{k: it[k] for k in ("name", "volume", "qty", "price",
                                          "box_qty")},
@@ -2017,7 +2029,9 @@ def payment_receipt(client_name, old_debt, amount) -> str:
 def commit_payment(p):
     c = db.client_get(p["client_id"])
     old_debt = c["debt"]
-    summary = f"Приход: {c['name']} — {fmt_num(p['amount'])} сом (склад {p['wh_name']})"
+    summary = (f"Приход: {c['name']} — {fmt_num(p['amount'])} сом "
+               f"(склад {p['wh_name']})"
+               + _debt_suffix(old_debt - p["amount"]))
     op_id, _ = db.commit_operation(
         p["user_id"], "payment", p["wh_id"], p["client_id"], summary,
         [], [(p["client_id"], -p["amount"])],

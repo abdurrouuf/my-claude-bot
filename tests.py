@@ -532,6 +532,22 @@ def test_act_statement_invoice_with_payment():
     assert pdf.getvalue().startswith(b"%PDF")
 
 
+def test_summary_debt_suffix():
+    """Сводка операции показывает долг клиента после неё (лента, /log)."""
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    (_, _, _, _, s), _ = _invoice(wh, DANIYAR, "Клиент Д",
+                                  [_item(16, 8, 1400)], payment=5000,
+                                  debt=31100)
+    assert "приход 5'000" in s and s.endswith("долг: 37'300 сом"), s
+    c = db.client_exact(wh["id"], "Клиент Д")
+    _, _, _, s2 = bot.commit_payment(
+        {"user_id": DANIYAR, "wh_id": wh["id"], "wh_name": wh["name"],
+         "client_id": c["id"], "amount": 37300})
+    assert s2.endswith("долг погашен"), s2
+    assert db.client_get(c["id"])["debt"] == 0
+
+
 def test_cash_since_zero_handover():
     """/cash показывает движения только после инкассации «под ноль»."""
     wh = _fresh_db()
