@@ -565,6 +565,28 @@ def test_certs():
     # одно слово «поставка» при единственной поставке тоже находит её
     name, _ = bot._cert_product_match("поставка")
     assert name == "Поставка F260403"
+    # файл и подпись ОТДЕЛЬНЫМИ сообщениями (случай владельца 08.08.2026)
+    import asyncio
+    from types import SimpleNamespace
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append(t)
+
+    upd = SimpleNamespace(effective_chat=SimpleNamespace(id=1, type="private"),
+                          effective_user=SimpleNamespace(id=ADMIN),
+                          message=Msg())
+    bot._remember_cert_doc(upd, "FILE9", "document", "s.pdf")
+    admin = db.get_user(ADMIN)
+    asyncio.run(bot.cert_text_reply(
+        upd, admin, "сертификат Дексатоп — поставка F250918."))
+    certs = db.certs_of("ДЕКСАТОП")
+    assert certs and certs[0]["file_id"] == "FILE9"
+    assert "ДЕКСАТОП" in replies[-1]
+    # без свежего файла — подсказка, ничего не пишется
+    asyncio.run(bot.cert_text_reply(upd, admin, "сертификат Бутатоп"))
+    assert db.certs_of("БУТАТОП") == [] and "/cert" in replies[-1]
 
 
 def test_client_word_order():
