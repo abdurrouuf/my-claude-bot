@@ -1368,7 +1368,13 @@ def recent_operations(limit: int = 10, user_id=None, op_type=None):
     if user_id is not None:
         conds.append("user_id=?")
         params.append(user_id)
-    if op_type:
+    if op_type == "payment":
+        # «Приходы» = все принятые деньги: и отдельные оплаты, и оплаты
+        # прямо при накладной (решение владельца 08.08.2026 — иначе деньги
+        # накладных приходилось искать другим фильтром).
+        conds.append("(type='payment' OR (type='invoice' AND "
+                     "COALESCE(json_extract(data, '$.payment'), 0) > 0))")
+    elif op_type:
         conds.append("type=?")
         params.append(op_type)
     q = "SELECT * FROM operations"
