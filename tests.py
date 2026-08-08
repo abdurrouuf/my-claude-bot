@@ -545,8 +545,14 @@ def test_log_filters():
                         "Инкассация: сдал", [], [], {"amount": 50})
     assert {o["type"] for o in db.recent_operations(50, DANIYAR)} == \
         {"invoice", "payment"}
+    # «приходы» = отдельные оплаты + накладные с приходом (решение
+    # владельца 08.08.2026); накладная без денег в фильтр не попадает
     pays = db.recent_operations(50, DANIYAR, "payment")
-    assert len(pays) == 1 and pays[0]["type"] == "payment"
+    assert {p["type"] for p in pays} == {"payment", "invoice"}
+    assert all(json.loads(p["data"]).get("payment") or p["type"] == "payment"
+               for p in pays)
+    _invoice(wh, DANIYAR, "Клиент Б/Д", [_item(16, 1, 180)])  # без прихода
+    assert len(db.recent_operations(50, DANIYAR, "payment")) == len(pays)
     assert db.recent_operations(50, None, "handover")[0]["user_id"] == AZAMAT
     assert db.recent_operations(50, DANIYAR, "handover") == []
     # слова-фильтры понимают единственное и множественное число
