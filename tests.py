@@ -532,6 +532,44 @@ def test_act_statement_invoice_with_payment():
     assert pdf.getvalue().startswith(b"%PDF")
 
 
+def test_pending_survives_restart():
+    """Заявка-карточка переживает перезапуск бота (зеркало в базе)."""
+    wh = _fresh_db()
+    p = {"kind": "writeoff", "user_id": ADMIN, "chat_id": 1,
+         "wh_id": wh["id"], "wh_name": wh["name"], "reason": "бой",
+         "items": [_item(16, 7, 180)]}
+    token = bot.new_pending(dict(p))
+    dict.clear(bot.PENDING)                     # «перезапуск»: память пуста
+    got = bot.get_pending(token)
+    assert got is not None and got["kind"] == "writeoff"
+    assert got["items"][0]["qty"] == 7 and got["reason"] == "бой"
+    # правка заявки между кнопками тоже переживает перезапуск
+    got["reason"] = "просрочка"
+    bot.get_pending(token)                      # обращение обновляет снимок
+    dict.clear(bot.PENDING)
+    assert bot.get_pending(token)["reason"] == "просрочка"
+    # pop гасит заявку и в памяти, и в базе
+    bot.PENDING.pop(token, None)
+    dict.clear(bot.PENDING)
+    assert bot.get_pending(token) is None
+    # протухшая заявка из базы не поднимается
+    token2 = bot.new_pending({"kind": "payment", "user_id": ADMIN,
+                              "chat_id": 1}, ttl=-1)
+    dict.clear(bot.PENDING)
+    assert bot.get_pending(token2) is None
+
+
+def test_cert_multi_query_split():
+    """/cert альтопен, дексатоп — разбор списка через запятую."""
+    _fresh_db()
+    db.cert_add("АЛЬТОПЕН", "F1")
+    db.cert_add("ДЕКСАТОП", "F2")
+    parts = [x.strip() for x in "альтопен, дексатоп, ерунда".split(",")
+             if x.strip()]
+    names = [bot._cert_product_match(x)[0] for x in parts]
+    assert names[:2] == ["АЛЬТОПЕН", "ДЕКСАТОП"] and names[2] is None
+
+
 def test_writeoff_pdf_and_summary():
     """Акт списания PDF; сводка без «(не указана)» при пустой причине."""
     wh = _fresh_db()

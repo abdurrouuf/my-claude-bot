@@ -142,7 +142,20 @@ def _request_history(chat_id) -> list:
     return out
 
 # Неподтверждённые заявки (накладные/приходы/перемещения) до нажатия кнопки.
-PENDING = {}
+class _PendingStore(dict):
+    """Заявки-карточки: память + зеркало в базе, чтобы кнопки переживали
+    перезапуск бота при деплое (просьба владельца 08.08.2026 — «Заявка
+    устарела» после наших обновлений). pop чистит и снимок в базе."""
+
+    def pop(self, token, *default):
+        try:
+            db.pending_delete(token)
+        except Exception:
+            pass
+        return super().pop(token, *default)
+
+
+PENDING = _PendingStore()
 PENDING_TTL = 15 * 60        # обычная заявка живёт 15 минут
 APPROVAL_TTL = 24 * 60 * 60  # заявка на перемещение ждёт админа сутки
 # Сотрудник может отменить/заменить свою операцию в течение часа (просьба
@@ -281,16 +294,67 @@ def new_pending(payload: dict, ttl: int = PENDING_TTL) -> str:
     payload["created"] = now
     payload["ttl"] = ttl
     PENDING[token] = payload
+    _persist_pending(token)
     return token
+
+
+def _persist_pending(token: str):
+    """Снимок заявки в базу — кнопка сработает и после перезапуска бота.
+    Несериализуемая заявка (не должно случаться) живёт только в памяти."""
+    p = PENDING.get(token)
+    if p is None:
+        return
+    try:
+        blob = json.dumps(p, ensure_ascii=False, default=str)
+    except (TypeError, ValueError):
+        return
+    left = p.get("ttl", PENDING_TTL) - (time.monotonic() - p["created"])
+    if left <= 0:
+        return
+    try:
+        db.pending_save(token, blob, time.time() + left)
+    except Exception as e:
+        log.warning("Не удалось сохранить заявку %s: %s", token, e)
+
+
+def _restore_pending(token: str):
+    """Заявка не в памяти (бот перезапускался) — поднимаем снимок из базы."""
+    try:
+        row = db.pending_load(token)
+    except Exception:
+        return None
+    if row is None:
+        return None
+    blob, expires = row
+    left = expires - time.time()
+    if left <= 0:
+        try:
+            db.pending_delete(token)
+        except Exception:
+            pass
+        return None
+    try:
+        p = json.loads(blob)
+    except (ValueError, TypeError):
+        return None
+    p["created"] = time.monotonic()
+    p["ttl"] = left
+    dict.__setitem__(PENDING, token, p)
+    return p
 
 
 def get_pending(token: str):
     p = PENDING.get(token)
     if p is None:
+        p = _restore_pending(token)
+    if p is None:
         return None
     if time.monotonic() - p["created"] > p.get("ttl", PENDING_TTL):
         PENDING.pop(token, None)
         return None
+    # Обновляем снимок: правки заявки прошлых шагов (выбор клиента, партии)
+    # не потеряются при перезапуске между нажатиями кнопок
+    _persist_pending(token)
     return p
 
 
@@ -1382,8 +1446,24 @@ async def _handle_cert_upload(update, file_id, kind, file_name, caption):
     await update.message.reply_text("\n".join(lines))
 
 
+async def _send_cert_files(update, name, certs):
+    for c in certs:
+        cap = f"📜 Сертификат: {name}"
+        if c["note"]:
+            cap += f" — {c['note']}"
+        try:
+            cap += " (добавлен " + datetime.fromisoformat(
+                c["ts"]).strftime("%d.%m.%Y") + ")"
+        except ValueError:
+            pass
+        if c["file_kind"] == "photo":
+            await update.message.reply_photo(c["file_id"], caption=cap)
+        else:
+            await update.message.reply_document(c["file_id"], caption=cap)
+
+
 async def cert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/cert Название — прислать сертификат соответствия препарата."""
+    """/cert Название[, ещё название...] — сертификаты соответствия."""
     actor = await get_actor(update)
     if actor is None:
         return
@@ -1407,6 +1487,26 @@ async def cert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         lines += ["", "Получить: /cert Название"]
         await send_long(update.message, "\n".join(lines))
         return
+    # Несколько препаратов через запятую — пачкой одной командой
+    # (просьба владельца 08.08.2026): /cert альтопен, албенивер, дексатоп
+    parts = [x.strip() for x in query.split(",") if x.strip()]
+    if len(parts) > 1:
+        missing = []
+        for part in parts:
+            name, cands = _cert_product_match(part)
+            if name is None:
+                hint = f" (уточните: {', '.join(cands)})" if cands else ""
+                missing.append(part + hint)
+                continue
+            certs = db.certs_of(name)
+            if not certs:
+                missing.append(f"{part} (сертификата пока нет)")
+                continue
+            await _send_cert_files(update, name, certs[:1])
+        if missing:
+            await update.message.reply_text(
+                "⚠️ Не отправил: " + "; ".join(missing))
+        return
     name, cands = _cert_product_match(query)
     if name is None:
         if cands:
@@ -1421,19 +1521,7 @@ async def cert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"На «{name}» сертификата в боте пока нет. Что есть: /cert")
         return
-    for c in (certs if send_all else certs[:1]):
-        cap = f"📜 Сертификат: {name}"
-        if c["note"]:
-            cap += f" — {c['note']}"
-        try:
-            cap += " (добавлен " + datetime.fromisoformat(
-                c["ts"]).strftime("%d.%m.%Y") + ")"
-        except ValueError:
-            pass
-        if c["file_kind"] == "photo":
-            await update.message.reply_photo(c["file_id"], caption=cap)
-        else:
-            await update.message.reply_document(c["file_id"], caption=cap)
+    await _send_cert_files(update, name, certs if send_all else certs[:1])
     if not send_all and len(certs) > 1:
         await update.message.reply_text(
             f"Это самый свежий из {len(certs)}. Прислать все: "
@@ -8370,6 +8458,7 @@ async def _post_init(app):
 
 if __name__ == "__main__":
     db.init(ADMIN_ID, WAREHOUSE_NAMES, STAFF)
+    db.pending_cleanup(time.time())   # протухшие заявки прошлых запусков
     if db.seed_products(prices.SEED_DATA):
         log.info("Прайс перенесён в базу (%d позиций)", len(prices.SEED_DATA))
     import buy_prices_data

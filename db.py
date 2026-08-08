@@ -140,6 +140,11 @@ CREATE TABLE IF NOT EXISTS product_batches(
     qty          INTEGER NOT NULL DEFAULT 0,
     UNIQUE(warehouse_id, product_id, expiry)
 );
+CREATE TABLE IF NOT EXISTS pending_requests(
+    token   TEXT PRIMARY KEY,   -- зеркало заявок-карточек: переживают деплой
+    payload TEXT NOT NULL,      -- JSON заявки
+    expires REAL NOT NULL       -- wall-clock, time.time()
+);
 CREATE TABLE IF NOT EXISTS product_certs(
     id           INTEGER PRIMARY KEY AUTOINCREMENT,
     product_name TEXT NOT NULL COLLATE NOCASEU,  -- препарат (без фасовки)
@@ -1056,6 +1061,35 @@ def add_client_alias(client_id: int, alias: str):
 def client_aliases_list(client_id: int) -> list:
     return [r["alias"] for r in connect().execute(
         "SELECT alias FROM client_aliases WHERE client_id=? ORDER BY alias", (client_id,))]
+
+
+# ---------- Заявки-карточки: зеркало в базе (переживают деплой) ----------
+
+def pending_save(token: str, payload_json: str, expires: float):
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO pending_requests(token, payload, expires) "
+            "VALUES(?,?,?)", (token, payload_json, expires))
+
+
+def pending_load(token: str):
+    row = connect().execute(
+        "SELECT payload, expires FROM pending_requests WHERE token=?",
+        (token,)).fetchone()
+    return (row["payload"], row["expires"]) if row else None
+
+
+def pending_delete(token: str):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("DELETE FROM pending_requests WHERE token=?", (token,))
+
+
+def pending_cleanup(now: float):
+    conn = connect()
+    with _lock, conn:
+        conn.execute("DELETE FROM pending_requests WHERE expires < ?", (now,))
 
 
 # ---------- Сертификаты соответствия ----------
