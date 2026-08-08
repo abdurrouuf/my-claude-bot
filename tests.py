@@ -532,6 +532,33 @@ def test_act_statement_invoice_with_payment():
     assert pdf.getvalue().startswith(b"%PDF")
 
 
+def test_report_calendar_day_and_tail():
+    """Сводка — календарный день; вчерашний вечер отдельным «хвостом»."""
+    from datetime import datetime, timedelta
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    (op_id, *_), _ = _invoice(wh, DANIYAR, "Клиент Хвост",
+                              [_item(16, 2, 180)], payment=360)
+    # передвинем накладную на «вчера 23:00»
+    y = (datetime.now(db.BISHKEK) - timedelta(days=1)).replace(
+        hour=23, minute=0, second=0, microsecond=0)
+    conn = db.connect()
+    conn.execute("UPDATE operations SET ts=? WHERE id=?",
+                 (y.isoformat(timespec="seconds"), op_id))
+    conn.commit()
+    midnight = datetime.now(db.BISHKEK).replace(hour=0, minute=0, second=0,
+                                                microsecond=0)
+    today = bot.report_data([wh], 0)
+    assert today[0]["empty"]          # сегодня операций нет (загрузка не в счёт)
+    tail = bot.report_data([wh], 0, start_dt=midnight - timedelta(hours=4),
+                           end_dt=midnight)
+    assert not tail[0]["empty"]
+    assert tail[0]["sales"] == 360 and tail[0]["money"] == 360
+    # правая граница строгая: операция «вчера 23:00» не попадает в «сегодня»
+    assert db.operations_since(midnight.isoformat(timespec="seconds"),
+                               None)[-1]["id"] != op_id
+
+
 def test_pending_survives_restart():
     """Заявка-карточка переживает перезапуск бота (зеркало в базе)."""
     wh = _fresh_db()
