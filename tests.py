@@ -557,6 +557,14 @@ def test_certs():
     m = bot.CERT_CAPTION_RE.match("Сертификат на Альтопен — поставка 07.2026")
     assert m and m.group(1).strip() == "Альтопен — поставка 07.2026"
     assert db.certs_delete("АЛЬТОПЕН") == 2 and db.cert_names() == []
+    # сертификат на ВСЮ поставку: подпись «сертификат поставки F260403»
+    assert bot.CERT_SUPPLY_RE.match("поставки F260403").group(1) == "F260403"
+    db.cert_add("Поставка F260403", "FILE3", "document")
+    name, _ = bot._cert_product_match("поставка f260403")
+    assert name == "Поставка F260403"
+    # одно слово «поставка» при единственной поставке тоже находит её
+    name, _ = bot._cert_product_match("поставка")
+    assert name == "Поставка F260403"
 
 
 def test_client_word_order():
