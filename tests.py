@@ -559,6 +559,29 @@ def test_report_calendar_day_and_tail():
                                None)[-1]["id"] != op_id
 
 
+def test_report_handover_line():
+    """«Сдано выручки» в отчёте дня; день с одной сдачей — не пустой."""
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    _invoice(wh, DANIYAR, "Клиент С", [_item(16, 2, 180)], payment=360)
+    db.commit_operation(DANIYAR, "handover", wh["id"], None,
+                        "Инкассация: Данияр сдал 360 сом", [], [],
+                        {"amount": 360})
+    d = bot.report_data([wh], 0)[0]
+    assert d["hand_sum"] == 360
+    assert d["hand_list"] == [("Данияр", 360)]
+    assert not d["empty"]
+    pdf, caption = bot.build_report_pdf([wh], 0, "за день")
+    assert pdf is not None and "Сдано выручки" in caption
+    # день, где была ТОЛЬКО сдача — сводка всё равно приходит
+    wh2 = db.warehouse_by_name("Манас")
+    db.commit_operation(AZAMAT, "handover", wh2["id"], None,
+                        "Инкассация: Азамат сдал 100 сом", [], [],
+                        {"amount": 100})
+    d2 = bot.report_data([wh2], 0)[0]
+    assert not d2["empty"] and d2["hand_sum"] == 100 and d2["money"] == 0
+
+
 def test_pending_survives_restart():
     """Заявка-карточка переживает перезапуск бота (зеркало в базе)."""
     wh = _fresh_db()
