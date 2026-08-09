@@ -559,6 +559,31 @@ def test_report_calendar_day_and_tail():
                                None)[-1]["id"] != op_id
 
 
+def test_cash_alert():
+    """Ежедневное напоминание админу о несданных кассах (любая сумма)."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    _invoice(wh, DANIYAR, "Клиент К", [_item(16, 1, 180)], payment=5)
+    sent = []
+
+    class B:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+    asyncio.run(bot.send_cash_alert(B()))
+    assert sent and sent[0][0] == ADMIN
+    assert "Данияр" in sent[0][1] and "5 сом" in sent[0][1]
+    assert "сдач ещё не было" in sent[0][1]
+    # сдал всё — тишина
+    db.commit_operation(DANIYAR, "handover", wh["id"], None,
+                        "Инкассация: сдал", [], [], {"amount": 5})
+    sent.clear()
+    asyncio.run(bot.send_cash_alert(B()))
+    assert sent == []
+
+
 def test_report_handover_line():
     """«Сдано выручки» в отчёте дня; день с одной сдачей — не пустой."""
     wh = _fresh_db()

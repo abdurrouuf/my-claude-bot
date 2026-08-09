@@ -6230,6 +6230,58 @@ async def drafts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text or "📝 Сегодня черновиков ещё не было.", parse_mode="HTML")
 
 
+async def send_cash_alert(bot):
+    """Ежедневно за 10 минут до вечерней сводки — админу в личку список
+    ВСЕХ несданных касс, любая сумма (решение владельца 09.08.2026:
+    «любая сумма, даже пять сом, каждый день, в 19:50»)."""
+    lines = []
+    for u in db.list_users():
+        if u["role"] == "admin":
+            continue
+        cash = db.cash_on_hand(u["id"])
+        if cash <= 0:
+            continue
+        last = db.last_handover_ts(u["id"])
+        since = "сдач ещё не было"
+        if last:
+            try:
+                days = (datetime.now(BISHKEK)
+                        - datetime.fromisoformat(last)).days
+                since = ("сдавал сегодня" if days == 0
+                         else f"последняя сдача {days} дн. назад")
+            except ValueError:
+                since = ""
+        lines.append(f"👤 {esc(u['name'])}: <b>{money(cash)}</b>"
+                     + (f" — {since}" if since else ""))
+    if not lines:
+        return  # все кассы по нулям — не шумим
+    text = ("💰 <b>Наличные на руках у сотрудников</b>\n"
+            + "\n".join(lines)
+            + "\n\nСдача выручки: сотрудник пишет «сдал сумма», "
+              "вы подтверждаете кнопкой. Детали: /cash")
+    try:
+        await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не удалось отправить напоминание о кассах: %s", e)
+
+
+async def cash_alert_loop(app):
+    while True:
+        now = datetime.now(BISHKEK)
+        target = (now.replace(hour=SUMMARY_HOUR, minute=0, second=0,
+                              microsecond=0) - timedelta(minutes=10))
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            if not db.claim_daily_job(
+                    f"cash_alert:{datetime.now(BISHKEK).date().isoformat()}"):
+                continue
+            await send_cash_alert(app.bot)
+        except Exception:
+            log.exception("Ошибка напоминания о кассах")
+
+
 async def evening_summary_loop(app):
     while True:
         now = datetime.now(BISHKEK)
@@ -8524,6 +8576,7 @@ async def _post_init(app):
         except Exception:
             log.exception("Не удалось отправить предупреждение о кэше промпта")
     app.create_task(evening_summary_loop(app))
+    app.create_task(cash_alert_loop(app))
     app.create_task(weekly_debt_loop(app))
     app.create_task(daily_backup_loop(app))
     app.create_task(monthly_deadstock_loop(app))
