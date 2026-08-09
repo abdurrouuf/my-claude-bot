@@ -1175,6 +1175,14 @@ def cash_movements(user_id: int, limit: int = 10):
     return out
 
 
+def last_handover_ts(user_id: int):
+    """Когда сотрудник в последний раз сдавал выручку (ISO или None)."""
+    row = connect().execute(
+        "SELECT ts FROM operations WHERE user_id=? AND type='handover' "
+        "AND status='done' ORDER BY id DESC LIMIT 1", (user_id,)).fetchone()
+    return row["ts"] if row else None
+
+
 def cash_movements_since_zero(user_id: int, cap: int = 100):
     """Движения кассы ПОСЛЕ последней инкассации, обнулившей кассу
     (просьба владельца 07.08.2026: старые движения после сдачи «под ноль»
