@@ -821,9 +821,16 @@ def warehouse_by_name(name: str):
     key = re.sub(r"[\s\-–—]+", "", name).lower()
     if not key:
         return None
-    for w in all_warehouses():
-        if re.sub(r"[\s\-–—]+", "", w["name"]).lower() == key:
-            return w
+    whs = all_warehouses()
+    norm = {re.sub(r"[\s\-–—]+", "", w["name"]).lower(): w for w in whs}
+    if key in norm:
+        return norm[key]
+    # Опечатка («Манач» → Манас, «Каракл» → Каракол): единственный близкий
+    # кандидат принимается (просьба владельца 09.08.2026). Двусмысленность
+    # или совсем непохожее — None, как раньше.
+    close = difflib.get_close_matches(key, list(norm), n=2, cutoff=0.75)
+    if len(close) == 1:
+        return norm[close[0]]
     return None
 
 

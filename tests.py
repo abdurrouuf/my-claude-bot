@@ -559,6 +559,20 @@ def test_report_calendar_day_and_tail():
                                None)[-1]["id"] != op_id
 
 
+def test_warehouse_name_typos():
+    """«Манач» → Манас: опечатки в имени склада прощаются (отчёты)."""
+    _fresh_db()
+    assert db.warehouse_by_name("Манач")["name"] == "Манас"
+    assert db.warehouse_by_name("манас")["name"] == "Манас"
+    assert db.warehouse_by_name("Каракл")["name"] == "Каракол"
+    assert db.warehouse_by_name("карабалта")["name"] == "Кара-Балта"
+    assert db.warehouse_by_name("Кара балта")["name"] == "Кара-Балта"
+    assert db.warehouse_by_name("Бишкек")["name"] == "Бишкек"
+    # совсем непохожее — по-прежнему не находится
+    assert db.warehouse_by_name("Ош") is None
+    assert db.warehouse_by_name("юг") is None
+
+
 def test_cash_alert():
     """Ежедневное напоминание админу о несданных кассах (любая сумма)."""
     import asyncio
