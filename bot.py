@@ -1446,11 +1446,22 @@ async def _handle_cert_upload(update, file_id, kind, file_name, caption):
     await update.message.reply_text("\n".join(lines))
 
 
+# Контракты СТАРЫХ поставок: их сертификаты догружены позже свежих и не
+# должны становиться дефолтом /cert (видны через «/cert Название все»).
+# Новую старую поставку достаточно вписать сюда либо добавить слово
+# «старая» в примечание подписи.
+CERT_OLD_SUPPLIES = ("F241009",)
+
+
 def _cert_default(certs):
     """Какой сертификат слать по умолчанию: самый свежий ЗАГРУЖЕННЫЙ,
-    но с пометкой «старая» в примечании — только по запросу «все»
-    (старые поставки догружаются позже новых, 09.08.2026)."""
-    fresh = [c for c in certs if "стар" not in (c["note"] or "").lower()]
+    кроме помеченных старыми (словом «старая» или контрактом из
+    CERT_OLD_SUPPLIES) — те только по запросу «все»."""
+    def is_old(c):
+        note = c["note"] or ""
+        return ("стар" in note.lower()
+                or any(s in note for s in CERT_OLD_SUPPLIES))
+    fresh = [c for c in certs if not is_old(c)]
     return (fresh or certs)[:1]
 
 
