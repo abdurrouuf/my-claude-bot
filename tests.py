@@ -664,7 +664,13 @@ def test_certs():
     # разбор подписи: «сертификат на Альтопен — поставка 07.2026»
     m = bot.CERT_CAPTION_RE.match("Сертификат на Альтопен — поставка 07.2026")
     assert m and m.group(1).strip() == "Альтопен — поставка 07.2026"
-    assert db.certs_delete("АЛЬТОПЕН") == 2 and db.cert_names() == []
+    # старая поставка, загруженная ПОЗЖЕ новой, не перекрывает дефолт
+    db.cert_add("АЛЬТОПЕН", "FILE_OLD", "document",
+                note="старая поставка F241009 (22.05.2025)")
+    certs = db.certs_of("АЛЬТОПЕН")
+    assert certs[0]["file_id"] == "FILE_OLD"          # свежая по загрузке
+    assert bot._cert_default(certs)[0]["file_id"] == "FILE2"  # дефолт — новая
+    assert db.certs_delete("АЛЬТОПЕН") == 3 and db.cert_names() == []
     # сертификат на ВСЮ поставку: подпись «сертификат поставки F260403»
     assert bot.CERT_SUPPLY_RE.match("поставки F260403").group(1) == "F260403"
     db.cert_add("Поставка F260403", "FILE3", "document")
