@@ -1446,6 +1446,14 @@ async def _handle_cert_upload(update, file_id, kind, file_name, caption):
     await update.message.reply_text("\n".join(lines))
 
 
+def _cert_default(certs):
+    """Какой сертификат слать по умолчанию: самый свежий ЗАГРУЖЕННЫЙ,
+    но с пометкой «старая» в примечании — только по запросу «все»
+    (старые поставки догружаются позже новых, 09.08.2026)."""
+    fresh = [c for c in certs if "стар" not in (c["note"] or "").lower()]
+    return (fresh or certs)[:1]
+
+
 async def _send_cert_files(update, name, certs):
     for c in certs:
         cap = f"📜 Сертификат: {name}"
@@ -1502,7 +1510,7 @@ async def cert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not certs:
                 missing.append(f"{part} (сертификата пока нет)")
                 continue
-            await _send_cert_files(update, name, certs[:1])
+            await _send_cert_files(update, name, _cert_default(certs))
         if missing:
             await update.message.reply_text(
                 "⚠️ Не отправил: " + "; ".join(missing))
@@ -1521,7 +1529,8 @@ async def cert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"На «{name}» сертификата в боте пока нет. Что есть: /cert")
         return
-    await _send_cert_files(update, name, certs if send_all else certs[:1])
+    await _send_cert_files(update, name,
+                           certs if send_all else _cert_default(certs))
     if not send_all and len(certs) > 1:
         await update.message.reply_text(
             f"Это самый свежий из {len(certs)}. Прислать все: "
