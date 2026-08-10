@@ -66,6 +66,9 @@ DRAFT_SUMMARY_HOUR = int(os.environ.get("DRAFT_SUMMARY_HOUR", "19"))
 # Долг считается «старым», если клиент не платил столько дней
 DEBT_ALERT_DAYS = int(os.environ.get("DEBT_ALERT_DAYS", "30"))
 
+# Окно раздела «Растущие долги» в отчёте о должниках, дней
+DEBT_GROWTH_DAYS = int(os.environ.get("DEBT_GROWTH_DAYS", "30"))
+
 # Час ежедневного бэкапа базы админу в личку (по Бишкеку)
 BACKUP_HOUR = int(os.environ.get("BACKUP_HOUR", "3"))
 
@@ -6761,10 +6764,40 @@ def overdue_rows(warehouses, min_days: int):
     return out
 
 
+def growing_debt_rows(warehouses, days: int):
+    """Список риска: клиенты, чей долг за последние days дней ВЫРОС — набрали
+    товара в долг больше, чем погасили (берут новое, не гася старое).
+    Считается по дельтам журнала операций; стартовые загрузки справочника
+    ростом не считаются (мимо журнала). Учебные склады пропускаются.
+    Возвращает [(wh, [(рост, клиент, набрал, погасил), ...])]."""
+    since = (datetime.now(BISHKEK)
+             - timedelta(days=days)).isoformat(timespec="seconds")
+    growth = db.debt_growth(since)
+    out = []
+    for wh in warehouses:
+        if is_training_wh(wh):
+            continue
+        rows = []
+        for c in db.clients_of(wh["id"]):
+            took, paid = growth.get(c["id"], (0.0, 0.0))
+            delta = took - paid
+            # Рост меньше сома — шум округления, клиент без долга — не риск
+            if delta < 1 or c["debt"] <= 0:
+                continue
+            rows.append((delta, c, took, paid))
+        if rows:
+            rows.sort(key=lambda r: -r[0])
+            out.append((wh, rows))
+    return out
+
+
 def overdue_report(warehouses, min_days: int):
-    """PDF «Давно не платили»: (pdf, found, total) или None, если должников нет."""
+    """PDF «Давно не платили» + раздел риска «Растущие долги».
+    Возвращает (pdf, found, total, grew_n, grew_total) или None, если ни
+    зависших, ни растущих долгов нет."""
     data = overdue_rows(warehouses, min_days)
-    if not data:
+    grow = growing_debt_rows(warehouses, DEBT_GROWTH_DAYS)
+    if not data and not grow:
         return None
     sections, found, total = [], 0, 0.0
     for wh, rows in data:
@@ -6782,11 +6815,33 @@ def overdue_report(warehouses, min_days: int):
                          "rows": sec_rows, "widths": [70, 38, 34, 25],
                          "numbered": True,
                          "footer": f"Итого: {money(sec_total)}"})
+    grew_n, grew_total = 0, 0.0
+    for wh, rows in grow:
+        sec_rows, sec_total = [], 0.0
+        for delta, c, took, paid in rows:
+            sec_rows.append([c["name"], money(c["debt"]), fmt_num(took),
+                             fmt_num(paid), f"+{fmt_num(delta)}"])
+            sec_total += delta
+        grew_n += len(sec_rows)
+        grew_total += sec_total
+        sections.append({"title": f"РАСТУЩИЕ ДОЛГИ за {DEBT_GROWTH_DAYS} дн. — "
+                                  f"склад «{wh['name']}»",
+                         "headers": ["Клиент", "Долг сейчас", "Набрал",
+                                     "Погасил", "Рост"],
+                         "rows": sec_rows, "widths": [51, 32, 28, 28, 28],
+                         "numbered": True,
+                         "footer": f"Итого рост: +{money(sec_total)}"})
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    if data:
+        title = "ДАВНО НЕ ПЛАТИЛИ"
+        sub = f"ОсОО «ВЕТОП» · {min_days}+ дней без оплат · на {date_str}"
+    else:  # только растущие долги — заголовок «давно не платили» сбивал бы
+        title = "РАСТУЩИЕ ДОЛГИ"
+        sub = f"ОсОО «ВЕТОП» · рост за {DEBT_GROWTH_DAYS} дн. · на {date_str}"
     pdf = generate_report_pdf(
-        "ДАВНО НЕ ПЛАТИЛИ", f"ОсОО «ВЕТОП» · {min_days}+ дней без оплат · на {date_str}",
-        sections, footer=f"ИТОГО ЗАВИСШИХ ДОЛГОВ: {money(total)}" if len(sections) > 1 else "")
-    return pdf, found, total
+        title, sub, sections,
+        footer=f"ИТОГО ЗАВИСШИХ ДОЛГОВ: {money(total)}" if len(data) > 1 else "")
+    return pdf, found, total, grew_n, grew_total
 
 
 def overdue_filename() -> str:
@@ -6812,13 +6867,24 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     report = overdue_report(db.visible_warehouses(actor), min_days)
     if report is None:
         await update.message.reply_text(
-            f"✅ Нет клиентов без оплат дольше {min_days} дней.")
+            f"✅ Нет клиентов без оплат дольше {min_days} дней, "
+            f"растущих долгов тоже нет.")
         return
-    pdf, found, total = report
+    pdf, found, total, grew_n, grew_total = report
     await update.message.reply_document(
         document=InputFile(pdf, filename=overdue_filename()),
-        caption=f"⏰ Не платили {min_days}+ дней: {found} клиентов, "
-                f"зависло {money(total)}")
+        caption=_overdue_caption(min_days, found, total, grew_n, grew_total))
+
+
+def _overdue_caption(min_days, found, total, grew_n, grew_total) -> str:
+    parts = []
+    if found:
+        parts.append(f"⏰ Не платили {min_days}+ дней: {found} клиентов, "
+                     f"зависло {money(total)}")
+    if grew_n:
+        parts.append(f"📈 Растущие долги: {grew_n} клиентов, "
+                     f"+{money(grew_total)} за {DEBT_GROWTH_DAYS} дн.")
+    return "\n".join(parts)
 
 
 async def send_debt_alerts(bot):
@@ -6826,12 +6892,12 @@ async def send_debt_alerts(bot):
     админу — все склады, сотруднику — свои."""
     report = overdue_report(db.all_warehouses(), DEBT_ALERT_DAYS)
     if report:
-        pdf, found, total = report
+        pdf, found, total, grew_n, grew_total = report
         try:
             await bot.send_document(
                 ADMIN_ID, document=InputFile(pdf, filename=overdue_filename()),
-                caption=f"⏰ Не платили {DEBT_ALERT_DAYS}+ дней: {found} клиентов, "
-                        f"зависло {money(total)}")
+                caption=_overdue_caption(DEBT_ALERT_DAYS, found, total,
+                                         grew_n, grew_total))
         except Exception as e:
             log.warning("Не удалось отправить напоминание админу: %s", e)
     for u in db.list_users():
@@ -6840,13 +6906,13 @@ async def send_debt_alerts(bot):
         report = overdue_report(db.visible_warehouses(u), DEBT_ALERT_DAYS)
         if not report:
             continue
-        pdf, found, total = report
+        pdf, found, total, grew_n, grew_total = report
         try:
             await bot.send_document(
                 u["id"], document=InputFile(pdf, filename=overdue_filename()),
-                caption=f"⏰ Не платили {DEBT_ALERT_DAYS}+ дней: {found} клиентов, "
-                        f"зависло {money(total)}\n"
-                        f"Пора напомнить клиентам об оплате 📞")
+                caption=_overdue_caption(DEBT_ALERT_DAYS, found, total,
+                                         grew_n, grew_total)
+                        + "\nПора напомнить клиентам об оплате 📞")
         except Exception as e:
             log.warning("Не удалось отправить напоминание %s: %s", u["name"], e)
 
