@@ -824,6 +824,46 @@ def test_summary_debt_suffix():
     assert db.client_get(c["id"])["debt"] == 0
 
 
+def test_growing_debts():
+    """Раздел риска «Растущие долги»: в списке — у кого долг за окно вырос;
+    погасивший больше, чем набрал, и стартовые долги справочника — не рост;
+    отмена операции убирает рост (журнальная модель)."""
+    wh = _fresh_db()
+    _load(wh, {16: 100})
+    # Накладная 2000 с оплатой 500 на месте: дельта журнала чистая (+1500),
+    # отдельная оплата 400 — «погасил»; итоговый рост 1100
+    (op_id, *_), _ = _invoice(wh, DANIYAR, "Растёт", [_item(16, 10, 200)],
+                              payment=500)
+    r = db.client_exact(wh["id"], "Растёт")
+    bot.commit_payment({"user_id": DANIYAR, "wh_id": wh["id"],
+                        "wh_name": wh["name"], "client_id": r["id"],
+                        "amount": 400})
+    # Старый долг из справочника + оплата 1000 — рост отрицательный
+    db.clients_add_bulk(wh["id"], [("Старый", 5000)])
+    s = db.client_exact(wh["id"], "Старый")
+    bot.commit_payment({"user_id": DANIYAR, "wh_id": wh["id"],
+                        "wh_name": wh["name"], "client_id": s["id"],
+                        "amount": 1000})
+    rows = {c["name"]: (delta, took, paid)
+            for _, rs in bot.growing_debt_rows(db.all_warehouses(),
+                                               bot.DEBT_GROWTH_DAYS)
+            for delta, c, took, paid in rs}
+    assert rows.get("Растёт") == (1100, 1500, 400), rows
+    assert "Старый" not in rows
+    # Зависших долгов нет (все операции свежие), но отчёт всё равно есть —
+    # из-за растущих; found=0, grew_n=1
+    report = bot.overdue_report(db.all_warehouses(), bot.DEBT_ALERT_DAYS)
+    assert report is not None
+    pdf, found, total, grew_n, grew_total = report
+    assert found == 0 and grew_n == 1 and grew_total == 1100
+    assert pdf.getvalue()[:4] == b"%PDF"
+    db.cancel_operation(op_id)
+    rows = {c["name"] for _, rs in
+            bot.growing_debt_rows(db.all_warehouses(), bot.DEBT_GROWTH_DAYS)
+            for _, c, *_ in rs}
+    assert "Растёт" not in rows
+
+
 def test_cash_since_zero_handover():
     """/cash показывает движения только после инкассации «под ноль»."""
     wh = _fresh_db()

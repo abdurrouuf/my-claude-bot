@@ -1238,6 +1238,35 @@ def debtors_with_age(wh_id: int):
     return result
 
 
+def debt_growth(since_iso: str) -> dict:
+    """Движение долга клиентов с момента since_iso — по дельтам журнала.
+
+    Возвращает {client_id: (набрал, погасил)}: «набрал» — сумма положительных
+    дельт долга (товар в долг, включая стартовый долг накладной нового
+    клиента), «погасил» — сумма отрицательных (оплаты, возвраты).
+    Отменённые операции не считаются. Стартовые долги справочника
+    (clients_add_bulk) в журнал не пишутся и ростом не считаются.
+    """
+    out = {}
+    for r in connect().execute(
+            "SELECT data FROM operations WHERE status='done' AND ts >= ?",
+            (since_iso,)):
+        try:
+            deltas = json.loads(r["data"]).get("debt_deltas") or []
+        except (ValueError, TypeError):
+            continue
+        for cid, d in deltas:
+            if cid is None:
+                continue
+            took, paid = out.get(cid, (0.0, 0.0))
+            if d > 0:
+                took += d
+            else:
+                paid += -d
+            out[cid] = (took, paid)
+    return out
+
+
 def set_client_price(cid: int, product_id: int, price: float):
     """Спеццена клиента; 0 или меньше — убрать."""
     conn = connect()
