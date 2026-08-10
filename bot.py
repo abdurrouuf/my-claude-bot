@@ -3557,6 +3557,13 @@ def _expiry_questions(p):
         return need
     src_wh = _batch_src_wh(p)
     if not src_wh:
+        # ПРИХОД товара извне (перемещение без склада-источника): срок
+        # обязателен для каждой позиции — партия ляжет на склад с этим
+        # сроком (решение владельца 09.08.2026: «без сроков годности
+        # ни перемещения, ни пополнения»).
+        for i, it in enumerate(p["items"]):
+            if it.get("product_id") and not it.get("expiry"):
+                need.append((i, it))
         return need
     choices = p.get("batch_choices") or {}
     for i, it in enumerate(p["items"]):
@@ -3601,9 +3608,15 @@ async def _ask_expiry(q, context, p, question, chat_id, user_id):
     src_name = p.get("from_wh_name") or p.get("wh_name")
     what = {"transfer": "перемещение", "writeoff": "списание",
             "return": "возврат"}.get(p["kind"], "операцию")
+    arrival = p["kind"] == "transfer" and _batch_src_wh(p) is None
+    if arrival:
+        what = "приход"
     if p["kind"] == "return":
         why = ("Возврат кладёт товар на склад — посмотрите срок годности "
                "на упаковке возвращаемого товара.")
+    elif arrival:
+        why = ("Приход товара на склад: партия запишется со сроком "
+               "с упаковки.")
     else:
         src_wh = _batch_src_wh(p)
         dated = sum(b["qty"] for b in _dated_batches(src_wh, it.get("product_id") or 0))

@@ -559,6 +559,22 @@ def test_report_calendar_day_and_tail():
                                None)[-1]["id"] != op_id
 
 
+def test_arrival_requires_expiry():
+    """Приход товара извне без срока годности не проводится — бот
+    спрашивает срок по каждой позиции (решение владельца 09.08.2026)."""
+    wh = _fresh_db()
+    a = {"kind": "transfer", "user_id": ADMIN, "wh_id": wh["id"],
+         "wh_name": wh["name"], "from_wh_id": None,
+         "items": [_item(16, 10, 180), _item(28, 5, 440)], "warnings": []}
+    assert [i for i, _ in bot._expiry_questions(a)] == [0, 1]
+    a["items"][0]["expiry"] = "11.2028"
+    assert [i for i, _ in bot._expiry_questions(a)] == [1]
+    a["items"][1]["expiry"] = "12.2027"
+    assert bot._expiry_questions(a) == []
+    # у перемещения со склада поведение прежнее: датированных хватает —
+    # вопросов нет (см. test_return_requires_expiry)
+
+
 def test_warehouse_name_typos():
     """«Манач» → Манас: опечатки в имени склада прощаются (отчёты)."""
     _fresh_db()
