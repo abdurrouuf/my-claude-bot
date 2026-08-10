@@ -4186,6 +4186,35 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             p.get("with_prices", False))
         return
 
+    if kind == "pdbt":  # выбран склад для отчёта о долгах
+        PENDING.pop(token, None)
+        await q.answer()
+        owner_row = db.get_user(p["user_id"])
+        if owner_row is None:
+            return
+        if len(parts) > 2 and parts[2] == "all":
+            whs = db.visible_warehouses(owner_row)
+            label = "все склады"
+        else:
+            try:
+                wh = db.warehouse_by_id(int(parts[2]))
+            except (ValueError, IndexError):
+                wh = None
+            if wh is None or not db.can_view_warehouse(owner_row, wh["id"]):
+                await q.edit_message_text("Склад не найден или нет доступа.")
+                return
+            whs = [wh]
+            label = f"«{wh['name']}»"
+        try:
+            await q.edit_message_text(f"💰 Долги: {esc(label)}", parse_mode="HTML")
+        except Exception:
+            pass
+        shim = SimpleNamespace(message=q.message,
+                               effective_chat=q.message.chat,
+                               effective_user=q.from_user)
+        await _debts_report(shim, whs)
+        return
+
     if kind == "pc":  # выбор кассы: сотрудник или все сразу (ответ — PDF)
         PENDING.pop(token, None)
         await q.answer()
@@ -5730,6 +5759,26 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
+        if not arg and len(whs) > 1:
+            # Несколько складов — сначала спрашиваем кнопками (просьба
+            # владельца 10.08.2026: «не отправляй сразу все долги»).
+            # «Все сразу» — кнопкой или /debts all.
+            payload = {"kind": "pick_debts", "user_id": actor["id"],
+                       "chat_id": update.effective_chat.id}
+            token = new_pending(payload)
+            kb = [[InlineKeyboardButton(f"💰 {w['name']}",
+                                        callback_data=f"pdbt:{token}:{w['id']}")]
+                  for w in whs]
+            kb.append([InlineKeyboardButton("🗂 Все склады сразу",
+                                            callback_data=f"pdbt:{token}:all")])
+            kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+            await update.message.reply_text("Долги какого склада показать?",
+                                            reply_markup=InlineKeyboardMarkup(kb))
+            return
+    await _debts_report(update, whs)
+
+
+async def _debts_report(update, whs):
     sections, summary = [], []
     grand_total = 0
     for wh in whs:
