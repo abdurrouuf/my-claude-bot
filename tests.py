@@ -864,6 +864,44 @@ def test_growing_debts():
     assert "Растёт" not in rows
 
 
+def test_sales_history():
+    """/sales: разбор «препарат [фасовка] [клиент]», история по журналу,
+    возвраты и черновики видны, чужой товар не попадает."""
+    wh = _fresh_db()
+    _load(wh, {16: 100, 17: 100})
+    pr16, pr17 = prices.BY_ID[16], prices.BY_ID[17]
+    base16 = pr16["name"].split("(")[0].strip()
+    # Разбор: точное имя без фасовки — обе фасовки товара с этим именем
+    label, pids, cli, _ = bot._parse_sales_query(base16.lower())
+    assert 16 in pids and cli is None
+    # С фасовкой и клиентом
+    label, pids, cli, _ = bot._parse_sales_query(
+        f"{base16} {pr16['volume']} Мустанг".lower())
+    assert pids == [16] and cli == "мустанг", (label, pids, cli)
+    # Продажи: два клиента, товар 17 — шум, который не должен попасть
+    _invoice(wh, DANIYAR, "Мустанг", [_item(16, 10, 200), _item(17, 3, 500)])
+    _invoice(wh, DANIYAR, "Болот", [_item(16, 5, 210)])
+    c = db.client_exact(wh["id"], "Мустанг")
+    db.commit_operation(DANIYAR, "return", wh["id"], c["id"], "возврат",
+                        [(wh["id"], 16, 2)], [(c["id"], -400)],
+                        {"items": [{"name": pr16["name"],
+                                    "volume": pr16["volume"], "qty": 2,
+                                    "price": 200, "product_id": 16}]})
+    db.log_draft(DANIYAR, "Мустанг", 600,
+                 [{"name": pr16["name"], "volume": pr16["volume"],
+                   "qty": 3, "sum": 600}])
+    rows = db.product_sales([16], {wh["id"]})
+    assert len(rows) == 3          # две накладные + возврат, без товара 17
+    pdf, cap = bot.sales_history_report(
+        [wh], base16, [16], {c["id"]}, "Мустанг")
+    assert "продано 10 шт" in cap and "2'000" in cap, cap
+    assert "Возвраты: 2 шт" in cap and "Черновики" in cap, cap
+    assert pdf.getvalue()[:4] == b"%PDF"
+    # Без фильтра клиента — обе накладные
+    _, cap_all = bot.sales_history_report([wh], base16, [16])
+    assert "продано 15 шт" in cap_all, cap_all
+
+
 def test_cash_since_zero_handover():
     """/cash показывает движения только после инкассации «под ноль»."""
     wh = _fresh_db()
