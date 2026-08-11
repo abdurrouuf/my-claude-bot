@@ -5432,6 +5432,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/olddebts — кто давно не платил (можно: /olddebts 45)",
         "/deadstock — залежавшийся товар · /forecast — что скоро закончится",
         "/client Имя — карточка клиента (долг, история)",
+        "/sales Препарат — история продаж препарата (можно: /sales Дексатоп 50мл Мустанг)",
         "/act Имя — акт сверки в PDF",
         "/price — прайс-лист",
         "/pricepdf — красивый PDF-прайс для отправки клиентам",
@@ -6874,6 +6875,245 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=InputFile(pdf, filename=overdue_filename()),
         caption=_overdue_caption(min_days, found, total, grew_n, grew_total))
+
+
+# ---------- /sales — история продаж препарата (как поиск в 1С) ----------
+
+def _pnorm(s: str) -> str:
+    """Нормализация названий для сравнения: нижний регистр, без пробелов,
+    дефисов и точек («50 мл» == «50мл»), ё=е."""
+    return re.sub(r"[\s\-–—.]+", "", str(s).lower()).replace("ё", "е")
+
+
+def _base_name(pr) -> str:
+    """Название препарата без расшифровки в скобках."""
+    return pr["name"].split("(")[0].strip()
+
+
+def _sales_pids(q: str):
+    """Точное совпадение запроса с препаратом прайса: «дексатоп» → все
+    фасовки, «дексатоп 50мл» → одна. Возвращает (подпись, [pids]) или None."""
+    qn = _pnorm(q)
+    if not qn:
+        return None
+    sku = [pr for pr in prices.PRICE_LIST_DATA
+           if _pnorm(_base_name(pr) + pr["volume"]) == qn]
+    if sku:
+        return f"{_base_name(sku[0])} {sku[0]['volume']}", [p["id"] for p in sku]
+    same = [pr for pr in prices.PRICE_LIST_DATA if _pnorm(_base_name(pr)) == qn]
+    if same:
+        return _base_name(same[0]), [p["id"] for p in same]
+    return None
+
+
+def _parse_sales_query(text: str):
+    """«дексатоп 50мл мустанг» → (подпись, pids, клиент|None, []).
+
+    Длиннейший префикс слов — препарат (можно с фасовкой), остаток — клиент;
+    клиента можно отделить и запятой. Точного совпадения нет — пробуем с
+    опечатками. Совсем не поняли — (None, None, None, кандидаты-подсказки)."""
+    if "," in text:
+        prod_part, cli_part = [x.strip() for x in text.split(",", 1)]
+    else:
+        prod_part, cli_part = text.strip(), ""
+    words = prod_part.split()
+    for cut in range(len(words), 0, -1):
+        got = _sales_pids(" ".join(words[:cut]))
+        if not got:
+            continue
+        label, pids = got
+        rest = words[cut:]
+        # Хвост может уточнять фасовку: «дексатоп 50» и «дексатоп 50 мл»
+        if rest and len(pids) > 1:
+            for vcut in (min(2, len(rest)), 1):
+                vq = _pnorm(" ".join(rest[:vcut]))
+                sub = [pid for pid in pids
+                       if vq and vq in _pnorm(prices.BY_ID[pid]["volume"])]
+                if sub and len(sub) < len(pids):
+                    pids, rest = sub, rest[vcut:]
+                    if len(sub) == 1:
+                        label += f" {prices.BY_ID[sub[0]]['volume']}"
+                    break
+        cli = f"{' '.join(rest)} {cli_part}".strip()
+        return label, pids, cli or None, []
+    # Опечатки: тот же перебор префиксов, но через difflib (как у /cert)
+    cands = []
+    for cut in range(len(words), 0, -1):
+        name, cands = _cert_product_match(" ".join(words[:cut]))
+        if not name:
+            continue
+        pids = [pr["id"] for pr in prices.PRICE_LIST_DATA
+                if _base_name(pr) == name]
+        if not pids:  # имя есть только у сертификатов — не товар прайса
+            continue
+        cli = f"{' '.join(words[cut:])} {cli_part}".strip()
+        return name, pids, cli or None, []
+    return None, None, None, cands
+
+
+def sales_history_report(whs, label, pids, cli_ids=None, cli_label=None):
+    """PDF истории продаж препарата по журналу: секция на фасовку, новые
+    сверху; черновики (не учёт) — отдельной секцией. None — данных нет.
+    Возвращает (pdf, подпись-итог)."""
+    wh_names = {w["id"]: w["name"] for w in whs}
+    per_pid = {}
+    sold_qty = sold_sum = ret_qty = ret_sum = 0.0
+    ops, newest, oldest = set(), None, None
+    for op, it in db.product_sales(pids, set(wh_names), cli_ids):
+        qty, price = float(it.get("qty") or 0), float(it.get("price") or 0)
+        try:
+            dstr = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y")
+        except ValueError:
+            dstr = op["ts"][:10]
+        if newest is None:
+            newest = dstr
+        oldest = dstr
+        ret = op["type"] == "return"
+        if ret:
+            ret_qty += qty
+            ret_sum += qty * price
+        else:
+            sold_qty += qty
+            sold_sum += qty * price
+        ops.add(op["id"])
+        cli = op["client_name"] or "—"
+        if len(whs) > 1:
+            cli += f" ({wh_names.get(op['warehouse_id'], '?')})"
+        sign = "-" if ret else ""
+        per_pid.setdefault(it.get("product_id"), []).append(
+            [dstr, cli, sign + fmt_num(qty),
+             fmt_num(price), sign + fmt_num(qty * price),
+             f"№{op['id']}" + (" возврат" if ret else "")])
+    sections = []
+    for pid in pids:
+        rows = per_pid.get(pid)
+        if not rows:
+            continue
+        pr = prices.BY_ID.get(pid)
+        title = f"{_base_name(pr)} {pr['volume']}" if pr else f"Товар №{pid}"
+        note = ""
+        if len(rows) > 80:
+            note = f" (показаны последние 80 из {len(rows)})"
+            rows = rows[:80]
+        sections.append({"title": title + note,
+                         "headers": ["Дата", "Клиент", "Кол-во", "Цена",
+                                     "Сумма", "№ оп."],
+                         "rows": rows, "widths": [24, 55, 20, 22, 26, 20]})
+    # Черновики переходного периода — отдельно, в учёт не входят
+    want = [(_pnorm(pr["name"]), _pnorm(_base_name(pr)), _pnorm(pr["volume"]))
+            for pr in (prices.BY_ID[pid] for pid in pids if pid in prices.BY_ID)]
+    draft_rows, draft_qty, draft_sum = [], 0.0, 0.0
+    for r in db.draft_items_all():
+        if cli_label:
+            a, b = _pnorm(r["client"]), _pnorm(cli_label)
+            if a != b and b not in a and a not in b:
+                continue
+        try:
+            its = json.loads(r["items"])
+        except (ValueError, TypeError):
+            continue
+        for it in its:
+            n, v = _pnorm(it.get("name") or ""), _pnorm(it.get("volume") or "")
+            if not any(v == vn and n in (nn, bn) for nn, bn, vn in want):
+                continue
+            qty, s = float(it.get("qty") or 0), float(it.get("sum") or 0)
+            try:
+                dstr = datetime.fromisoformat(r["ts"]).strftime("%d.%m.%Y")
+            except ValueError:
+                dstr = r["ts"][:10]
+            draft_qty += qty
+            draft_sum += s
+            if len(draft_rows) < 60:
+                draft_rows.append([dstr, r["client"], fmt_num(qty),
+                                   fmt_num(s / qty if qty else 0), fmt_num(s)])
+    if draft_rows:
+        sections.append({"title": "ЧЕРНОВИКИ (не учёт)",
+                         "headers": ["Дата", "Клиент", "Кол-во", "Цена", "Сумма"],
+                         "rows": draft_rows, "widths": [26, 61, 22, 26, 32]})
+    if not sections:
+        return None
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    sub = f"ОсОО «ВЕТОП» · {label}"
+    if cli_label:
+        sub += f" · клиент: {cli_label}"
+    pdf = generate_report_pdf(
+        "ИСТОРИЯ ПРОДАЖ", sub + f" · на {date_str}", sections,
+        footer=f"ПРОДАНО: {fmt_num(sold_qty)} шт на {money(sold_sum)}"
+               + (f" · возвраты: {fmt_num(ret_qty)} шт" if ret_qty else ""))
+    cap = f"🔎 {label}"
+    if cli_label:
+        cap += f" → {cli_label}"
+    if ops:
+        cap += (f": продано {fmt_num(sold_qty)} шт на {money(sold_sum)} "
+                f"({len(ops)} опер., {oldest} — {newest})")
+    else:
+        cap += ": реальных продаж нет"
+    if ret_qty:
+        cap += f"\n↩️ Возвраты: {fmt_num(ret_qty)} шт на {money(ret_sum)}"
+    if draft_rows:
+        cap += f"\n📝 Черновики (не учёт): {fmt_num(draft_qty)} шт на {money(draft_sum)}"
+    return pdf, cap
+
+
+async def sales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    # Продажи и клиенты по всем складам сотрудника — только личка
+    if not await _require_private(update):
+        return
+    query = " ".join(context.args) if context.args else ""
+    if not query:
+        await update.message.reply_text(
+            "🔎 История продаж препарата (все накладные по нему).\n\n"
+            "Примеры:\n"
+            "/sales Дексатоп — все фасовки\n"
+            "/sales Дексатоп 50мл — одна фасовка\n"
+            "/sales Дексатоп 50мл Мустанг — только этому клиенту")
+        return
+    label, pids, cli_q, cands = _parse_sales_query(query)
+    if not pids:
+        msg = "Не понял, какой это препарат."
+        if cands:
+            msg += " Возможно: " + ", ".join(cands)
+        msg += "\nПример: /sales Дексатоп 50мл"
+        await update.message.reply_text(msg)
+        return
+    whs = db.visible_warehouses(actor)
+    cli_ids = cli_label = None
+    if cli_q:
+        matches = {}
+        for wh in whs:
+            c = db.client_exact(wh["id"], cli_q)
+            if c:
+                matches[c["id"]] = c
+        if not matches:
+            for wh in whs:
+                for c in db.fuzzy_clients(wh["id"], cli_q):
+                    matches[c["id"]] = c
+        names = {c["name"] for c in matches.values()}
+        if not matches:
+            await update.message.reply_text(
+                f"Клиент «{cli_q}» не найден. Продажи по всем клиентам: "
+                f"/sales {label}")
+            return
+        if len(names) > 1:
+            await update.message.reply_text(
+                "Уточните клиента, похожих несколько: "
+                + ", ".join(sorted(names)[:5]))
+            return
+        cli_ids, cli_label = set(matches), next(iter(names))
+    report = sales_history_report(whs, label, pids, cli_ids, cli_label)
+    if report is None:
+        await update.message.reply_text(
+            f"По препарату «{label}»"
+            + (f" клиенту «{cli_label}»" if cli_label else "")
+            + " продаж не найдено — ни накладных, ни черновиков.")
+        return
+    pdf, cap = report
+    fname = safe_filename(f"продажи_{label}") + ".pdf"
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=fname), caption=cap[:1000])
 
 
 def _overdue_caption(min_days, found, total, grew_n, grew_total) -> str:
@@ -8624,6 +8864,7 @@ STAFF_COMMANDS = [
     ("client", "Карточка клиента: /client Имя"),
     ("act", "Акт сверки PDF: /act Имя"),
     ("expiry", "Сроки годности по партиям"),
+    ("sales", "История продаж препарата: /sales Дексатоп"),
     ("cash", "Касса (наличные на руках)"),
     ("report", "Отчёт за день/неделю/месяц"),
     ("price", "Прайс-лист"),
@@ -8745,6 +8986,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("draft", draft_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
+    app.add_handler(CommandHandler("sales", sales_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))
     app.add_handler(CommandHandler("forecast", forecast_cmd))
     app.add_handler(CommandHandler("client", client_cmd))

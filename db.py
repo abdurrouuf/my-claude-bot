@@ -1267,6 +1267,39 @@ def debt_growth(since_iso: str) -> dict:
     return out
 
 
+def product_sales(pids, wh_ids, client_ids=None):
+    """История продаж товара по журналу: накладные и возвраты (status='done'),
+    новые первыми. Состав операции лежит в JSON data.items — фильтр в питоне
+    (журнал невелик). Возвращает [(op_row + client_name, item_dict)]."""
+    out = []
+    pidset, whset = set(pids), set(wh_ids)
+    for op in connect().execute(
+            "SELECT o.id, o.ts, o.type, o.warehouse_id, o.client_id, o.data, "
+            "c.name AS client_name FROM operations o "
+            "LEFT JOIN clients c ON c.id = o.client_id "
+            "WHERE o.status='done' AND o.type IN ('invoice','return') "
+            "ORDER BY o.ts DESC, o.id DESC"):
+        if op["warehouse_id"] not in whset:
+            continue
+        if client_ids is not None and op["client_id"] not in client_ids:
+            continue
+        try:
+            items = json.loads(op["data"]).get("items") or []
+        except (ValueError, TypeError):
+            continue
+        for it in items:
+            if it.get("product_id") in pidset:
+                out.append((op, it))
+    return out
+
+
+def draft_items_all():
+    """Черновики с составом и датой — для истории продаж переходного периода."""
+    return connect().execute(
+        "SELECT ts, user_id, client, items FROM draft_log "
+        "WHERE items IS NOT NULL ORDER BY ts DESC, id DESC").fetchall()
+
+
 def set_client_price(cid: int, product_id: int, price: float):
     """Спеццена клиента; 0 или меньше — убрать."""
     conn = connect()
