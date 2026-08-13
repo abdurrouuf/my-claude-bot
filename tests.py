@@ -1114,6 +1114,165 @@ def test_expiry_asks_warehouse_buttons():
     asyncio.run(run())
 
 
+def _cb_update(uid, data, answers, edits):
+    """Шим callback-запроса для on_callback (ревизия 14.08.2026)."""
+    from types import SimpleNamespace
+
+    class Q:
+        def __init__(self):
+            self.data = data
+            self.from_user = SimpleNamespace(id=uid)
+            self.message = SimpleNamespace(
+                chat=SimpleNamespace(id=uid, type="private"),
+                chat_id=uid)
+
+        async def answer(self, text=None, **kw):
+            answers.append(text)
+
+        async def edit_message_text(self, text, **kw):
+            edits.append(text)
+
+    return SimpleNamespace(callback_query=Q(),
+                           effective_user=SimpleNamespace(id=uid))
+
+
+def test_pk_callback_validates_client():
+    # Поддельный callback с client_id чужого склада не должен проходить
+    # (ревизия 14.08.2026: обход /hidedebts и операции мимо своего склада)
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    other = db.warehouse_by_name("Манас")
+    db.clients_add_bulk(wh["id"], ["Асан"])
+    db.clients_add_bulk(other["id"], ["Чужой"])
+    ours = db.client_exact(wh["id"], "Асан")
+    foreign = db.client_exact(other["id"], "Чужой")
+    ctx = SimpleNamespace(bot=None)
+
+    async def run():
+        # заявка на телефон клиента склада Каракол
+        token = bot.new_pending({"kind": "set_phone", "user_id": ADMIN,
+                                 "chat_id": 1, "wh_id": wh["id"],
+                                 "wh_name": wh["name"],
+                                 "client_name": "Асан", "client_id": None,
+                                 "phone": "+996700000001"})
+        answers, edits = [], []
+        await bot.on_callback(_cb_update(ADMIN, f"pk:{token}:{foreign['id']}",
+                                         answers, edits), ctx)
+        assert db.client_get(foreign["id"])["phone"] is None, "чужой склад прошёл"
+        assert "не найден" in (answers[-1] or "").lower()
+        # свой клиент — проходит
+        await bot.on_callback(_cb_update(ADMIN, f"pk:{token}:{ours['id']}",
+                                         answers, edits), ctx)
+        assert db.client_get(ours["id"])["phone"] == "+996700000001"
+    asyncio.run(run())
+
+
+def test_pc_requires_pick_cash_kind():
+    # pc-callback на чужую по типу заявку не должен слать PDF касс
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    ctx = SimpleNamespace(bot=None)
+
+    async def run():
+        token = bot.new_pending({"kind": "pick_stock", "user_id": DANIYAR,
+                                 "chat_id": 1})
+        answers, edits = [], []
+        upd = _cb_update(DANIYAR, f"pc:{token}:all", answers, edits)
+        sent = []
+        upd.callback_query.message.reply_document = \
+            lambda *a, **k: sent.append(1)
+        await bot.on_callback(upd, ctx)
+        assert not sent and not edits, "PDF касс ушёл по поддельной кнопке"
+        assert bot.get_pending(token) is not None  # заявка не съедена
+    asyncio.run(run())
+
+
+def test_client_act_group_closed():
+    # /client и /act в группе — отказ «в личку» (долг и телефон — не для чата)
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], ["Асан"])
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    upd = SimpleNamespace(
+        effective_user=SimpleNamespace(id=ADMIN),
+        effective_chat=SimpleNamespace(id=-100500, type="supergroup"),
+        message=Msg())
+
+    async def run():
+        await bot.client_cmd(upd, SimpleNamespace(args=["Асан"]))
+        assert "личке" in replies[-1]
+        await bot.act_cmd(upd, SimpleNamespace(args=["Асан"]))
+        assert "личке" in replies[-1]
+    asyncio.run(run())
+
+
+def test_sales_drafts_only_own():
+    # Черновики в /sales: сотрудник видит только СВОИ (ревизия 14.08.2026)
+    wh = _fresh_db()
+    pr = prices.BY_ID[16]
+    item = {"name": pr["name"], "volume": pr["volume"], "qty": 2, "sum": 360}
+    db.log_draft(ADMIN, "Клиент Админа", 360, [item])
+    db.log_draft(DANIYAR, "Клиент Данияра", 360, [item])
+    pids = [16]
+
+    def drafts_in(report):
+        if report is None:
+            return ""
+        pdf, cap = report
+        return cap
+
+    # админ видит оба черновика, сотрудник — только свой
+    r_admin = bot.sales_history_report([wh], "тест", pids, draft_user_id=None)
+    r_dan = bot.sales_history_report([wh], "тест", pids,
+                                     draft_user_id=DANIYAR)
+    assert "черновик" in drafts_in(r_admin).lower()
+    cap_dan = drafts_in(r_dan).lower()
+    assert "2 шт" in cap_dan or "черновик" in cap_dan
+    # а черновиков АДМИНА в отчёте сотрудника нет: у отчёта только 1 черновик
+    # (проверяем по количеству в подписи)
+    assert "4 шт" not in cap_dan
+
+
+def test_draft_mode_is_per_warehouse():
+    # После завершения переходного периода режим черновиков определяется
+    # только складом: /fullmode выкл возвращает черновики (ревизия 14.08.2026)
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd(uid):
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=uid),
+            effective_chat=SimpleNamespace(id=uid, type="private"),
+            message=Msg())
+
+    async def run():
+        conn = db.connect()
+        # Каракол в полном режиме — подсказки о черновиках нет
+        await bot.start(upd(DANIYAR), SimpleNamespace(args=[]))
+        assert "черновик" not in replies[-1].split("Накладная")[0].lower()
+        # /fullmode выкл — склад снова на черновиках, /start предупреждает
+        conn.execute("UPDATE warehouses SET full_mode=0 WHERE id=?",
+                     (wh["id"],))
+        conn.commit()
+        await bot.start(upd(DANIYAR), SimpleNamespace(args=[]))
+        assert "черновик" in replies[-1].split("Накладная")[0].lower()
+    asyncio.run(run())
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

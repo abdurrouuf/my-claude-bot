@@ -1565,9 +1565,13 @@ def recent_operations(limit: int = 10, user_id=None, op_type=None, wh_id=None):
         conds.append("user_id=?")
         params.append(user_id)
     if wh_id is not None:
-        conds.append("(warehouse_id=? OR EXISTS (SELECT 1 FROM "
+        # json_valid: одна битая строка data (ручная правка базы, кривой
+        # бэкап) иначе роняла бы json_each и весь /log Склад (ревизия
+        # 14.08.2026).
+        conds.append("(warehouse_id=? OR (json_valid(operations.data) AND "
+                     "EXISTS (SELECT 1 FROM "
                      "json_each(operations.data, '$.stock_deltas') je "
-                     "WHERE json_extract(je.value, '$[0]')=?))")
+                     "WHERE json_extract(je.value, '$[0]')=?)))")
         params += [wh_id, wh_id]
     if op_type == "payment":
         # «Приходы» = все принятые деньги: и отдельные оплаты, и оплаты
