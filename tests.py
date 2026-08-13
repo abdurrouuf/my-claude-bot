@@ -1073,6 +1073,47 @@ def test_margin_op_id_only_for_invoice_actions():
         assert got is expected, action
 
 
+def test_expiry_asks_warehouse_buttons():
+    # /expiry без склада при нескольких доступных — вопрос кнопками
+    # (просьба владельца 14.08.2026, как /stock и /debts)
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append((text, kw.get("reply_markup")))
+
+        async def reply_document(self, **kw):
+            replies.append(("<pdf>", None))
+
+    def upd(uid):
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=uid),
+            effective_chat=SimpleNamespace(id=uid, type="private"),
+            message=Msg())
+
+    async def run():
+        # админ, складов несколько, без аргумента — вопрос кнопками
+        await bot.expiry_cmd(upd(ADMIN), SimpleNamespace(args=[]))
+        text, kb = replies[-1]
+        assert "какого склада" in text and kb is not None
+        # /expiry all — сразу отчёт по всем складам, без вопросов
+        await bot.expiry_cmd(upd(ADMIN), SimpleNamespace(args=["all"]))
+        text, kb = replies[-1]
+        assert kb is None and "сроков годности пока нет" in text
+        # /expiry Каракол — сразу отчёт по названному складу
+        await bot.expiry_cmd(upd(ADMIN), SimpleNamespace(args=["Каракол"]))
+        text, kb = replies[-1]
+        assert kb is None and "Каракол" in text
+        # сотрудник с одним складом — сразу отчёт, без кнопок
+        await bot.expiry_cmd(upd(DANIYAR), SimpleNamespace(args=[]))
+        text, kb = replies[-1]
+        assert kb is None
+    asyncio.run(run())
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
