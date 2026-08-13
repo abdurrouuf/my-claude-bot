@@ -1554,13 +1554,21 @@ def operations_all_since(start_iso: str):
     ).fetchall()
 
 
-def recent_operations(limit: int = 10, user_id=None, op_type=None):
-    """Последние операции журнала; user_id/op_type — необязательные фильтры
-    (фильтры /log Азамат накладные, просьба владельца 08.08.2026)."""
+def recent_operations(limit: int = 10, user_id=None, op_type=None, wh_id=None):
+    """Последние операции журнала; user_id/op_type/wh_id — необязательные
+    фильтры (/log Азамат накладные 50, /log Бишкек 30).
+
+    Фильтр склада смотрит и в дельты остатков (data.stock_deltas), поэтому
+    перемещение видно с обеих сторон, а не только у склада-источника."""
     conds, params = [], []
     if user_id is not None:
         conds.append("user_id=?")
         params.append(user_id)
+    if wh_id is not None:
+        conds.append("(warehouse_id=? OR EXISTS (SELECT 1 FROM "
+                     "json_each(operations.data, '$.stock_deltas') je "
+                     "WHERE json_extract(je.value, '$[0]')=?))")
+        params += [wh_id, wh_id]
     if op_type == "payment":
         # «Приходы» = все принятые деньги: и отдельные оплаты, и оплаты
         # прямо при накладной (решение владельца 08.08.2026 — иначе деньги

@@ -7758,24 +7758,41 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
             name_words.append(a)
     target_id = None if is_admin(actor) else actor["id"]
     who_label = "все сотрудники" if is_admin(actor) else actor["name"]
+    wh_filter = None
     if name_words:
-        u = _match_employee(" ".join(name_words), db.list_users())
-        if u is None:
-            await update.message.reply_text(
-                f"Сотрудник «{esc(' '.join(name_words))}» не найден.\n"
-                "Пример: /log Азамат накладные 50", parse_mode="HTML")
-            return
-        if not is_admin(actor) and u["id"] != actor["id"]:
-            await update.message.reply_text(
-                "Чужие операции видит только администратор — /log без имени "
-                "покажет ваши.")
-            return
-        target_id, who_label = u["id"], u["name"]
-    ops = db.recent_operations(n, target_id, op_type)
+        joined = " ".join(name_words)
+        # Слово может быть складом («/log Бишкек 30», просьба владельца
+        # 13.08.2026) — сначала пробуем склад, потом сотрудника.
+        wh_try = db.warehouse_by_name(joined)
+        if wh_try is not None:
+            if not any(w["id"] == wh_try["id"]
+                       for w in db.visible_warehouses(actor)):
+                await update.message.reply_text(
+                    f"Склад «{esc(wh_try['name'])}» вам недоступен.",
+                    parse_mode="HTML")
+                return
+            wh_filter = wh_try
+        else:
+            u = _match_employee(joined, db.list_users())
+            if u is None:
+                await update.message.reply_text(
+                    f"Сотрудник или склад «{esc(joined)}» не найден.\n"
+                    "Примеры: /log Азамат накладные 50, /log Бишкек 30",
+                    parse_mode="HTML")
+                return
+            if not is_admin(actor) and u["id"] != actor["id"]:
+                await update.message.reply_text(
+                    "Чужие операции видит только администратор — /log без "
+                    "имени покажет ваши.")
+                return
+            target_id, who_label = u["id"], u["name"]
+    ops = db.recent_operations(n, target_id, op_type,
+                               wh_filter["id"] if wh_filter else None)
     if not ops:
         if op_type or name_words:
             await update.message.reply_text(
                 f"Операций не найдено ({esc(who_label)}"
+                + (f", склад «{esc(wh_filter['name'])}»" if wh_filter else "")
                 + (f", {LOG_FILTER_LABELS[op_type]}" if op_type else "")
                 + ").", parse_mode="HTML")
         else:
@@ -7844,6 +7861,8 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
     flush(last_day)
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
     sub = f"ОсОО «ВЕТОП» · последние {len(ops)} · {who_label}"
+    if wh_filter:
+        sub += f" · склад «{wh_filter['name']}»"
     if op_type:
         sub += f" · {LOG_FILTER_LABELS[op_type]}"
     footer = f"Операций в журнале: {len(ops)}"
