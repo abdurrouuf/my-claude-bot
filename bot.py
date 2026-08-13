@@ -9055,13 +9055,17 @@ async def _expiry_report(update, whs):
             if len(batches) == 1:
                 exp_cell = batches[0][0]
             else:
-                exp_cell = ", ".join(f"{e} — {q_} шт" for e, q_ in batches)
+                # Каждая партия — своей строкой ячейки (список = многострочный
+                # текст в generate_report_pdf): «11.2027 — 1329 шт» переносом
+                # посреди числа читалось плохо (просьба владельца 14.08.2026).
+                exp_cell = [f"{e or 'без срока'} — {q_} шт"
+                            for e, q_ in batches]
             total_qty = sum(q_ for _, q_ in batches)
             rows.append([exp_cell, label, volume, f"{total_qty} шт", status])
         sections.append(
             {"title": f"Склад «{wh['name']}»",
              "headers": ["Срок (партии)", "Товар", "Фасовка", "Остаток", "Статус"],
-             "rows": rows, "widths": [34, 62, 24, 20, 27], "numbered": True,
+             "rows": rows, "widths": [41, 55, 24, 20, 27], "numbered": True,
              "footer": f"Позиций: {len(rows)} (партий: {n_batches}) · "
                        f"просрочено: {n_expired} · "
                        f"истекает в ближайшие 3 мес: {n_soon}"})
