@@ -914,6 +914,31 @@ def test_sales_history():
     assert "продано 15 шт" in cap_all, cap_all
 
 
+def test_hidden_debts():
+    """/hidedebts: долги скрытого склада не попадают сотруднику ни в /debts,
+    ни в /olddebts, ни в понедельничную рассылку; админ видит всё."""
+    wh = _fresh_db()  # Каракол, полный режим
+    db.clients_add_bulk(wh["id"], [("Должник", 9000)])
+    daniyar = db.get_user(DANIYAR)
+    admin = db.get_user(ADMIN)
+    assert bot.hidden_debt_wh_ids() == set()
+    db.set_setting("hidden_debt_whs", json.dumps([wh["id"]]))
+    assert bot.hidden_debt_wh_ids() == {wh["id"]}
+    # сотруднику склад отфильтрован, админу — нет
+    assert bot.debt_whs_for(daniyar, db.visible_warehouses(daniyar)) == []
+    assert any(w["id"] == wh["id"]
+               for w in bot.debt_whs_for(admin, db.visible_warehouses(admin)))
+    assert bot._debts_hidden_from(daniyar, wh["id"])
+    assert not bot._debts_hidden_from(admin, wh["id"])
+    # понедельничный отчёт сотрудника по отфильтрованным складам пуст
+    assert bot.overdue_report(
+        bot.debt_whs_for(daniyar, db.visible_warehouses(daniyar)), 0) is None
+    assert bot.overdue_report(
+        bot.debt_whs_for(admin, db.visible_warehouses(admin)), 0) is not None
+    db.set_setting("hidden_debt_whs", json.dumps([]))
+    assert bot.debt_whs_for(daniyar, db.visible_warehouses(daniyar)) != []
+
+
 def test_bishkek_load_data():
     """Таблица загрузки Бишкека: 104 товара, 124 партии, 157'577 шт;
     вместе с товаром перемещения №52 (45+33, уже в базе) — ровно
