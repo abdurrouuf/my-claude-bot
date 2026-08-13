@@ -508,6 +508,15 @@ async def post_feed(context, wh_ids, text: str, exclude_chat_id=None):
             log.warning("Не удалось отправить в ленту %s: %s", chat_id, e)
 
 
+def _feed_muted(user_id, wh_id) -> bool:
+    """Накладные и приходы, проведённые САМИМ АДМИНОМ, не идут в ленту
+    складов со скрытыми долгами (/hidedebts) — просьба владельца
+    13.08.2026: «все мои операции не должны переходить в общий чат
+    Бишкека — не накладные, не приходы; перемещения можно».
+    Операции сотрудников и остальные типы идут в ленту как обычно."""
+    return user_id == ADMIN_ID and wh_id in hidden_debt_wh_ids()
+
+
 async def feed_invoice_pdf(context, wh_id, client_label, p, old_debt, total,
                            caption=None, exclude_chat_id=None, op_id=None):
     """PDF проведённой накладной — в чат-ленту склада (просьба владельца:
@@ -3747,12 +3756,14 @@ async def _finish_amend(q, context, actor, p):
                                old_debt, total, op_id=op_id)
         await notify_admin(context, actor,
                            f"замена накладной №{p['old_op_id']} → №{op_id}: {summary}")
-        actor_name = db.get_user(p.get("op_user_id") or p["user_id"])["name"]
-        await feed_invoice_pdf(
-            context, p["wh_id"], client_label, p, old_debt, total,
-            caption=(f"🔁 <b>{esc(actor_name)}</b> — {esc(summary)}\n"
-                     f"Замена накладной №{p['old_op_id']}"),
-            exclude_chat_id=p["chat_id"], op_id=op_id)
+        author_id = p.get("op_user_id") or p["user_id"]
+        actor_name = db.get_user(author_id)["name"]
+        if not _feed_muted(author_id, p["wh_id"]):
+            await feed_invoice_pdf(
+                context, p["wh_id"], client_label, p, old_debt, total,
+                caption=(f"🔁 <b>{esc(actor_name)}</b> — {esc(summary)}\n"
+                         f"Замена накладной №{p['old_op_id']}"),
+                exclude_chat_id=p["chat_id"], op_id=op_id)
         await alert_low_stock(context, [
             (p["wh_id"], it["product_id"], -it["qty"])
             for it in p["items"] if it.get("product_id")])
@@ -3826,10 +3837,11 @@ async def _finish_invoice(q, context, actor, p):
         # В ленту склада — только PDF со сводкой в подписи (без
         # отдельного текстового сообщения, просьба владельца 21.07.2026).
         actor_name = db.get_user(p["user_id"])["name"]
-        await feed_invoice_pdf(
-            context, p["wh_id"], client_label, p, old_debt, total,
-            caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}",
-            exclude_chat_id=p["chat_id"], op_id=op_id)
+        if not _feed_muted(p["user_id"], p["wh_id"]):
+            await feed_invoice_pdf(
+                context, p["wh_id"], client_label, p, old_debt, total,
+                caption=f"🧾 <b>{esc(actor_name)}</b> — {esc(summary)}",
+                exclude_chat_id=p["chat_id"], op_id=op_id)
         await alert_low_stock(context, [
             (p["wh_id"], it["product_id"], -it["qty"])
             for it in p["items"] if it.get("product_id")])
@@ -4375,8 +4387,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     + payment_receipt(client_label, old_debt, p["amount"]),
                     parse_mode="HTML")
                 await notify_admin(context, actor, summary)
-                await feed_operation(context, op_id, db.get_user(p["user_id"])["name"], "💵",
-                                     exclude_chat_id=p["chat_id"])
+                if not _feed_muted(p["user_id"], p["wh_id"]):
+                    await feed_operation(context, op_id,
+                                         db.get_user(p["user_id"])["name"], "💵",
+                                         exclude_chat_id=p["chat_id"])
             elif p["kind"] in ("transfer", "writeoff"):
                 # Перемещение и списание: спрашиваем, какую партию забираем
                 # (выбранный срок переезжает на склад-получатель), а если
