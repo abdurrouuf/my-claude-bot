@@ -914,6 +914,18 @@ def test_sales_history():
     assert "продано 15 шт" in cap_all, cap_all
 
 
+def test_bishkek_load_data():
+    """Таблица загрузки Бишкека: 104 товара, 124 партии, 157'577 шт;
+    вместе с товаром перемещения №52 (45+33, уже в базе) — ровно
+    инвентаризация владельца 157'655 шт."""
+    import bishkek_stock_data
+    pos = [x for x in bishkek_stock_data.BISHKEK_STOCK if x[1] > 0]
+    assert len({p for p, q, e in pos}) == 104
+    assert len(pos) == 124
+    total = sum(q for _, q, _ in pos)
+    assert total == 157577 and total + 45 + 33 == 157655
+
+
 def test_cash_since_zero_handover():
     """/cash показывает движения только после инкассации «под ноль»."""
     wh = _fresh_db()
