@@ -8567,8 +8567,19 @@ async def loadwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     token = new_pending(payload)
     batch_note = ""
     if len(items) > len(pids):
-        batch_note = (f"Партий: <b>{len(items)}</b> — у "
-                      f"{len(items) - len(pids)} товаров два срока годности.\n")
+        # Точный подсчёт (замечание владельца 13.08.2026: «у 20 товаров два
+        # срока» было числом лишних СТРОК — товар с тремя партиями давал 2)
+        per_pid = {}
+        for pid, _, _ in items:
+            per_pid[pid] = per_pid.get(pid, 0) + 1
+        two = sum(1 for c in per_pid.values() if c == 2)
+        more = sum(1 for c in per_pid.values() if c > 2)
+        parts = []
+        if two:
+            parts.append(f"у {two} товаров два срока годности")
+        if more:
+            parts.append(f"у {more} — три и больше")
+        batch_note = f"Партий: <b>{len(items)}</b> — {', '.join(parts)}.\n"
     exist_note = ""
     if stock_sig:
         exist_note = (f"⚠️ На складе уже есть остатки: {len(stock_sig)} поз., "
