@@ -965,6 +965,19 @@ def test_showdebt_exceptions():
     db.set_setting("hidden_debt_whs", json.dumps([]))
 
 
+def test_feed_muted_for_admin_on_hidden_wh():
+    """Накладные/приходы админа не идут в ленту скрытого склада;
+    операции сотрудников и открытые склады — идут."""
+    wh = _fresh_db()
+    db.set_setting("hidden_debt_whs", json.dumps([wh["id"]]))
+    assert bot._feed_muted(ADMIN, wh["id"])          # админ, скрытый склад
+    assert not bot._feed_muted(DANIYAR, wh["id"])    # сотрудник — в ленту
+    other = db.warehouse_by_name("Манас")
+    assert not bot._feed_muted(ADMIN, other["id"])   # открытый склад — в ленту
+    db.set_setting("hidden_debt_whs", json.dumps([]))
+    assert not bot._feed_muted(ADMIN, wh["id"])      # долги открыли — как раньше
+
+
 def test_bishkek_load_data():
     """Таблица загрузки Бишкека: 104 товара, 124 партии, 157'577 шт;
     вместе с товаром перемещения №52 (45+33, уже в базе) — ровно
