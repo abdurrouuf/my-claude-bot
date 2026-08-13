@@ -4196,7 +4196,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if owner_row is None:
             return
         if len(parts) > 2 and parts[2] == "all":
-            whs = debt_whs_for(owner_row, db.visible_warehouses(owner_row))
+            whs = debt_report_whs(owner_row, db.visible_warehouses(owner_row))
             label = "все склады"
         else:
             try:
@@ -4206,7 +4206,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if wh is None or not db.can_view_warehouse(owner_row, wh["id"]):
                 await q.edit_message_text("Склад не найден или нет доступа.")
                 return
-            if _debts_hidden_from(owner_row, wh["id"]):
+            if not debt_report_whs(owner_row, [wh]):
                 await q.edit_message_text(HIDDEN_DEBT_MSG)
                 return
             whs = [wh]
@@ -4218,7 +4218,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shim = SimpleNamespace(message=q.message,
                                effective_chat=q.message.chat,
                                effective_user=q.from_user)
-        await _debts_report(shim, whs)
+        await _debts_report(shim, whs, owner_row)
         return
 
     if kind == "pc":  # выбор кассы: сотрудник или все сразу (ответ — PDF)
@@ -5774,6 +5774,107 @@ def _debts_hidden_from(actor, wh_id: int) -> bool:
     return not is_admin(actor) and wh_id in hidden_debt_wh_ids()
 
 
+def open_debt_client_ids() -> set:
+    """Клиенты-исключения (/showdebt): их долги сотрудники видят даже на
+    скрытом складе (просьба владельца 13.08.2026 — «чтобы Бека видел
+    некоторых должников»)."""
+    raw = db.get_setting("open_debt_clients")
+    try:
+        return {int(x) for x in json.loads(raw)} if raw else set()
+    except (ValueError, TypeError):
+        return set()
+
+
+def debt_report_whs(actor, whs) -> list:
+    """Склады для отчёта о долгах: скрытые выпадают, но остаются, если в
+    них есть открытые клиенты (сотрудник увидит только их)."""
+    if is_admin(actor):
+        return list(whs)
+    hid = hidden_debt_wh_ids()
+    open_ids = open_debt_client_ids()
+    out = []
+    for w in whs:
+        if w["id"] not in hid or any(
+                c["id"] in open_ids for c in db.clients_of(w["id"])):
+            out.append(w)
+    return out
+
+
+async def showdebt_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Открыть сотрудникам долг отдельного клиента скрытого склада (админ).
+
+    /showdebt Иванов [, Асан] — открыть; /showdebt выкл Иванов — скрыть
+    обратно; /showdebt — список открытых."""
+    if await _require_admin(update) is None:
+        return
+    open_ids = open_debt_client_ids()
+    args = list(context.args or [])
+    if not args:
+        if not open_ids:
+            await update.message.reply_text(
+                "Открытых клиентов нет.\n"
+                "Открыть: /showdebt Иванов (можно несколько через запятую)\n"
+                "Скрыть обратно: /showdebt выкл Иванов")
+            return
+        lines = ["👁 Сотрудники видят долги этих клиентов скрытых складов:"]
+        for cid in sorted(open_ids):
+            c = db.client_get(cid)
+            if c is None:
+                continue
+            wh = db.warehouse_by_id(c["warehouse_id"])
+            lines.append(f"• {c['name']} ({wh['name'] if wh else '?'}) — "
+                         f"{money(c['debt'])}")
+        lines.append("\nСкрыть обратно: /showdebt выкл Имя")
+        await update.message.reply_text("\n".join(lines))
+        return
+    off = args[0].lower() in ("выкл", "выкл.", "off", "скрыть")
+    names = [x.strip() for x in " ".join(args[1:] if off else args).split(",")
+             if x.strip()]
+    if not names:
+        await update.message.reply_text("Укажите имя: /showdebt выкл Иванов")
+        return
+    done, problems = [], []
+    for name in names:
+        found = {}
+        for wh in db.all_warehouses():
+            c = db.client_exact(wh["id"], name)
+            if c is not None:
+                found[c["id"]] = c
+        if not found:
+            cands = []
+            for wh in db.all_warehouses():
+                for c in db.fuzzy_clients(wh["id"], name):
+                    found_key = c["id"]
+                    if found_key not in {x["id"] for x in cands}:
+                        cands.append(c)
+            if len(cands) == 1:
+                found = {cands[0]["id"]: cands[0]}
+            elif cands:
+                problems.append(f"«{name}» — уточните: "
+                                + ", ".join(x["name"] for x in cands[:4]))
+                continue
+        if not found:
+            problems.append(f"«{name}» — не найден")
+            continue
+        if len(found) > 1:
+            problems.append(f"«{name}» — есть на нескольких складах, "
+                            "напишите точное имя")
+            continue
+        c = next(iter(found.values()))
+        if off:
+            open_ids.discard(c["id"])
+        else:
+            open_ids.add(c["id"])
+        done.append(c["name"])
+    db.set_setting("open_debt_clients", json.dumps(sorted(open_ids)))
+    msg = []
+    if done:
+        msg.append(("🙈 Снова скрыты: " if off else "👁 Открыты сотрудникам: ")
+                   + ", ".join(done))
+    msg.extend(problems)
+    await update.message.reply_text("\n".join(msg) or "Ничего не изменено.")
+
+
 async def hidedebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Скрыть/открыть долги склада для сотрудников (админ)."""
     if await _require_admin(update) is None:
@@ -5824,7 +5925,7 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     arg = " ".join(context.args).strip() if context.args else ""
     if in_group:
-        whs = debt_whs_for(actor, whs_group)
+        whs = debt_report_whs(actor, whs_group)
         if not whs:
             await update.message.reply_text(HIDDEN_DEBT_MSG)
             return
@@ -5834,12 +5935,12 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
-        if _debts_hidden_from(actor, wh["id"]):
+        if not debt_report_whs(actor, [wh]):
             await update.message.reply_text(HIDDEN_DEBT_MSG)
             return
         whs = [wh]
     else:
-        whs = debt_whs_for(actor, db.visible_warehouses(actor))
+        whs = debt_report_whs(actor, db.visible_warehouses(actor))
         if not whs:
             await update.message.reply_text(HIDDEN_DEBT_MSG)
             return
@@ -5859,14 +5960,20 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Долги какого склада показать?",
                                             reply_markup=InlineKeyboardMarkup(kb))
             return
-    await _debts_report(update, whs)
+    await _debts_report(update, whs, actor)
 
 
-async def _debts_report(update, whs):
+async def _debts_report(update, whs, actor=None):
+    open_ids = open_debt_client_ids()
     sections, summary = [], []
     grand_total = 0
     for wh in whs:
         clients = [c for c in db.clients_of(wh["id"]) if c["debt"] != 0]
+        only_open = actor is not None and _debts_hidden_from(actor, wh["id"])
+        if only_open:
+            # Скрытый склад: сотрудник видит только клиентов, открытых
+            # админом через /showdebt
+            clients = [c for c in clients if c["id"] in open_ids]
         if not clients:
             summary.append(f"🏬 «{wh['name']}»: долгов нет ✅")
             continue
@@ -5878,7 +5985,8 @@ async def _debts_report(update, whs):
             else:
                 rows.append([c["name"], f"переплата {money(-c['debt'])}", c["phone"] or ""])
         sections.append({
-            "title": f"Склад «{wh['name']}»",
+            "title": f"Склад «{wh['name']}»"
+                     + (" — открытые клиенты" if only_open else ""),
             "headers": ["Клиент", "Долг", "Телефон"],
             "rows": rows, "widths": [85, 45, 37], "numbered": True,
             "footer": f"Итого долгов: {money(total)} · должников: "
@@ -5996,18 +6104,23 @@ async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
-        if _debts_hidden_from(actor, wh["id"]):
+        if not debt_report_whs(actor, [wh]):
             await update.message.reply_text(HIDDEN_DEBT_MSG)
             return
         whs = [wh]
     else:
-        whs = debt_whs_for(actor, db.visible_warehouses(actor))
+        whs = debt_report_whs(actor, db.visible_warehouses(actor))
         if not whs:
             await update.message.reply_text(HIDDEN_DEBT_MSG)
             return
+    open_ids = open_debt_client_ids()
     sections, summary = [], []
     for wh in whs:
         clients = db.clients_of(wh["id"])
+        if _debts_hidden_from(actor, wh["id"]):
+            # Скрытый склад: в справочнике сотрудника — только клиенты,
+            # открытые админом (/showdebt)
+            clients = [c for c in clients if c["id"] in open_ids]
         if not clients:
             summary.append(f"🏬 «{wh['name']}»: клиентов пока нет")
             continue
@@ -6511,9 +6624,10 @@ async def resolve_client_arg(update, actor, args, usage: str):
         return None, None
     name = " ".join(args)
     c, wh = find_client_visible(actor, name)
-    if c is not None and _debts_hidden_from(actor, wh["id"]):
-        # Карточка и акт сверки показывают долг — для скрытого склада
-        # сотруднику не отдаём (/hidedebts).
+    if (c is not None and _debts_hidden_from(actor, wh["id"])
+            and c["id"] not in open_debt_client_ids()):
+        # Карточка и акт сверки показывают долг — на скрытом складе
+        # сотруднику отдаём только клиентов, открытых /showdebt.
         await update.message.reply_text(HIDDEN_DEBT_MSG)
         return None, None
     if c is None:
@@ -9026,6 +9140,7 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("rate", "Курс доллара и накладные расходы"),
     ("olddebts", "Давно не платили"),
     ("hidedebts", "Скрыть долги склада от сотрудников"),
+    ("showdebt", "Открыть сотрудникам долг клиента: /showdebt Имя"),
     ("drafts", "Сводка черновиков"),
     ("abc", "АВС-анализ товаров и клиентов"),
     ("deadstock", "Мёртвый товар"),
@@ -9133,6 +9248,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
     app.add_handler(CommandHandler("hidedebts", hidedebts_cmd))
+    app.add_handler(CommandHandler("showdebt", showdebt_cmd))
     app.add_handler(CommandHandler("sales", sales_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))
     app.add_handler(CommandHandler("forecast", forecast_cmd))
