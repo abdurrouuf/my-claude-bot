@@ -4196,7 +4196,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if owner_row is None:
             return
         if len(parts) > 2 and parts[2] == "all":
-            whs = db.visible_warehouses(owner_row)
+            whs = debt_whs_for(owner_row, db.visible_warehouses(owner_row))
             label = "все склады"
         else:
             try:
@@ -4205,6 +4205,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 wh = None
             if wh is None or not db.can_view_warehouse(owner_row, wh["id"]):
                 await q.edit_message_text("Склад не найден или нет доступа.")
+                return
+            if _debts_hidden_from(owner_row, wh["id"]):
+                await q.edit_message_text(HIDDEN_DEBT_MSG)
                 return
             whs = [wh]
             label = f"«{wh['name']}»"
@@ -5745,6 +5748,70 @@ async def show_stock_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _stock_cmd(update, context, with_prices=True)
 
 
+# Долги отдельных складов можно скрыть от сотрудников (/hidedebts —
+# просьба владельца 13.08.2026 при загрузке должников Бишкека:
+# «никому, кроме меня, не показывай должников»). Хранится в settings.
+HIDDEN_DEBT_MSG = "Долги этого склада пока показывает только администратор."
+
+
+def hidden_debt_wh_ids() -> set:
+    raw = db.get_setting("hidden_debt_whs")
+    try:
+        return {int(x) for x in json.loads(raw)} if raw else set()
+    except (ValueError, TypeError):
+        return set()
+
+
+def debt_whs_for(actor, whs) -> list:
+    """Склады без тех, чьи долги скрыты от сотрудников. Админ видит всё."""
+    if is_admin(actor):
+        return list(whs)
+    hid = hidden_debt_wh_ids()
+    return [w for w in whs if w["id"] not in hid]
+
+
+def _debts_hidden_from(actor, wh_id: int) -> bool:
+    return not is_admin(actor) and wh_id in hidden_debt_wh_ids()
+
+
+async def hidedebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Скрыть/открыть долги склада для сотрудников (админ)."""
+    if await _require_admin(update) is None:
+        return
+    hid = hidden_debt_wh_ids()
+    args = list(context.args or [])
+    if not args:
+        if hid:
+            names = [w["name"] for w in db.all_warehouses() if w["id"] in hid]
+            txt = ("🙈 Долги скрыты от сотрудников: " + ", ".join(names)
+                   + "\n(отчёты о долгах, справочник, карточки клиентов и "
+                     "понедельничные напоминания по этим складам видите "
+                     "только вы)")
+        else:
+            txt = "Скрытых долгов нет — все склады видны сотрудникам как обычно."
+        txt += "\n\nСкрыть: /hidedebts Бишкек\nОткрыть: /hidedebts выкл Бишкек"
+        await update.message.reply_text(txt)
+        return
+    off = args[0].lower() in ("выкл", "выкл.", "off", "открыть")
+    name = " ".join(args[1:] if off else args).strip()
+    wh = db.warehouse_by_name(name)
+    if wh is None:
+        await update.message.reply_text(
+            f"Склад «{esc(name)}» не найден.", parse_mode="HTML")
+        return
+    if off:
+        hid.discard(wh["id"])
+        msg = (f"👁 Долги склада «{esc(wh['name'])}» снова видны сотрудникам "
+               "с доступом.")
+    else:
+        hid.add(wh["id"])
+        msg = (f"🙈 Долги склада «{esc(wh['name'])}» теперь видите только вы: "
+               "/debts, /olddebts, /clients, /client, /act и понедельничные "
+               "напоминания сотрудникам их не покажут.")
+    db.set_setting("hidden_debt_whs", json.dumps(sorted(hid)))
+    await update.message.reply_text(msg, parse_mode="HTML")
+
+
 async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
@@ -5757,16 +5824,25 @@ async def show_debts(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     arg = " ".join(context.args).strip() if context.args else ""
     if in_group:
-        whs = whs_group
+        whs = debt_whs_for(actor, whs_group)
+        if not whs:
+            await update.message.reply_text(HIDDEN_DEBT_MSG)
+            return
     elif arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
         if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
+        if _debts_hidden_from(actor, wh["id"]):
+            await update.message.reply_text(HIDDEN_DEBT_MSG)
+            return
         whs = [wh]
     else:
-        whs = db.visible_warehouses(actor)
+        whs = debt_whs_for(actor, db.visible_warehouses(actor))
+        if not whs:
+            await update.message.reply_text(HIDDEN_DEBT_MSG)
+            return
         if not arg and len(whs) > 1:
             # Несколько складов — сначала спрашиваем кнопками (просьба
             # владельца 10.08.2026: «не отправляй сразу все долги»).
@@ -5920,9 +5996,15 @@ async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
+        if _debts_hidden_from(actor, wh["id"]):
+            await update.message.reply_text(HIDDEN_DEBT_MSG)
+            return
         whs = [wh]
     else:
-        whs = db.visible_warehouses(actor)
+        whs = debt_whs_for(actor, db.visible_warehouses(actor))
+        if not whs:
+            await update.message.reply_text(HIDDEN_DEBT_MSG)
+            return
     sections, summary = [], []
     for wh in whs:
         clients = db.clients_of(wh["id"])
@@ -6429,9 +6511,14 @@ async def resolve_client_arg(update, actor, args, usage: str):
         return None, None
     name = " ".join(args)
     c, wh = find_client_visible(actor, name)
+    if c is not None and _debts_hidden_from(actor, wh["id"]):
+        # Карточка и акт сверки показывают долг — для скрытого склада
+        # сотруднику не отдаём (/hidedebts).
+        await update.message.reply_text(HIDDEN_DEBT_MSG)
+        return None, None
     if c is None:
         hints = []
-        for w in db.visible_warehouses(actor):
+        for w in debt_whs_for(actor, db.visible_warehouses(actor)):
             hints += [f"{x['name']} ({w['name']})" for x in db.fuzzy_clients(w["id"], name)]
         msg = f"❌ Клиент «{esc(name)}» не найден."
         if hints:
@@ -6869,7 +6956,8 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Использование: /olddebts [дней]\nПример: /olddebts 45")
             return
-    report = overdue_report(db.visible_warehouses(actor), min_days)
+    report = overdue_report(
+        debt_whs_for(actor, db.visible_warehouses(actor)), min_days)
     if report is None:
         await update.message.reply_text(
             f"✅ Нет клиентов без оплат дольше {min_days} дней, "
@@ -7147,7 +7235,8 @@ async def send_debt_alerts(bot):
     for u in db.list_users():
         if u["id"] == ADMIN_ID:
             continue
-        report = overdue_report(db.visible_warehouses(u), DEBT_ALERT_DAYS)
+        report = overdue_report(debt_whs_for(u, db.visible_warehouses(u)),
+                                DEBT_ALERT_DAYS)
         if not report:
             continue
         pdf, found, total, grew_n, grew_total = report
@@ -8936,6 +9025,7 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("stockcost", "Остатки в закупочных ценах"),
     ("rate", "Курс доллара и накладные расходы"),
     ("olddebts", "Давно не платили"),
+    ("hidedebts", "Скрыть долги склада от сотрудников"),
     ("drafts", "Сводка черновиков"),
     ("abc", "АВС-анализ товаров и клиентов"),
     ("deadstock", "Мёртвый товар"),
@@ -9042,6 +9132,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("draft", draft_cmd))
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
+    app.add_handler(CommandHandler("hidedebts", hidedebts_cmd))
     app.add_handler(CommandHandler("sales", sales_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))
     app.add_handler(CommandHandler("forecast", forecast_cmd))
