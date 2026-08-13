@@ -40,11 +40,11 @@ CLAUDE_MODEL = os.environ.get("CLAUDE_MODEL", "claude-sonnet-5")
 # (черновики без знака) — переменная DRAFT_WATERMARK=0 на Railway.
 DRAFT_WATERMARK = os.environ.get("DRAFT_WATERMARK", "1") == "1"
 
-# Переходный период: сотрудникам доступны ТОЛЬКО черновики и вопросы о прайсе.
-# Накладные, оплаты, перемещения и создание клиентов заблокированы (админу — нет).
-# ЗАВЕРШЁН 13.08.2026 (все склады переведены в полный учёт) — по умолчанию
-# выключен. Вернуть — переменная TRANSITION_MODE=1 на Railway.
-TRANSITION_MODE = os.environ.get("TRANSITION_MODE", "0") == "1"
+# Переходный период ЗАВЕРШЁН 13.08.2026: все склады в полном учёте.
+# Режим черновиков теперь определяется ТОЛЬКО самим складом (/fullmode выкл
+# Склад — накладные снова черновики, операции сотрудников там закрыты).
+# Глобальная переменная TRANSITION_MODE больше не используется (ревизия
+# 14.08.2026: она делала «/fullmode выкл» пустышкой).
 
 TRANSITION_HINT = (
     "⏳ Ваш склад пока работает в режиме черновиков — эта операция для него "
@@ -53,10 +53,6 @@ TRANSITION_HINT = (
     "Асан, Албенивер 200мл 1к, долг 31470, приход 5000\n\n"
     "Придёт готовая PDF-накладная, остатки и долги не изменятся."
 )
-
-
-def transition_blocked(actor) -> bool:
-    return TRANSITION_MODE and not is_admin(actor)
 
 
 # Час вечерней сводки по времени Бишкека (0-23)
@@ -1251,9 +1247,12 @@ async def start_invoice(update, context, actor, data, draft=False):
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-    if not draft and TRANSITION_MODE and not wh["full_mode"]:
-        # Переходный период: накладная автоматически становится черновиком.
-        # Склады в полном режиме (/fullmode) работают по-настоящему.
+    if not draft and not wh["full_mode"]:
+        # Склад в режиме черновиков (/fullmode выкл): накладная автоматически
+        # становится черновиком. Раньше это зависело ещё и от глобального
+        # TRANSITION_MODE — после завершения переходного периода (14.08.2026)
+        # режим определяет только сам склад, иначе «/fullmode выкл» молча
+        # проводил бы всё по-настоящему.
         draft = True
     client_name = str(data.get("client") or "").strip()
     if not client_name:
@@ -1359,8 +1358,13 @@ async def cert_text_reply(update, actor, text) -> bool:
     pend = CERT_PENDING_DOC.get(key)
     if is_admin(actor) and pend and time.time() - pend["ts"] <= CERT_PENDING_TTL:
         CERT_PENDING_DOC.pop(key, None)
+        age_min = int((time.time() - pend["ts"]) / 60)
+        what = pend["file_name"] or ("фото" if pend["kind"] == "photo"
+                                     else "файл без имени")
+        src_label = (f"{what} (получен {age_min} мин назад)" if age_min
+                     else f"{what} (получен только что)")
         await _handle_cert_upload(update, pend["file_id"], pend["kind"],
-                                  pend["file_name"], text)
+                                  pend["file_name"], text, src_label=src_label)
         return True
     if is_admin(actor):
         await update.message.reply_text(
@@ -1410,8 +1414,12 @@ def _cert_product_match(query: str):
     return None, [by_lower[c] for c in close]
 
 
-async def _handle_cert_upload(update, file_id, kind, file_name, caption):
-    """PDF/фото с подписью «сертификат …» от админа — сохранить привязку."""
+async def _handle_cert_upload(update, file_id, kind, file_name, caption,
+                              src_label=None):
+    """PDF/фото с подписью «сертификат …» от админа — сохранить привязку.
+    src_label — описание файла, когда он был прислан ОТДЕЛЬНЫМ сообщением
+    (ревизия 14.08.2026: показываем, ЧТО именно привязали, — за 15 минут
+    последним файлом могло оказаться фото накладной, а не сертификат)."""
     actor = await get_actor(update)
     if actor is None:
         return
@@ -1439,7 +1447,8 @@ async def _handle_cert_upload(update, file_id, kind, file_name, caption):
         db.cert_add(name, file_id, kind, file_name, note)
         await update.message.reply_text(
             f"✅ Сертификат сохранён: {name}\n"
-            f"Сотрудники получат его командой /cert поставка {label}")
+            f"Сотрудники получат его командой /cert поставка {label}"
+            + (f"\n📎 Привязан: {src_label}" if src_label else ""))
         return
     ok, bad = [], []
     for part in [p.strip() for p in rest.split(",") if p.strip()]:
@@ -1454,6 +1463,8 @@ async def _handle_cert_upload(update, file_id, kind, file_name, caption):
     if ok:
         lines.append("✅ Сертификат сохранён: " + ", ".join(ok))
         lines.append(f"Сотрудники получат его командой /cert {ok[0].lower()}")
+        if src_label:
+            lines.append(f"📎 Привязан: {src_label}")
     if bad:
         lines.append("⚠️ Не распознал препарат: " + "; ".join(bad)
                      + ". Напишите название как в прайсе.")
@@ -1489,10 +1500,18 @@ async def _send_cert_files(update, name, certs):
                 c["ts"]).strftime("%d.%m.%Y") + ")"
         except ValueError:
             pass
-        if c["file_kind"] == "photo":
-            await update.message.reply_photo(c["file_id"], caption=cap)
-        else:
-            await update.message.reply_document(c["file_id"], caption=cap)
+        try:
+            if c["file_kind"] == "photo":
+                await update.message.reply_photo(c["file_id"], caption=cap)
+            else:
+                await update.message.reply_document(c["file_id"], caption=cap)
+        except Exception:
+            # file_id мёртв (например, сменился токен бота) — честно сказать,
+            # а не промолчать (ревизия 14.08.2026).
+            log.warning("Сертификат «%s» не отправился", name, exc_info=True)
+            await update.message.reply_text(
+                f"⚠️ Файл сертификата «{name}» не отправился — попросите "
+                f"администратора загрузить его заново.")
 
 
 async def cert_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1669,7 +1688,7 @@ async def start_amend_invoice(update, context, actor, data):
         op, wh = await _invoice_by_op_id(update, actor, data["op_id"])
         if op is None:
             return
-        if TRANSITION_MODE and not wh["full_mode"]:
+        if not wh["full_mode"]:
             await update.message.reply_text(
                 "На этом складе сейчас черновики — просто выпишите черновик "
                 "заново целиком, старый PDF выбросьте.")
@@ -1684,7 +1703,7 @@ async def start_amend_invoice(update, context, actor, data):
         if err:
             await update.message.reply_text(err, parse_mode="HTML")
             return
-        if TRANSITION_MODE and not wh["full_mode"]:
+        if not wh["full_mode"]:
             await update.message.reply_text(
                 "На этом складе сейчас черновики — просто выпишите черновик заново "
                 "целиком, старый PDF выбросьте.")
@@ -1796,7 +1815,7 @@ async def start_replace_invoice(update, context, actor, data):
                 f"У клиента «{esc(c0['name'])}» нет проведённых накладных.",
                 parse_mode="HTML")
             return
-    if TRANSITION_MODE and not wh["full_mode"]:
+    if not wh["full_mode"]:
         await update.message.reply_text(
             "На этом складе сейчас черновики — просто выпишите черновик заново "
             "целиком, старый PDF выбросьте.")
@@ -1951,7 +1970,7 @@ async def start_handover(update, context, actor, data):
     # режиме: касса общая, а выручка могла прийти с полного склада (Бека —
     # родной Бишкек на черновиках, но торгует на Кара-Балте; инцидент
     # 27.07.2026 — бот отвечал «переходный период»).
-    if transition_blocked(actor) and not any(
+    if not is_admin(actor) and not any(
             w["full_mode"] for w in db.operable_warehouses(actor)):
         await update.message.reply_text(TRANSITION_HINT)
         return
@@ -2240,7 +2259,7 @@ async def start_return(update, context, actor, data):
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-    if transition_blocked(actor) and not wh["full_mode"]:
+    if not is_admin(actor) and not wh["full_mode"]:
         await update.message.reply_text(TRANSITION_HINT)
         return
     client_name = str(data.get("client") or "").strip()
@@ -2378,7 +2397,7 @@ async def start_payment(update, context, actor, data):
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-    if transition_blocked(actor) and not wh["full_mode"]:
+    if not is_admin(actor) and not wh["full_mode"]:
         await update.message.reply_text(TRANSITION_HINT)
         return
     client_name = str(data.get("client") or "").strip()
@@ -2566,7 +2585,7 @@ async def start_transfer(update, context, actor, data):
         if from_wh["id"] == to_wh["id"]:
             await update.message.reply_text("Склад-источник и склад-получатель совпадают.")
             return
-    if transition_blocked(actor) and not (
+    if not is_admin(actor) and not (
             to_wh["full_mode"] or (from_wh and from_wh["full_mode"])):
         await update.message.reply_text(TRANSITION_HINT)
         return
@@ -3176,7 +3195,7 @@ async def start_inventory(update, context, actor, data):
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-    if transition_blocked(actor) and not wh["full_mode"]:
+    if not is_admin(actor) and not wh["full_mode"]:
         await update.message.reply_text(TRANSITION_HINT)
         return
     items, warnings = [], []
@@ -3303,7 +3322,7 @@ async def start_writeoff(update, context, actor, data):
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
-    if transition_blocked(actor) and not wh["full_mode"]:
+    if not is_admin(actor) and not wh["full_mode"]:
         await update.message.reply_text(TRANSITION_HINT)
         return
     try:
@@ -4146,6 +4165,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "pw":  # выбран склад для операции, где склад не был указан
+        if p.get("kind") != "pick_wh":
+            await q.answer()
+            return
         PENDING.pop(token, None)
         await q.answer()
         try:
@@ -4174,6 +4196,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "ps":  # выбран склад для отчёта об остатках
+        if p.get("kind") != "pick_stock":
+            await q.answer()
+            return
         PENDING.pop(token, None)
         await q.answer()
         owner_row = db.get_user(p["user_id"])
@@ -4204,6 +4229,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "pexp":  # выбран склад для отчёта о сроках годности
+        if p.get("kind") != "pick_expiry":
+            await q.answer()
+            return
         PENDING.pop(token, None)
         await q.answer()
         owner_row = db.get_user(p["user_id"])
@@ -4234,6 +4262,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "pdbt":  # выбран склад для отчёта о долгах
+        if p.get("kind") != "pick_debts":
+            await q.answer()
+            return
         PENDING.pop(token, None)
         await q.answer()
         owner_row = db.get_user(p["user_id"])
@@ -4266,6 +4297,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "pc":  # выбор кассы: сотрудник или все сразу (ответ — PDF)
+        # Кассы всех сотрудников — только админ и только по «своей» заявке
+        # выбора кассы: без сверки kind поддельный callback на любой живой
+        # токен выдал бы PDF касс кому угодно (ревизия 14.08.2026).
+        if p.get("kind") != "pick_cash" or not is_admin(actor):
+            await q.answer()
+            return
         PENDING.pop(token, None)
         await q.answer()
         target = None
@@ -4287,7 +4324,22 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "pk":  # выбран существующий клиент
-        p["client_id"] = int(parts[2])
+        # Данным кнопки не доверяем (ревизия 14.08.2026): клиент обязан
+        # существовать и принадлежать складу заявки — поддельный callback
+        # с чужим client_id иначе показал бы долг клиента другого склада
+        # (обход /hidedebts) и позволил бы провести оплату мимо своего склада.
+        if p.get("kind") not in ("invoice", "payment", "return",
+                                 "set_phone", "set_price"):
+            await q.answer()
+            return
+        try:
+            chosen = db.client_get(int(parts[2]))
+        except (ValueError, IndexError):
+            chosen = None
+        if chosen is None or chosen["warehouse_id"] != p.get("wh_id"):
+            await q.answer("Клиент не найден", show_alert=True)
+            return
+        p["client_id"] = chosen["id"]
         await q.answer()
         if p["kind"] == "set_phone":
             PENDING.pop(token, None)
@@ -4414,15 +4466,27 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    q.message.chat.id, q.from_user.id)
             elif p["kind"] == "payment":
                 op_id, client_label, old_debt, summary = commit_payment(p)
-                await q.edit_message_text(
-                    f"✅ Оплата проведена (операция №{op_id}).\n\n"
-                    + payment_receipt(client_label, old_debt, p["amount"]),
-                    parse_mode="HTML")
-                await notify_admin(context, actor, summary)
-                if not _feed_muted(p["user_id"], p["wh_id"]):
-                    await feed_operation(context, op_id,
-                                         db.get_user(p["user_id"])["name"], "💵",
-                                         exclude_chat_id=p["chat_id"])
+                # Оплата УЖЕ в базе — сбой Telegram дальше не должен
+                # выглядеть как «не проведено», иначе повтор задвоит её
+                # (ревизия 14.08.2026, как в _finish_invoice).
+                try:
+                    await q.edit_message_text(
+                        f"✅ Оплата проведена (операция №{op_id}).\n\n"
+                        + payment_receipt(client_label, old_debt, p["amount"]),
+                        parse_mode="HTML")
+                    await notify_admin(context, actor, summary)
+                    if not _feed_muted(p["user_id"], p["wh_id"]):
+                        await feed_operation(context, op_id,
+                                             db.get_user(p["user_id"])["name"], "💵",
+                                             exclude_chat_id=p["chat_id"])
+                except Exception:
+                    log.exception("Оплата №%s проведена, уведомления не дошли", op_id)
+                    try:
+                        await q.edit_message_text(
+                            f"✅ Оплата ПРОВЕДЕНА (операция №{op_id}), повторно "
+                            f"проводить НЕ нужно. Детали: /op {op_id}")
+                    except Exception:
+                        pass
             elif p["kind"] in ("transfer", "writeoff"):
                 # Перемещение и списание: спрашиваем, какую партию забираем
                 # (выбранный срок переезжает на склад-получатель), а если
@@ -4432,21 +4496,32 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    q.message.chat.id, q.from_user.id)
             elif p["kind"] == "handover":
                 op_id, summary = commit_handover(p)
-                remaining = db.cash_on_hand(p["user_id"])
-                await q.edit_message_text(
-                    f"✅ {esc(summary)} — принято (операция №{op_id}).\n"
-                    f"В его кассе осталось: {money(remaining)}", parse_mode="HTML")
-                if p.get("approver_id"):
+                # Сдача УЖЕ в базе — сбой Telegram не должен провоцировать
+                # повтор и задвоение инкассации (ревизия 14.08.2026).
+                try:
+                    remaining = db.cash_on_hand(p["user_id"])
+                    await q.edit_message_text(
+                        f"✅ {esc(summary)} — принято (операция №{op_id}).\n"
+                        f"В его кассе осталось: {money(remaining)}", parse_mode="HTML")
+                    if p.get("approver_id"):
+                        try:
+                            await context.bot.send_message(
+                                p["chat_id"],
+                                f"✅ Админ принял выручку {money(p['amount'])} (операция №{op_id}).\n"
+                                f"В вашей кассе осталось: {money(remaining)}", parse_mode="HTML")
+                        except Exception:
+                            log.warning("Не удалось уведомить заявителя")
+                    actor_name = db.get_user(p["user_id"])["name"]
+                    await feed_operation(context, op_id, actor_name, "💰",
+                                         exclude_chat_id=p["chat_id"])
+                except Exception:
+                    log.exception("Инкассация №%s проведена, уведомления не дошли", op_id)
                     try:
-                        await context.bot.send_message(
-                            p["chat_id"],
-                            f"✅ Админ принял выручку {money(p['amount'])} (операция №{op_id}).\n"
-                            f"В вашей кассе осталось: {money(remaining)}", parse_mode="HTML")
+                        await q.edit_message_text(
+                            f"✅ Сдача выручки ПРОВЕДЕНА (операция №{op_id}), "
+                            f"повторно проводить НЕ нужно. Детали: /op {op_id}")
                     except Exception:
-                        log.warning("Не удалось уведомить заявителя")
-                actor_name = db.get_user(p["user_id"])["name"]
-                await feed_operation(context, op_id, actor_name, "💰",
-                                     exclude_chat_id=p["chat_id"])
+                        pass
             elif p["kind"] == "return":
                 # Срок годности возврата обязателен (решение владельца
                 # 03.08.2026): позиции без срока — вопрос текстом, потом
@@ -4455,26 +4530,37 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                    q.message.chat.id, q.from_user.id)
             elif p["kind"] == "inventory":
                 op_id, summary = commit_inventory(p)
-                if op_id is None:
-                    await q.edit_message_text("✅ Расхождений уже нет — корректировка не нужна.")
-                else:
-                    await q.edit_message_text(
-                        f"✅ {esc(summary)} — проведено (операция №{op_id}).", parse_mode="HTML")
-                    if p.get("approver_id"):
-                        try:
-                            await context.bot.send_message(
-                                p["chat_id"],
-                                f"✅ Админ подтвердил вашу инвентаризацию "
-                                f"(операция №{op_id}). Остатки скорректированы.",
-                                parse_mode="HTML")
-                        except Exception:
-                            log.warning("Не удалось уведомить заявителя")
+                # Корректировка УЖЕ в базе — сбой Telegram не должен
+                # выглядеть как «не проведено» (ревизия 14.08.2026).
+                try:
+                    if op_id is None:
+                        await q.edit_message_text("✅ Расхождений уже нет — корректировка не нужна.")
                     else:
-                        await notify_admin(context, actor, summary)
-                    actor_name = db.get_user(p["user_id"])["name"]
-                    note = "Подтвердил админ" if p.get("approver_id") else ""
-                    await feed_operation(context, op_id, actor_name, "📋", note,
-                                         exclude_chat_id=p["chat_id"])
+                        await q.edit_message_text(
+                            f"✅ {esc(summary)} — проведено (операция №{op_id}).", parse_mode="HTML")
+                        if p.get("approver_id"):
+                            try:
+                                await context.bot.send_message(
+                                    p["chat_id"],
+                                    f"✅ Админ подтвердил вашу инвентаризацию "
+                                    f"(операция №{op_id}). Остатки скорректированы.",
+                                    parse_mode="HTML")
+                            except Exception:
+                                log.warning("Не удалось уведомить заявителя")
+                        else:
+                            await notify_admin(context, actor, summary)
+                        actor_name = db.get_user(p["user_id"])["name"]
+                        note = "Подтвердил админ" if p.get("approver_id") else ""
+                        await feed_operation(context, op_id, actor_name, "📋", note,
+                                             exclude_chat_id=p["chat_id"])
+                except Exception:
+                    log.exception("Инвентаризация №%s проведена, уведомления не дошли", op_id)
+                    try:
+                        await q.edit_message_text(
+                            f"✅ Инвентаризация ПРОВЕДЕНА (операция №{op_id}), "
+                            f"повторно проводить НЕ нужно. Детали: /op {op_id}")
+                    except Exception:
+                        pass
             elif p["kind"] == "set_price":
                 c = db.client_get(p["client_id"])
                 for it in p["items"]:
@@ -4562,18 +4648,31 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Стартовая загрузка остатков склада {p['wh_name']}: "
                     f"{len(deltas)} поз., {total} шт",
                     deltas, [], {"load": p["wh_name"]}, batch_plan=plan)
-                # Старый справочник «один срок на товар» — ближайший срок.
-                for (wh_, pid), rows_ in plan.items():
-                    dated = sorted((e for e, _q in rows_ if e),
-                                   key=lambda e: e[3:] + e[:2])
-                    if dated:
-                        db.set_product_expiry(wh_, pid, dated[0])
-                await q.edit_message_text(
-                    f"✅ Остатки склада «{esc(p['wh_name'])}» загружены "
-                    f"(операция №{op_id}): {len(deltas)} позиций, {total} шт "
-                    f"({sum(len(r) for r in plan.values())} партий).\n"
-                    f"Сроки годности — /expiry {esc(p['wh_name'])}.\n"
-                    f"Проверьте: /stock {esc(p['wh_name'])}.", parse_mode="HTML")
+                # Загрузка УЖЕ в базе — сбой Telegram дальше не должен
+                # выглядеть как «не проведено»: повторный /loadwh задвоил бы
+                # весь склад (ревизия 14.08.2026).
+                try:
+                    # Старый справочник «один срок на товар» — ближайший срок.
+                    for (wh_, pid), rows_ in plan.items():
+                        dated = sorted((e for e, _q in rows_ if e),
+                                       key=lambda e: e[3:] + e[:2])
+                        if dated:
+                            db.set_product_expiry(wh_, pid, dated[0])
+                    await q.edit_message_text(
+                        f"✅ Остатки склада «{esc(p['wh_name'])}» загружены "
+                        f"(операция №{op_id}): {len(deltas)} позиций, {total} шт "
+                        f"({sum(len(r) for r in plan.values())} партий).\n"
+                        f"Сроки годности — /expiry {esc(p['wh_name'])}.\n"
+                        f"Проверьте: /stock {esc(p['wh_name'])}.", parse_mode="HTML")
+                except Exception:
+                    log.exception("Загрузка №%s проведена, уведомление не дошло", op_id)
+                    try:
+                        await q.edit_message_text(
+                            f"✅ Остатки ЗАГРУЖЕНЫ (операция №{op_id}), повторно "
+                            f"/loadwh НЕ нужно. Проверьте: /stock {esc(p['wh_name'])}.",
+                            parse_mode="HTML")
+                    except Exception:
+                        pass
             elif p["kind"] == "reset_wh":
                 # Первая кнопка — не стираем, а показываем ВТОРОЕ подтверждение
                 # с отдельной кнопкой (защита от «одним нажатием», просьба
@@ -5455,9 +5554,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"Ваш склад: <b>{esc(own['name']) if own else '—'}</b>",
         "",
     ]
-    if transition_blocked(actor):
+    if not is_admin(actor) and not any(
+            w["full_mode"] for w in db.operable_warehouses(actor)):
         lines += [
-            "⏳ <b>Сейчас переходный период</b> — накладные выдаются черновиками.",
+            "⏳ <b>Ваш склад пока на черновиках</b> — накладные выдаются черновиками.",
             "Просто напишите как обычно:",
             "<i>Асан, Албенивер 200мл 1к, долг 31470</i>",
             "Придёт PDF-накладная для клиента, база не меняется.",
@@ -6692,6 +6792,10 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    # Карточка с долгом и телефоном — только личка (ревизия 14.08.2026:
+    # /client в группе показал бы долг клиента всем участникам чата).
+    if not await _require_private(update):
+        return
     c, wh = await resolve_client_arg(update, actor, context.args,
                                      "Использование: /client Имя\nПример: /client Асан")
     if c is None:
@@ -6759,6 +6863,9 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def act_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
+        return
+    # Акт сверки с историей долга — только личка (ревизия 14.08.2026).
+    if not await _require_private(update):
         return
     c, wh = await resolve_client_arg(update, actor, context.args,
                                      "Использование: /act Имя\nПример: /act Асан")
@@ -7179,8 +7286,12 @@ def _parse_sales_query(text: str):
         if rest and len(pids) > 1:
             for vcut in (min(2, len(rest)), 1):
                 vq = _pnorm(" ".join(rest[:vcut]))
+                # Число запроса сверяется с числом фасовки целиком:
+                # «50» — это 50 мл, а не кусок «500 мл» (ревизия 14.08.2026).
                 sub = [pid for pid in pids
-                       if vq and vq in _pnorm(prices.BY_ID[pid]["volume"])]
+                       if vq and re.search(
+                           r"(?<![0-9])" + re.escape(vq) + r"(?![0-9])",
+                           _pnorm(prices.BY_ID[pid]["volume"]))]
                 if sub and len(sub) < len(pids):
                     pids, rest = sub, rest[vcut:]
                     if len(sub) == 1:
@@ -7203,7 +7314,8 @@ def _parse_sales_query(text: str):
     return None, None, None, cands
 
 
-def sales_history_report(whs, label, pids, cli_ids=None, cli_label=None):
+def sales_history_report(whs, label, pids, cli_ids=None, cli_label=None,
+                         draft_user_id=None):
     """PDF истории продаж препарата по журналу: секция на фасовку, новые
     сверху; черновики (не учёт) — отдельной секцией. None — данных нет.
     Возвращает (pdf, подпись-итог)."""
@@ -7256,6 +7368,11 @@ def sales_history_report(whs, label, pids, cli_ids=None, cli_label=None):
             for pr in (prices.BY_ID[pid] for pid in pids if pid in prices.BY_ID)]
     draft_rows, draft_qty, draft_sum = [], 0.0, 0.0
     for r in db.draft_items_all():
+        # Черновики в draft_log не привязаны к складу, поэтому не-админ
+        # видит только СВОИ (ревизия 14.08.2026: иначе Данияру показывались
+        # черновики админа по Бишкеку с именами клиентов и суммами).
+        if draft_user_id is not None and r["user_id"] != draft_user_id:
+            continue
         if cli_label:
             a, b = _pnorm(r["client"]), _pnorm(cli_label)
             if a != b and b not in a and a not in b:
@@ -7355,7 +7472,9 @@ async def sales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 + ", ".join(sorted(names)[:5]))
             return
         cli_ids, cli_label = set(matches), next(iter(names))
-    report = sales_history_report(whs, label, pids, cli_ids, cli_label)
+    report = sales_history_report(
+        whs, label, pids, cli_ids, cli_label,
+        draft_user_id=None if is_admin(actor) else actor["id"])
     if report is None:
         await update.message.reply_text(
             f"По препарату «{label}»"
@@ -8712,7 +8831,7 @@ async def fullmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not args:
         lines = ["🏭 <b>Режимы складов:</b>"]
         for w in db.all_warehouses():
-            mode = "🟢 полный учёт" if w["full_mode"] else "📝 черновики (переходный)"
+            mode = "🟢 полный учёт" if w["full_mode"] else "📝 черновики"
             lines.append(f"• {esc(w['name'])} — {mode}")
         lines.append("")
         lines.append("Включить: /fullmode Каракол · выключить: /fullmode выкл Каракол")
@@ -8726,7 +8845,8 @@ async def fullmode_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.set_warehouse_full(wh["id"], not turn_off)
     if turn_off:
         await update.message.reply_text(
-            f"📝 Склад «{esc(wh['name'])}» вернулся в переходный режим (черновики).",
+            f"📝 Склад «{esc(wh['name'])}» переведён в режим черновиков: накладные\n"
+            f"выдаются черновиками, операции сотрудников по нему закрыты.",
             parse_mode="HTML")
     else:
         await update.message.reply_text(
@@ -8834,6 +8954,17 @@ async def loadwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         exist_note = (f"⚠️ На складе уже есть остатки: {len(stock_sig)} поз., "
                       f"{fmt_num(existing)} шт — загрузка ДОБАВИТСЯ к ним, "
                       f"итог будет {fmt_num(existing + total)} шт.\n")
+    # Если этот склад уже загружали раньше — сказать прямо (ревизия
+    # 14.08.2026: повторная загрузка задвоила бы весь склад).
+    prev = db.connect().execute(
+        "SELECT id FROM operations WHERE status='done' AND "
+        "json_valid(data) AND json_extract(data, '$.load')=? "
+        "ORDER BY id DESC LIMIT 1", (wh["name"],)).fetchone()
+    if prev:
+        exist_note += (f"‼️ Этот склад УЖЕ загружался (операция №{prev['id']}). "
+                       f"Повторная загрузка ЗАДВОИТ остатки — проводите только "
+                       f"если это осознанное решение (обычно нужен /resetwh "
+                       f"и загрузка заново).\n")
     await update.message.reply_text(
         f"📦 <b>Стартовая загрузка остатков — склад «{esc(wh['name'])}»</b>\n\n"
         f"Позиций с остатком: <b>{len(pids)}</b>\n"

@@ -24,6 +24,14 @@ HEADER_FILL = PatternFill("solid", fgColor="1B5E20")
 HEADER_FONT = Font(bold=True, color="FFFFFF")
 
 
+def _txt(v):
+    """Строка, начинающаяся с «=», стала бы в Excel живой формулой —
+    экранируем апострофом (имя клиента может задать сотрудник)."""
+    if isinstance(v, str) and v.startswith("="):
+        return "'" + v
+    return v
+
+
 def _sheet_header(ws, headers, widths):
     ws.append(headers)
     for col, width in enumerate(widths, 1):
@@ -76,10 +84,10 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
             op["id"], dt, OP_TYPES.get(op["type"], op["type"]),
             user["name"] if user else op["user_id"],
             wh["name"] if wh else "",
-            client["name"] if client else "",
+            _txt(client["name"]) if client else "",
             total, payment,
             "проведена" if op["status"] == "done" else "отменена",
-            op["summary"],
+            _txt(op["summary"]),
         ])
 
     # --- Долги ---
@@ -89,7 +97,7 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
     for wh in db.all_warehouses():
         for c in db.clients_of(wh["id"]):
             if c["debt"]:
-                ws.append([wh["name"], c["name"], c["debt"]])
+                ws.append([wh["name"], _txt(c["name"]), c["debt"]])
                 total_debt += c["debt"]
     ws.append([])
     ws.append(["", "ИТОГО", total_debt])
