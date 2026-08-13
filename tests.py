@@ -806,6 +806,18 @@ def test_log_filters():
     assert bot.LOG_TYPE_FILTERS["накладные"] == "invoice"
     assert bot.LOG_TYPE_FILTERS["возврат"] == "return"
     assert bot.LOG_TYPE_FILTERS["приходы"] == "payment"
+    # фильтр по складу (/log Бишкек 30): видит операции склада, включая
+    # перемещение, где склад — вторая сторона
+    wh2 = db.warehouse_by_name("Манас")
+    db.commit_operation(ADMIN, "transfer", wh["id"], None, "перемещение",
+                        [(wh["id"], 16, -3), (wh2["id"], 16, 3)], [], {})
+    ops_wh2 = db.recent_operations(50, wh_id=wh2["id"])
+    assert len(ops_wh2) == 1 and ops_wh2[0]["type"] == "transfer"
+    ops_wh1 = db.recent_operations(50, wh_id=wh["id"])
+    assert {o["type"] for o in ops_wh1} >= {"invoice", "payment", "transfer",
+                                            "inventory"}
+    assert all(o["id"] != ops_wh2[0]["id"] or o["type"] == "transfer"
+               for o in ops_wh1)
 
 
 def test_summary_debt_suffix():
