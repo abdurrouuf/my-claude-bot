@@ -8500,7 +8500,20 @@ async def loadwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     /loadwh Склад; /loadkarakol — то же для Каракола (старое имя)."""
     if await _require_admin(update) is None:
         return
-    name = " ".join(context.args or []).strip() or "Каракол"
+    name = " ".join(context.args or []).strip()
+    if not name:
+        # Голый /loadwh раньше молча подставлял Каракол (наследие
+        # /loadkarakol) — владелец 13.08.2026 так чуть не загрузил не тот
+        # склад. Теперь без имени — подсказка; старая команда работает.
+        cmd = (update.message.text or "").split()[0].lower() if update.message else ""
+        if "loadkarakol" in cmd:
+            name = "Каракол"
+        else:
+            avail = ", ".join(k.title() for k in STOCK_LOADS)
+            await update.message.reply_text(
+                "Укажите склад: /loadwh Бишкек\n"
+                f"Подготовленные таблицы есть для: {avail}.")
+            return
     wh = db.warehouse_by_name(name)
     if wh is None:
         await update.message.reply_text(f"Склад «{esc(name)}» не найден.",
