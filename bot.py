@@ -4487,12 +4487,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if data is None:
                     await q.edit_message_text("⚠️ Таблица загрузки не найдена.")
                     return
-                # Перепроверка на кнопке: две заявки подряд задвоили бы остатки
-                nonzero_now = sum(1 for q_ in db.stock_map(p["wh_id"]).values() if q_)
-                if nonzero_now:
+                # Перепроверка на кнопке: остатки должны быть ТЕМИ ЖЕ, что в
+                # момент заявки (снимок stock_sig) — иначе прошла другая
+                # загрузка/операция, и проведение задвоило бы товар.
+                sig_now = sorted([pid, q_] for pid, q_
+                                 in db.stock_map(p["wh_id"]).items() if q_)
+                if sig_now != [list(x) for x in (p.get("stock_sig") or [])]:
                     await q.edit_message_text(
-                        f"⚠️ На складе уже есть остатки ({nonzero_now} позиций) — "
-                        "повторная загрузка отменена, ничего не изменено.")
+                        "⚠️ Остатки склада изменились, пока заявка ждала "
+                        "кнопки, — загрузка отменена, ничего не изменено. "
+                        "Отправьте /loadwh заново.")
                     return
                 # Строки одного товара = партии: складываем в общую дельту,
                 # а раскладку по срокам передаём планом партий.
@@ -8545,13 +8549,13 @@ async def loadwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "остатков. Пришлите Джарвису таблицу (товар, количество, срок "
             "годности) — он зашьёт её в загрузчик.", parse_mode="HTML")
         return
-    nonzero_now = sum(1 for q in db.stock_map(wh["id"]).values() if q)
-    if nonzero_now:
-        await update.message.reply_text(
-            f"⚠️ На складе «{esc(wh['name'])}» уже есть остатки ({nonzero_now} "
-            "позиций) — повторная загрузка задвоит их. Если нужно начать "
-            "заново — /resetwh, либо напишите Джарвису.", parse_mode="HTML")
-        return
+    # Снимок текущих остатков: если на складе что-то лежит, загрузка НЕ
+    # блокируется (случай Бишкека 13.08.2026 — товар перемещения №52 уже в
+    # базе, а его количества вычтены из таблицы), но админ видит
+    # предупреждение, а кнопка сверяет снимок — повторная загрузка или
+    # параллельная операция отменяют заявку, задвоение невозможно.
+    stock_sig = sorted([pid, q] for pid, q in db.stock_map(wh["id"]).items() if q)
+    existing = sum(q for _, q in stock_sig)
     # Один товар может идти несколькими строками — это разные ПАРТИИ
     # (свой срок у каждой).
     items = [(pid, qty, exp) for pid, qty, exp in data if qty > 0]
@@ -8559,19 +8563,25 @@ async def loadwh_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     total = sum(q for _, q, _ in items)
     payload = {"kind": "load_wh", "user_id": update.effective_user.id,
                "chat_id": update.effective_chat.id, "wh_id": wh["id"],
-               "wh_name": wh["name"]}
+               "wh_name": wh["name"], "stock_sig": stock_sig}
     token = new_pending(payload)
     batch_note = ""
     if len(items) > len(pids):
         batch_note = (f"Партий: <b>{len(items)}</b> — у "
                       f"{len(items) - len(pids)} товаров два срока годности.\n")
+    exist_note = ""
+    if stock_sig:
+        exist_note = (f"⚠️ На складе уже есть остатки: {len(stock_sig)} поз., "
+                      f"{fmt_num(existing)} шт — загрузка ДОБАВИТСЯ к ним, "
+                      f"итог будет {fmt_num(existing + total)} шт.\n")
     await update.message.reply_text(
         f"📦 <b>Стартовая загрузка остатков — склад «{esc(wh['name'])}»</b>\n\n"
         f"Позиций с остатком: <b>{len(pids)}</b>\n"
         f"{batch_note}"
         f"Всего: <b>{total} шт</b>\n"
         f"Сроки годности будут сохранены "
-        f"({sum(1 for _, q, e in data if q and e)} партий).\n\n"
+        f"({sum(1 for _, q, e in data if q and e)} партий).\n"
+        f"{exist_note}\n"
         f"Данные — {esc(source)}. Провести?",
         parse_mode="HTML", reply_markup=confirm_kb(token))
 
