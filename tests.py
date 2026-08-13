@@ -939,6 +939,32 @@ def test_hidden_debts():
     assert bot.debt_whs_for(daniyar, db.visible_warehouses(daniyar)) != []
 
 
+def test_showdebt_exceptions():
+    """/showdebt: открытый клиент скрытого склада виден сотруднику в
+    отчёте о долгах, остальные — нет; закрытие убирает исключение."""
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], [("Скрытый", 5000), ("Открытый", 7000)])
+    daniyar = db.get_user(DANIYAR)
+    db.set_setting("hidden_debt_whs", json.dumps([wh["id"]]))
+    # Без исключений скрытый склад выпадает целиком
+    assert bot.debt_report_whs(daniyar, [wh]) == []
+    c_open = db.client_exact(wh["id"], "Открытый")
+    db.set_setting("open_debt_clients", json.dumps([c_open["id"]]))
+    assert bot.open_debt_client_ids() == {c_open["id"]}
+    # Со /showdebt склад возвращается в отчёт (сотрудник увидит только
+    # открытого — фильтр в _debts_report/clients_cmd по open_ids)
+    assert [w["id"] for w in bot.debt_report_whs(daniyar, [wh])] == [wh["id"]]
+    visible = [c["id"] for c in db.clients_of(wh["id"])
+               if c["id"] in bot.open_debt_client_ids()]
+    assert visible == [c_open["id"]]
+    # Админ видит всё без фильтров
+    admin = db.get_user(ADMIN)
+    assert bot.debt_report_whs(admin, [wh]) == [wh]
+    db.set_setting("open_debt_clients", json.dumps([]))
+    assert bot.debt_report_whs(daniyar, [wh]) == []
+    db.set_setting("hidden_debt_whs", json.dumps([]))
+
+
 def test_bishkek_load_data():
     """Таблица загрузки Бишкека: 104 товара, 124 партии, 157'577 шт;
     вместе с товаром перемещения №52 (45+33, уже в базе) — ровно
