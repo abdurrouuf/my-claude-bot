@@ -1293,6 +1293,19 @@ def test_client_name_expansion_incident():
     assert names.index("Нурлан") < names.index("Уникум Ош")
 
 
+def test_invoice_pdf_overpayment_and_ttl():
+    # Переплата клиента видна в PDF накладной (вопрос владельца 14.08.2026)
+    from invoice_pdf import generate_pdf_invoice
+    it = {"name": "ТЕСТ", "volume": "50 мл", "qty": 2, "price": 100,
+          "box_qty": None}
+    for prev, pay in ((-2640, 0), (-2640, 100), (500, 0)):
+        pdf = generate_pdf_invoice("Тест", [it], 200, prev_debt=prev,
+                                   payment=pay, is_payment=pay > 0)
+        assert pdf.getvalue()[:4] == b"%PDF"
+    # заявки живут сутки («чтобы в любой момент можно было провести»)
+    assert bot.PENDING_TTL == 24 * 60 * 60
+
+
 def test_admin_only_invoices():
     # /invadmin: накладная сотрудника по складу уходит админу на
     # подтверждение и без него не проводится (решение владельца 14.08.2026)

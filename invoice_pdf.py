@@ -561,9 +561,17 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
         remainder = total_debt - payment
         if prev_debt > 0:
             story.append(Paragraph(f"Старый долг: <b>{fmt_num(prev_debt)} сом</b>", total_style))
+        elif prev_debt < 0:
+            # Переплата клиента зачитывается (вопрос владельца 14.08.2026:
+            # «почему не видно, что у него переплата?»)
+            story.append(Paragraph(f"Переплата клиента: <b>{fmt_num(-prev_debt)} сом</b> "
+                                   f"(зачтена)", total_style))
         story.append(Paragraph(f"Итого долг: <b>{fmt_num(total_debt)} сом</b>", total_style))
         story.append(Paragraph(f"Приход: <b>{fmt_num(payment)} сом</b>", total_style))
-        if remainder <= 0:
+        if remainder < 0:
+            story.append(Paragraph(f"Долг полностью погашен! Переплата: "
+                                   f"<b>{fmt_num(-remainder)} сом</b>", total_style))
+        elif remainder == 0:
             story.append(Paragraph("Долг полностью погашен!", total_style))
         else:
             story.append(Paragraph(f"Остаток долга: <b>{fmt_num(remainder)} сом</b>", total_style))
@@ -571,6 +579,18 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
         grand_total = invoice_total + prev_debt
         story.append(Paragraph(f"Остаток долга: <b>{fmt_num(prev_debt)} сом</b>", total_style))
         story.append(Paragraph(f"Общий итоговый долг: <b>{fmt_num(grand_total)} сом</b>", total_style))
+    elif prev_debt < 0:
+        after = invoice_total + prev_debt
+        story.append(Paragraph(f"Переплата клиента: <b>{fmt_num(-prev_debt)} сом</b> "
+                               f"(зачтена)", total_style))
+        if after > 0:
+            story.append(Paragraph(f"Долг с учётом переплаты: <b>{fmt_num(after)} сом</b>",
+                                   total_style))
+        elif after < 0:
+            story.append(Paragraph(f"Остаток переплаты: <b>{fmt_num(-after)} сом</b>",
+                                   total_style))
+        else:
+            story.append(Paragraph("Переплата полностью зачтена.", total_style))
 
     story.append(Spacer(1, 2*mm))
     story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))
