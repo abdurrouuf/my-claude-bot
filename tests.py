@@ -1273,6 +1273,26 @@ def test_draft_mode_is_per_warehouse():
     asyncio.run(run())
 
 
+def test_client_name_expansion_incident():
+    # Инцидент 14.08.2026: ИИ развернул «Нурлан» в черновичное «Нурлан
+    # байке ит базар», которого нет в справочнике, а кнопки не предложили
+    # очевидного «Нурлана».
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], ["Нурлан", "Мурат байке ит базар"])
+    # кнопки: клиент, чьё имя целиком входит в запрошенное, — первым
+    cands = db.fuzzy_clients(wh["id"], "Нурлан байке ит базар")
+    assert any(c["name"] == "Нурлан" for c in cands), cands
+    # подсказки ИИ: справочник первым, черновичное имя-расширение скрыто,
+    # уникальные черновичные имена остаются дополнением
+    db.log_draft(ADMIN, "Нурлан байке ит базар", 1000, None)
+    db.log_draft(ADMIN, "Уникум Ош", 500, None)
+    names = db.known_client_names()
+    assert "Нурлан" in names
+    assert "Нурлан байке ит базар" not in names
+    assert "Уникум Ош" in names
+    assert names.index("Нурлан") < names.index("Уникум Ош")
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

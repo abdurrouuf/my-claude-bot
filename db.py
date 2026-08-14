@@ -663,18 +663,13 @@ def expiry_list(wh_id: int):
 def known_client_names(limit: int = 40, wh_ids: list = None):
     """Имена клиентов для подсказок. wh_ids — только клиенты этих складов
     (сотруднику в промпт не даём имена чужих складов); None — вся база.
-    Сначала часто используемые (из журнала черновиков — только без фильтра
-    складов), потом справочник — чтобы импорт не вытеснил ходовые имена."""
+    СПРАВОЧНИК — первым (с 14.08.2026): все склады загружены, справочник —
+    источник истины; старые имена из черновиков идут дополнением в конце
+    (раньше было наоборот, и ИИ разворачивал «Нурлан» в черновичное
+    «Нурлан байке ит базар», которого нет в справочнике)."""
     conn = connect()
     seen, out = set(), []
     if wh_ids is None:
-        for r in conn.execute(
-                "SELECT client, COUNT(*) AS n FROM draft_log "
-                "GROUP BY client COLLATE NOCASEU ORDER BY n DESC, MAX(id) DESC"):
-            k = r["client"].lower()
-            if k not in seen:
-                seen.add(k)
-                out.append(r["client"])
         clients_sql = "SELECT name FROM clients ORDER BY name"
         alias_sql = "SELECT alias FROM client_aliases ORDER BY alias"
         params = ()
@@ -699,6 +694,21 @@ def known_client_names(limit: int = 40, wh_ids: list = None):
         if k not in seen:
             seen.add(k)
             out.append(r["alias"])
+    if wh_ids is None and len(out) < limit:
+        # Дополнение: ходовые имена из черновиков, которых нет в справочнике
+        # (речевые варианты) — в конец, чтобы не спорили со справочником.
+        # Черновичное имя, содержащее имя справочника целиком («Нурлан байке
+        # ит базар» ⊃ «Нурлан»), пропускаем: ИИ разворачивал короткое имя
+        # в несуществующее длинное (инцидент 14.08.2026).
+        known_words = [set(k.split()) for k in seen]
+        for r in conn.execute(
+                "SELECT client, COUNT(*) AS n FROM draft_log "
+                "GROUP BY client COLLATE NOCASEU ORDER BY n DESC, MAX(id) DESC"):
+            k = r["client"].lower()
+            kw = set(k.split())
+            if k not in seen and not any(w and w < kw for w in known_words):
+                seen.add(k)
+                out.append(r["client"])
     return out[:limit]
 
 
@@ -1344,8 +1354,15 @@ def fuzzy_clients(wh_id: int, name: str, n: int = 3):
     qkey = _name_key(query)
     perm = [k for k in mapping if k not in matches and
             difflib.SequenceMatcher(None, qkey, _name_key(k)).ratio() >= 0.85]
+    # Имя клиента целиком входит в запрос словами («Нурлан» ⊂ «Нурлан байке
+    # ит базар») — difflib такое недооценивает (0.46), а случай реальный:
+    # ИИ разворачивает короткое имя по старым черновикам, в справочнике —
+    # короткое (инцидент 14.08.2026, Бишкек). Показываем первыми.
+    qwords = set(query.split())
+    contained = [k for k in mapping if k not in matches and k not in perm and
+                 set(k.split()) <= qwords]
     out, seen = [], set()
-    for m in perm + matches:
+    for m in contained + perm + matches:
         r = mapping[m]
         if r["id"] not in seen:
             seen.add(r["id"])
