@@ -591,7 +591,7 @@ def _build_static_system() -> str:
                  '«с Бишкека на Каракол: ...», «нужно на Каракол: ...»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "transfer", "from_warehouse": null_или_имя_склада, "to_warehouse": "имя склада", '
                  '"items": [{"name": "...", "volume": "...", "qty": штук, "box_qty": коробок_или_null, '
-                 '"price": цена, "expiry": null_или_срок}]}')
+                 '"price": цена, "expiry": null_или_срок, "lot": null_или_номер_серии}]}')
     parts.append('- Если назван сотрудник — подставь имя склада этого сотрудника в to_warehouse '
                  '(список сотрудников и складов — в блоке ниже).')
     parts.append('- "from_warehouse" заполняй только при явном перемещении «с X на Y»; '
@@ -599,6 +599,8 @@ def _build_static_system() -> str:
     parts.append('- "expiry": срок годности, если указан рядом с товаром («срок 11.2028», '
                  '«11/28», «до 12.27») — строкой в формате "MM.YYYY" (месяц двумя цифрами, '
                  'год четырьмя); не указан — null.')
+    parts.append('- "lot": номер серии/партии завода, если назван рядом с товаром '
+                 '(«партия 2606912», «серия A123») — строкой как есть; не назван — null.')
     parts.append("ВАЖНО: не путай накладную с приходом. Выбирай transfer ТОЛЬКО если есть "
                  "явные слова прихода («приход», «привезли», «пополнение», «на склад X: ...» "
                  "в начале), перемещения («с X на Y»), или первое слово — точное имя "
@@ -2659,6 +2661,10 @@ async def start_transfer(update, context, actor, data):
             exp = _norm_expiry(raw["expiry"])
             if exp:
                 it["expiry"] = exp
+        # Номер серии/партии завода («партия 2606912») — справочник для
+        # /expiry и документов (шаг 1 учёта серий, 14.08.2026)
+        if isinstance(raw, dict) and raw.get("lot"):
+            it["lot"] = str(raw["lot"]).strip()[:40]
     matched = [it for it in items if it.get("product_id")]
     if not matched:
         await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу — приход не создан.")
@@ -4096,6 +4102,13 @@ async def _finish_transfer(q, context, actor, p):
                     "\nЕсли это неверно — отмените: /undo")
     _fill_src_batches(p)
     op_id, summary = commit_transfer(p)
+    if not p.get("from_wh_id"):
+        # Приход извне: заводские серии позиций — в справочник серий
+        # (не учёт, только сведения для /expiry и документов).
+        for it in p["items"]:
+            if it.get("product_id") and it.get("lot"):
+                db.lot_add(it["product_id"], it.get("expiry") or "",
+                           it["lot"], note=f"приход №{op_id}")
     # Операция уже в базе — сбои уведомлений не должны выглядеть как
     # «не проведено» (см. _finish_invoice).
     try:
@@ -9102,6 +9115,35 @@ STOCK_LOADS = {
 }
 
 
+async def load_f260403_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/loadf260403 (админ, одноразовая): приход поставки F260403 из
+    зашитой таблицы (31 позиция, 113'400 шт, срок 06.2029, серии завода).
+    Идёт обычным «приходом извне»: карточка подтверждения, партии,
+    PDF в ленту — как будто владелец написал сообщение с 31 позицией."""
+    actor = await _require_admin(update)
+    if actor is None:
+        return
+    import f260403_arrival_data as f2
+    items = []
+    for pid, qty, lot in f2.ARRIVAL:
+        pr = prices.BY_ID.get(pid)
+        if pr is None:
+            await update.message.reply_text(
+                f"⚠️ Товар №{pid} не найден в прайсе — приход не создан.")
+            return
+        items.append({"name": pr["name"], "volume": pr["volume"], "qty": qty,
+                      "box_qty": None, "price": pr["price"],
+                      "expiry": f2.EXPIRY, "lot": lot})
+    total = sum(q for _, q, _ in f2.ARRIVAL)
+    await update.message.reply_text(
+        f"📦 Поставка {f2.CONTRACT}: {len(items)} позиций, {fmt_num(total)} шт, "
+        f"срок {f2.EXPIRY}, серии завода будут записаны в справочник. "
+        f"Сейчас покажу карточку прихода — проверьте и нажмите «Провести».")
+    data = {"action": "transfer", "from_warehouse": None,
+            "to_warehouse": f2.WAREHOUSE, "items": items}
+    await start_transfer(update, context, actor, data)
+
+
 def _stock_load_data(wh_name: str):
     entry = STOCK_LOADS.get(wh_name.lower())
     if entry is None:
@@ -9377,6 +9419,7 @@ async def expiry_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def _expiry_report(update, whs):
     now = datetime.now(BISHKEK)
     soon = now + timedelta(days=92)
+    lots = db.lots_map()   # заводские серии: (товар, срок) -> «2606912»
     sections, summary = [], []
     for wh in whs:
         rows_db = [r for r in db.expiry_list(wh["id"]) if r["qty"] > 0]
@@ -9409,13 +9452,20 @@ async def _expiry_report(update, whs):
             else:
                 status = ""
             if len(batches) == 1:
-                exp_cell = batches[0][0]
+                e0 = batches[0][0]
+                lot = lots.get((pid, e0))
+                # Заводская серия партии — своей строкой под сроком
+                exp_cell = [e0, f"серия {lot}"] if lot else e0
             else:
                 # Каждая партия — своей строкой ячейки (список = многострочный
                 # текст в generate_report_pdf): «11.2027 — 1329 шт» переносом
                 # посреди числа читалось плохо (просьба владельца 14.08.2026).
-                exp_cell = [f"{e or 'без срока'} — {q_} шт"
-                            for e, q_ in batches]
+                exp_cell = []
+                for e, q_ in batches:
+                    exp_cell.append(f"{e or 'без срока'} — {q_} шт")
+                    lot = lots.get((pid, e))
+                    if lot:
+                        exp_cell.append(f"серия {lot}")
             total_qty = sum(q_ for _, q_ in batches)
             rows.append([exp_cell, label, volume, f"{total_qty} шт", status])
         sections.append(
@@ -9697,6 +9747,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("fullmode", fullmode_cmd))
     app.add_handler(CommandHandler("loadwh", loadwh_cmd))
     app.add_handler(CommandHandler("loadkarakol", loadwh_cmd))
+    app.add_handler(CommandHandler("loadf260403", load_f260403_cmd))
     app.add_handler(CommandHandler("resetwh", resetwh_cmd))
     app.add_handler(CommandHandler("expiry", expiry_cmd))
     app.add_handler(CommandHandler("cert", cert_cmd))
