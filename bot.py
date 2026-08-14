@@ -4291,7 +4291,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shim = SimpleNamespace(message=q.message,
                                effective_chat=q.message.chat,
                                effective_user=q.from_user)
-        await _forecast_report(shim, whs)
+        await _forecast_report(shim, whs, p.get("horizon"))
         return
 
     if kind == "pdbt":  # выбран склад для отчёта о долгах
@@ -7001,14 +7001,18 @@ def build_deadstock(warehouses, days: int) -> str:
 
 
 FORECAST_WINDOW = 14   # скорость продаж считаем за 2 недели
-FORECAST_HORIZON = 14  # показываем то, чего хватит менее чем на 2 недели
+# Показываем то, чего хватит менее чем на месяц (было 14 — владелец
+# 14.08.2026 попросил «побольше препаратов»; закупки едут долго).
+# Свой горизонт — числом в команде: /forecast 60, /forecast Манас 60.
+FORECAST_HORIZON = 30
 
 
-def build_forecast_report(warehouses):
+def build_forecast_report(warehouses, horizon=None):
     """Прогноз «скоро закончится» PDF-файлом в фирменном стиле (14.08.2026,
     «что за беспорядок?» владельца про текстовую простыню): секция на склад,
     отсортировано по срочности. None — ничего не заканчивается.
     Возвращает (pdf, подпись-итог)."""
+    horizon = horizon or FORECAST_HORIZON
     sold_all = sales_by_warehouse(FORECAST_WINDOW)
     sections, summary = [], []
     for wh in warehouses:
@@ -7023,7 +7027,7 @@ def build_forecast_report(warehouses):
             if p is None or qty < 0:
                 continue
             days_left = qty / (sold_qty / FORECAST_WINDOW)
-            if days_left <= FORECAST_HORIZON:
+            if days_left <= horizon:
                 rows.append((days_left, p, qty, sold_qty))
         if not rows:
             continue
@@ -7051,11 +7055,13 @@ def build_forecast_report(warehouses):
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
     pdf = generate_report_pdf(
         "СКОРО ЗАКОНЧИТСЯ",
-        f"ОсОО «ВЕТОП» · прогноз по продажам последних {FORECAST_WINDOW} дней"
-        f" · на {date_str}", sections)
-    return pdf, ("⏳ Скоро закончится (по продажам последних "
+        f"ОсОО «ВЕТОП» · чего хватит менее чем на {horizon} дн. "
+        f"(по продажам последних {FORECAST_WINDOW} дней) · на {date_str}",
+        sections)
+    return pdf, (f"⏳ Скоро закончится (≤{horizon} дн., по продажам последних "
                  f"{FORECAST_WINDOW} дн.):\n" + "\n".join(summary)
-                 + "\nПополнить: перемещение или приход товара.")
+                 + "\nДругой горизонт: /forecast 60. Пополнить: перемещение "
+                 "или приход товара.")
 
 
 async def deadstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7094,7 +7100,14 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     whs_group, in_group = await _group_only_feed_whs(update, actor)
     if in_group and not whs_group:
         return
-    arg = " ".join(context.args).strip() if context.args else ""
+    # Число в аргументах — горизонт в днях: /forecast 60, /forecast Манас 60
+    horizon, wh_words = None, []
+    for w in (context.args or []):
+        if w.isdigit():
+            horizon = max(1, min(365, int(w)))
+        else:
+            wh_words.append(w)
+    arg = " ".join(wh_words).strip()
     if in_group:
         whs = whs_group
     elif arg and arg.lower() != "all":
@@ -7113,7 +7126,8 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # (просьба владельца 14.08.2026, как /stock, /debts и /expiry).
             # «Все сразу» — кнопкой или /forecast all.
             payload = {"kind": "pick_forecast", "user_id": actor["id"],
-                       "chat_id": update.effective_chat.id}
+                       "chat_id": update.effective_chat.id,
+                       "horizon": horizon}
             token = new_pending(payload)
             kb = [[InlineKeyboardButton(f"⏳ {w['name']}",
                                         callback_data=f"pfc:{token}:{w['id']}")]
@@ -7124,15 +7138,15 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Прогноз какого склада показать?",
                                             reply_markup=InlineKeyboardMarkup(kb))
             return
-    await _forecast_report(update, whs)
+    await _forecast_report(update, whs, horizon)
 
 
-async def _forecast_report(update, whs):
-    report = build_forecast_report(whs)
+async def _forecast_report(update, whs, horizon=None):
+    report = build_forecast_report(whs, horizon)
     if report is None:
         await update.message.reply_text(
             f"✅ Ничего не заканчивается: всех продаваемых товаров хватит более чем на "
-            f"{FORECAST_HORIZON} дней.")
+            f"{horizon or FORECAST_HORIZON} дней.")
         return
     pdf, caption = report
     date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
