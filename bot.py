@@ -6971,11 +6971,13 @@ FORECAST_WINDOW = 14   # скорость продаж считаем за 2 н�
 FORECAST_HORIZON = 14  # показываем то, чего хватит менее чем на 2 недели
 
 
-def build_forecast(warehouses) -> str:
-    """Прогноз: чего хватит менее чем на FORECAST_HORIZON дней."""
+def build_forecast_report(warehouses):
+    """Прогноз «скоро закончится» PDF-файлом в фирменном стиле (14.08.2026,
+    «что за беспорядок?» владельца про текстовую простыню): секция на склад,
+    отсортировано по срочности. None — ничего не заканчивается.
+    Возвращает (pdf, подпись-итог)."""
     sold_all = sales_by_warehouse(FORECAST_WINDOW)
-    lines = [f"⏳ <b>Скоро закончится (при продажах последних {FORECAST_WINDOW} дней)</b>"]
-    found = False
+    sections, summary = [], []
     for wh in warehouses:
         sold = sold_all.get(wh["id"], {})
         if not sold:
@@ -6992,16 +6994,35 @@ def build_forecast(warehouses) -> str:
                 rows.append((days_left, p, qty, sold_qty))
         if not rows:
             continue
-        found = True
-        lines.append("")
-        lines.append(f"🏬 <b>Склад «{esc(wh['name'])}»</b>")
+        out, n_empty = [], 0
         for days_left, p, qty, sold_qty in sorted(rows, key=lambda r: r[0]):
-            when = "уже закончился!" if qty <= 0 else f"хватит на ≈{max(int(days_left), 0)} дн."
-            lines.append(f"• {esc(p['name'])} {esc(p['volume'])} — {qty} шт, {when} "
-                         f"(продано {sold_qty} шт за {FORECAST_WINDOW} дн.)")
-    if not found:
-        return ""
-    return "\n".join(lines)
+            label = p["name"].split("(")[0].strip()
+            if qty <= 0:
+                when = "ЗАКОНЧИЛСЯ"
+                n_empty += 1
+            else:
+                when = f"≈{max(int(days_left), 0)} дн."
+            out.append([label, p["volume"], f"{qty} шт",
+                        f"{fmt_num(sold_qty)} шт", when])
+        sections.append(
+            {"title": f"Склад «{wh['name']}»",
+             "headers": ["Товар", "Фасовка", "Остаток",
+                         f"Продано за {FORECAST_WINDOW} дн.", "Хватит на"],
+             "rows": out, "widths": [55, 24, 20, 34, 26], "numbered": True,
+             "footer": f"Позиций на исходе: {len(out)}"
+                       + (f" · уже закончилось: {n_empty}" if n_empty else "")})
+        summary.append(f"🏬 «{wh['name']}»: {len(out)} поз."
+                       + (f" · ‼️ закончилось: {n_empty}" if n_empty else ""))
+    if not sections:
+        return None
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "СКОРО ЗАКОНЧИТСЯ",
+        f"ОсОО «ВЕТОП» · прогноз по продажам последних {FORECAST_WINDOW} дней"
+        f" · на {date_str}", sections)
+    return pdf, ("⏳ Скоро закончится (по продажам последних "
+                 f"{FORECAST_WINDOW} дн.):\n" + "\n".join(summary)
+                 + "\nПополнить: перемещение или приход товара.")
 
 
 async def deadstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7045,13 +7066,17 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
-    text = build_forecast(whs)
-    if not text:
+    report = build_forecast_report(whs)
+    if report is None:
         await update.message.reply_text(
             f"✅ Ничего не заканчивается: всех продаваемых товаров хватит более чем на "
             f"{FORECAST_HORIZON} дней.")
         return
-    await send_long(update.message, text)
+    pdf, caption = report
+    date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"прогноз_{date_str}.pdf"),
+        caption=caption[:1000])
 
 
 async def monthly_deadstock_loop(app):

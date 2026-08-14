@@ -1293,6 +1293,24 @@ def test_client_name_expansion_incident():
     assert names.index("Нурлан") < names.index("Уникум Ош")
 
 
+def test_forecast_pdf():
+    # /forecast — PDF в фирменном стиле («что за беспорядок?» 14.08.2026)
+    wh = _fresh_db()
+    _load(wh, {16: 60, 28: 40})
+    _invoice(wh, ADMIN, "Тест", [_item(16, 60, 180)])   # закончился
+    c = db.client_exact(wh["id"], "Тест")
+    _invoice(wh, ADMIN, "Тест", [_item(28, 33, 440)],   # ~2 дня
+             client_id=c["id"])
+    report = bot.build_forecast_report([wh])
+    assert report is not None
+    pdf, cap = report
+    assert pdf.getvalue()[:4] == b"%PDF"
+    assert "закончилось: 1" in cap and "2 поз." in cap
+    # ничего не заканчивается — отчёта нет
+    wh2 = db.warehouse_by_name("Манас")
+    assert bot.build_forecast_report([wh2]) is None
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
