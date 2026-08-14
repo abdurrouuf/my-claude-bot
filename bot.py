@@ -1242,6 +1242,42 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total,
     )
 
 
+async def _route_invoice_admin(message, context, p, requester,
+                               token=None, editor=None):
+    """Карточка накладной уходит админу (склад «/invadmin» — накладные
+    выписывает только он): кнопки «Провести/Отклонить» у админа,
+    сотруднику — «ждите подтверждения». editor — способ ответить
+    сотруднику вместо message.reply_text (edit_message_text у кнопок)."""
+    p["approver_id"] = ADMIN_ID
+    p["requester_name"] = requester["name"]
+    if token is None:
+        token = new_pending(p, ttl=APPROVAL_TTL)
+    else:
+        p["ttl"] = APPROVAL_TTL
+    note = (f"📨 Накладная по складу «{esc(p['wh_name'])}» отправлена "
+            "админу на подтверждение — накладные этого склада выписывает "
+            "только он. Я сообщу результат.")
+    try:
+        await context.bot.send_message(
+            ADMIN_ID,
+            f"🔔 <b>{esc(requester['name'])}</b> хочет выписать накладную "
+            f"по складу «{esc(p['wh_name'])}» — накладные этого склада "
+            f"выписываете только вы.\n\n" + invoice_summary(p),
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("✅ Провести", callback_data=f"ok:{token}"),
+                InlineKeyboardButton("❌ Отклонить", callback_data=f"no:{token}"),
+            ]]))
+    except Exception:
+        log.exception("Не удалось отправить накладную админу")
+        PENDING.pop(token, None)
+        note = "⚠️ Не удалось отправить админу. Попробуйте позже."
+    if editor is not None:
+        await editor(note)
+    else:
+        await message.reply_text(note, parse_mode="HTML")
+
+
 async def start_invoice(update, context, actor, data, draft=False):
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
@@ -1301,6 +1337,11 @@ async def start_invoice(update, context, actor, data, draft=False):
     if exact:
         payload["client_id"] = exact["id"]
         apply_client_prices(payload)
+        if _admin_invoice_required(actor, wh["id"]):
+            # Накладные этого склада выписывает только админ (/invadmin) —
+            # карточка уходит ему, сотрудник ждёт подтверждения.
+            await _route_invoice_admin(update.message, context, payload, actor)
+            return
         token = new_pending(payload)
         await update.message.reply_text(invoice_summary(payload), parse_mode="HTML",
                                         reply_markup=confirm_kb(token))
@@ -1664,6 +1705,11 @@ def _replace_rights_error(actor, op):
     СВОЮ и не старше часа (окно UNDO_MINUTES). None — можно."""
     if is_admin(actor):
         return None
+    if _admin_invoice_required(actor, op["warehouse_id"]):
+        # Склад «/invadmin»: дополнение и замена — тоже только админ, иначе
+        # сотрудник менял бы состав подтверждённой накладной в обход.
+        return ("⛔ Накладные этого склада выписывает только админ — "
+                "попросите его изменить накладную.")
     if op["user_id"] != actor["id"]:
         return ("⛔ Эту накладную выписал другой сотрудник — заменить её "
                 "может только админ.")
@@ -3848,7 +3894,7 @@ async def _finish_invoice(q, context, actor, p):
             try:
                 await context.bot.send_message(
                     p["chat_id"],
-                    f"✅ Админ подтвердил накладную №{op_id} новому клиенту "
+                    f"✅ Админ подтвердил накладную №{op_id} клиенту "
                     f"«{esc(client_label)}».", parse_mode="HTML")
             except Exception:
                 log.warning("Не удалось уведомить заявителя о накладной")
@@ -4142,8 +4188,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p.get("approver_id"):
             await q.edit_message_text("❌ Заявка отклонена.")
             if p["kind"] == "invoice":
-                what = (f"накладную новому клиенту «{esc(p.get('client_name') or '')}» "
-                        f"со стартовым долгом")
+                if p.get("client_id") is None and p.get("parsed_debt"):
+                    what = (f"накладную новому клиенту «{esc(p.get('client_name') or '')}» "
+                            f"со стартовым долгом")
+                else:
+                    what = f"накладную клиенту «{esc(p.get('client_name') or '')}»"
             elif p["kind"] == "inventory":
                 what = f"инвентаризацию склада «{esc(p['wh_name'])}»"
             elif p["kind"] == "writeoff":
@@ -4407,6 +4456,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         if p["kind"] == "invoice":
             apply_client_prices(p)
+            requester = db.get_user(p["user_id"])
+            if _admin_invoice_required(requester, p["wh_id"]):
+                await _route_invoice_admin(q.message, context, p, requester,
+                                           token=token,
+                                           editor=q.edit_message_text)
+                return
             summary = invoice_summary(p)
         elif p["kind"] == "set_price":
             summary = set_price_summary(p)
@@ -4443,6 +4498,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 log.exception("Не удалось отправить заявку о новом клиенте админу")
                 await q.edit_message_text("⚠️ Не удалось отправить админу. Попробуйте позже.")
                 PENDING.pop(token, None)
+            return
+        if _admin_invoice_required(requester, p["wh_id"]):
+            # Склад «/invadmin»: и накладная новому клиенту без долга — тоже
+            # только через подтверждение админа.
+            await _route_invoice_admin(q.message, context, p, requester,
+                                       token=token, editor=q.edit_message_text)
             return
         await q.edit_message_text(invoice_summary(p), parse_mode="HTML", reply_markup=confirm_kb(token))
         return
@@ -5925,6 +5986,64 @@ async def show_stock(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def show_stock_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Остатки склада с продажными ценами и суммой по прайсу (/stockprice)."""
     await _stock_cmd(update, context, with_prices=True)
+
+
+# Накладные отдельных складов выписывает только админ (/invadmin — решение
+# владельца 14.08.2026: с Бишкека он отгружает со скидками индивидуально,
+# поэтому накладная сотрудника уходит ему на подтверждение и без его
+# «Провести» не проводится). Хранится в settings.
+def admin_invoice_wh_ids() -> set:
+    raw = db.get_setting("admin_invoice_whs")
+    try:
+        return {int(x) for x in json.loads(raw)} if raw else set()
+    except (ValueError, TypeError):
+        return set()
+
+
+def _admin_invoice_required(actor_or_user, wh_id) -> bool:
+    """Накладная этого пользователя по складу требует подтверждения админа."""
+    return (actor_or_user is not None and not is_admin(actor_or_user)
+            and wh_id in admin_invoice_wh_ids())
+
+
+async def invadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Накладные склада — только админ: вкл/выкл/статус (админ)."""
+    if await _require_admin(update) is None:
+        return
+    cur = admin_invoice_wh_ids()
+    args = list(context.args or [])
+    if not args:
+        if cur:
+            names = [w["name"] for w in db.all_warehouses() if w["id"] in cur]
+            txt = ("🔏 Накладные выписывает только админ: " + ", ".join(names)
+                   + "\n(накладная сотрудника уходит вам на подтверждение "
+                     "и проводится только после вашего «Провести»)")
+        else:
+            txt = ("Ограничений нет — накладные выписывают все сотрудники "
+                   "со своим доступом.")
+        txt += "\n\nВключить: /invadmin Бишкек\nВыключить: /invadmin выкл Бишкек"
+        await update.message.reply_text(txt)
+        return
+    off = args[0].lower() in ("выкл", "выкл.", "off", "открыть")
+    name = " ".join(args[1:] if off else args).strip()
+    wh = db.warehouse_by_name(name)
+    if wh is None:
+        await update.message.reply_text(
+            f"Склад «{esc(name)}» не найден.", parse_mode="HTML")
+        return
+    if off:
+        cur.discard(wh["id"])
+        msg = (f"🔓 Накладные склада «{esc(wh['name'])}» снова выписывают "
+               "сотрудники с доступом — без вашего подтверждения.")
+    else:
+        cur.add(wh["id"])
+        msg = (f"🔏 Накладные склада «{esc(wh['name'])}» теперь выписываете "
+               "только вы. Накладная сотрудника придёт вам в личку с кнопками "
+               "«Провести/Отклонить» и без вашего подтверждения не проводится "
+               f"(заявка ждёт {APPROVAL_TTL // 3600} ч). Дополнение и замена "
+               "накладных сотрудникам тоже закрыты.")
+    db.set_setting("admin_invoice_whs", json.dumps(sorted(cur)))
+    await update.message.reply_text(msg, parse_mode="HTML")
 
 
 # Долги отдельных складов можно скрыть от сотрудников (/hidedebts —
@@ -9550,6 +9669,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("report", report_cmd))
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
     app.add_handler(CommandHandler("hidedebts", hidedebts_cmd))
+    app.add_handler(CommandHandler("invadmin", invadmin_cmd))
     app.add_handler(CommandHandler("showdebt", showdebt_cmd))
     app.add_handler(CommandHandler("sales", sales_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))
