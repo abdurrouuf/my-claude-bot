@@ -1342,6 +1342,14 @@ def test_forecast_pdf():
     # ничего не заканчивается — отчёта нет
     wh2 = db.warehouse_by_name("Манас")
     assert bot.build_forecast_report([wh2]) is None
+    # горизонт задаётся числом: при огромном — попадает и «медленный» товар
+    _load(wh, {30: 88})
+    _invoice(wh, ADMIN, "Тест", [_item(30, 4, 300)],
+             client_id=db.client_exact(wh["id"], "Тест")["id"])
+    pdf30, cap30 = bot.build_forecast_report([wh])   # осталось на ~294 дн.
+    assert "2 поз." in cap30 and "≤30" in cap30      # медленный не попал
+    pdf365, cap365 = bot.build_forecast_report([wh], 365)
+    assert "3 поз." in cap365 and "≤365" in cap365
 
 
 def main():
