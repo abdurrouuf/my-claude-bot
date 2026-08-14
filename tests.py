@@ -1293,6 +1293,51 @@ def test_client_name_expansion_incident():
     assert names.index("Нурлан") < names.index("Уникум Ош")
 
 
+def test_admin_only_invoices():
+    # /invadmin: накладная сотрудника по складу уходит админу на
+    # подтверждение и без него не проводится (решение владельца 14.08.2026)
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.set_setting("admin_invoice_whs", json.dumps([wh["id"]]))
+    daniyar = db.get_user(DANIYAR)
+    assert bot._admin_invoice_required(daniyar, wh["id"])
+    assert not bot._admin_invoice_required(db.get_user(ADMIN), wh["id"])
+    db.clients_add_bulk(wh["id"], ["Асан"])
+    c = db.client_exact(wh["id"], "Асан")
+    _load(wh, {16: 50})
+    sent = []
+
+    class Bot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text, kw.get("reply_markup")))
+
+    ctx = SimpleNamespace(bot=Bot())
+    token = bot.new_pending({
+        "kind": "invoice", "user_id": DANIYAR, "chat_id": 5,
+        "wh_id": wh["id"], "wh_name": wh["name"], "client_name": "Асан",
+        "client_id": None, "items": [_item(16, 2, 180)], "warnings": [],
+        "payment": 0, "parsed_debt": 0, "phone": None})
+    answers, edits = [], []
+
+    async def run():
+        await bot.on_callback(
+            _cb_update(DANIYAR, f"pk:{token}:{c['id']}", answers, edits), ctx)
+    asyncio.run(run())
+    p = bot.get_pending(token)
+    assert p["approver_id"] == bot.ADMIN_ID       # ждёт админа
+    assert sent and sent[0][0] == bot.ADMIN_ID    # карточка ушла админу
+    assert sent[0][2] is not None                 # с кнопками Провести/Отклонить
+    assert "админу на подтверждение" in edits[-1]
+    assert _stock(wh, 16) == 50                   # ничего не проведено
+    # замена/дополнение накладной такого склада сотруднику закрыты
+    from datetime import datetime
+    err = bot._replace_rights_error(
+        daniyar, {"user_id": DANIYAR, "warehouse_id": wh["id"],
+                  "ts": datetime.now(db.BISHKEK).isoformat()})
+    assert err and "только админ" in err
+
+
 def test_forecast_asks_warehouse_buttons():
     # /forecast без склада при нескольких доступных — вопрос кнопками
     import asyncio
