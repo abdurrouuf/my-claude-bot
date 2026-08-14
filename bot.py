@@ -1340,8 +1340,18 @@ async def start_invoice(update, context, actor, data, draft=False):
         "payment": payment, "parsed_debt": parsed_debt, "phone": phone,
     }
 
+    in_group = (update.effective_chat is not None
+                and update.effective_chat.type != "private")
     exact = db.client_exact(wh["id"], client_name)
     if exact:
+        if (not draft and exact["id"] in admin_only_client_ids()
+                and not is_admin(actor)):
+            # Клиент админа (вариант 3А): в чате склада — тишина (это
+            # сборочный лист), в личке — честный отказ. Черновик словом
+            # остаётся доступен (правило проекта: черновики — всегда).
+            if not in_group:
+                await update.message.reply_text(ADMIN_CLIENT_MSG)
+            return
         payload["client_id"] = exact["id"]
         apply_client_prices(payload)
         if _admin_invoice_required(actor, wh["id"]):
@@ -1354,8 +1364,15 @@ async def start_invoice(update, context, actor, data, draft=False):
                                         reply_markup=confirm_kb(token))
         return
 
-    token = new_pending(payload)
     candidates = db.fuzzy_clients(wh["id"], client_name)
+    if not draft and not is_admin(actor) and any(
+            c["id"] in admin_only_client_ids() for c in candidates):
+        # Похоже на клиента админа с опечаткой — кнопки «возможно, вы имели
+        # в виду» предлагали бы выписать ему или создать двойника.
+        if not in_group:
+            await update.message.reply_text(ADMIN_CLIENT_MSG)
+        return
+    token = new_pending(payload)
     rows = []
     for c in candidates:
         rows.append([InlineKeyboardButton(
@@ -1717,6 +1734,9 @@ def _replace_rights_error(actor, op):
         # сотрудник менял бы состав подтверждённой накладной в обход.
         return ("⛔ Накладные этого склада выписывает только админ — "
                 "попросите его изменить накладную.")
+    if op["client_id"] and op["client_id"] in admin_only_client_ids():
+        # Клиент админа (вариант 3А): замена его накладной — тоже только админ
+        return ADMIN_CLIENT_MSG + " Попросите его изменить накладную."
     if op["user_id"] != actor["id"]:
         return ("⛔ Эту накладную выписал другой сотрудник — заменить её "
                 "может только админ.")
@@ -4475,6 +4495,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p["kind"] == "invoice":
             apply_client_prices(p)
             requester = db.get_user(p["user_id"])
+            if (p["client_id"] in admin_only_client_ids()
+                    and not is_admin(requester)):
+                await q.edit_message_text(ADMIN_CLIENT_MSG)
+                return
             if _admin_invoice_required(requester, p["wh_id"]):
                 await _route_invoice_admin(q.message, context, p, requester,
                                            token=token,
@@ -5616,9 +5640,20 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         actor = _feed_chat_actor(update)
         if actor is None:
             return
+        # «Заказ: …» / «Заявка: …» — сборочный лист для склада, бот молчит
+        # всегда (вариант 3А, 15.08.2026).
+        if ORDER_RE.match(update.message.text):
+            return
         # «Джарвис, …» — явное обращение, обрабатываем без фильтра примет.
         rest = _strip_wake_word(update.message.text)
         if rest is None and not _looks_like_operation(update.message.text):
+            return
+        if (rest is None and not is_admin(actor)
+                and not MONEY_WORDS_RE.search(update.message.text)
+                and _mentions_admin_client(update.message.text)):
+            # Клиент админа в сообщении сотрудника без денежных слов —
+            # это заказ на сборку, накладную такому клиенту выписывает
+            # только админ. Полная тишина, ни копейки на ИИ (вариант 3А).
             return
         quiet = True
     else:
@@ -6062,6 +6097,128 @@ async def invadmin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                "накладных сотрудникам тоже закрыты.")
     db.set_setting("admin_invoice_whs", json.dumps(sorted(cur)))
     await update.message.reply_text(msg, parse_mode="HTML")
+
+
+# «Клиенты админа» (вариант 3А, 15.08.2026): накладные этим клиентам
+# выписывает ТОЛЬКО админ. Сообщение сотрудника с таким клиентом в чате
+# склада — СБОРОЧНЫЙ ЛИСТ для сборки заказа: бот молчит полностью
+# (клиент присылает заказ, его пересылают в чат, склад собирает).
+# Денежные операции (оплата, возврат, сдача) не ограничиваются.
+ADMIN_CLIENT_MSG = "⛔ Накладные этому клиенту выписывает только админ."
+
+
+def admin_only_client_ids() -> set:
+    raw = db.get_setting("admin_only_clients")
+    try:
+        return {int(x) for x in json.loads(raw)} if raw else set()
+    except (ValueError, TypeError):
+        return set()
+
+
+def _admin_client_name_res() -> list:
+    """Регексы имён (и псевдонимов) клиентов админа — для бесплатной
+    проверки сообщения чата ДО ИИ (границы слов: «Асыл» не ловит
+    «Асылбек»)."""
+    ids = admin_only_client_ids()
+    names = []
+    for cid in ids:
+        c = db.client_get(cid)
+        if c is None:
+            continue
+        names.append(c["name"])
+        names.extend(db.client_aliases_list(cid))
+    return [re.compile(r"(?<!\w)" + re.escape(n.lower()) + r"(?!\w)")
+            for n in names if n]
+
+
+# Оплаты/возвраты/сдачи по клиенту админа сотруднику разрешены — такие
+# сообщения не глушим даже с именем клиента админа.
+MONEY_WORDS_RE = re.compile(r"приход|оплат|сдал|сдаю|погас|возврат|верну",
+                            re.IGNORECASE)
+# Слово «заказ»/«заявка» в начале сообщения чата склада — сборочный лист,
+# бот молчит всегда (универсальная страховка варианта 3А).
+ORDER_RE = re.compile(r"^\s*(заказ|заявка)\b", re.IGNORECASE)
+
+
+def _mentions_admin_client(text: str) -> bool:
+    low = text.lower()
+    return any(rx.search(low) for rx in _admin_client_name_res())
+
+
+async def myclients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Клиенты, которым накладные выписывает только админ (вариант 3А).
+
+    /myclients Имя[, Имя] — добавить; /myclients выкл Имя — убрать;
+    /myclients — список."""
+    if await _require_admin(update) is None:
+        return
+    ids = admin_only_client_ids()
+    args = list(context.args or [])
+    if not args:
+        if not ids:
+            await update.message.reply_text(
+                "Список пуст — накладные всем клиентам выписывают сотрудники "
+                "со своим доступом.\n"
+                "Добавить: /myclients Кабылбеков Тыныбек (можно несколько "
+                "через запятую)\nУбрать: /myclients выкл Имя")
+            return
+        lines = ["🔏 Накладные этим клиентам выписываете только вы "
+                 "(сообщение сотрудника с таким клиентом в чате склада — "
+                 "просто список, бот молчит):"]
+        for cid in sorted(ids):
+            c = db.client_get(cid)
+            if c is None:
+                continue
+            wh = db.warehouse_by_id(c["warehouse_id"])
+            lines.append(f"• {c['name']} ({wh['name'] if wh else '?'})")
+        lines.append("\nУбрать: /myclients выкл Имя")
+        await update.message.reply_text("\n".join(lines))
+        return
+    off = args[0].lower() in ("выкл", "выкл.", "off", "убрать")
+    names = [x.strip() for x in " ".join(args[1:] if off else args).split(",")
+             if x.strip()]
+    if not names:
+        await update.message.reply_text("Укажите имя: /myclients выкл Иванов")
+        return
+    done, problems = [], []
+    for name in names:
+        found = {}
+        for wh in db.all_warehouses():
+            c = db.client_exact(wh["id"], name)
+            if c is not None:
+                found[c["id"]] = c
+        if not found:
+            cands = []
+            for wh in db.all_warehouses():
+                for c in db.fuzzy_clients(wh["id"], name):
+                    if c["id"] not in {x["id"] for x in cands}:
+                        cands.append(c)
+            if len(cands) == 1:
+                found = {cands[0]["id"]: cands[0]}
+            elif cands:
+                problems.append(f"«{name}» — уточните: "
+                                + ", ".join(x["name"] for x in cands[:4]))
+                continue
+        if not found:
+            problems.append(f"«{name}» — не найден")
+            continue
+        if len(found) > 1:
+            problems.append(f"«{name}» — есть на нескольких складах, "
+                            "напишите точное имя")
+            continue
+        c = next(iter(found.values()))
+        if off:
+            ids.discard(c["id"])
+        else:
+            ids.add(c["id"])
+        done.append(c["name"])
+    db.set_setting("admin_only_clients", json.dumps(sorted(ids)))
+    msg = []
+    if done:
+        msg.append(("🔓 Сняты (выписывают и сотрудники): " if off
+                    else "🔏 Теперь выписываете только вы: ") + ", ".join(done))
+    msg.extend(problems)
+    await update.message.reply_text("\n".join(msg) or "Ничего не изменено.")
 
 
 # Долги отдельных складов можно скрыть от сотрудников (/hidedebts —
@@ -9725,6 +9882,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("olddebts", olddebts_cmd))
     app.add_handler(CommandHandler("hidedebts", hidedebts_cmd))
     app.add_handler(CommandHandler("invadmin", invadmin_cmd))
+    app.add_handler(CommandHandler("myclients", myclients_cmd))
     app.add_handler(CommandHandler("showdebt", showdebt_cmd))
     app.add_handler(CommandHandler("sales", sales_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))

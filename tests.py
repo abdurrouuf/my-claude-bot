@@ -1455,6 +1455,77 @@ def test_expiry_shows_lots():
     assert out.get("pdf", b"")[:4] == b"%PDF"
 
 
+def test_admin_only_clients():
+    # Вариант 3А (15.08.2026): клиенты, которым накладные выписывает только
+    # админ; сообщение сотрудника с таким клиентом в чате — сборочный лист
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], ["Кабылбеков Тыныбек", "Асыл", "Асылбек"])
+    c_admin = db.client_exact(wh["id"], "Кабылбеков Тыныбек")
+    c_asyl = db.client_exact(wh["id"], "Асыл")
+    db.set_setting("admin_only_clients", json.dumps([c_admin["id"], c_asyl["id"]]))
+    _load(wh, {16: 50})
+    daniyar = db.get_user(DANIYAR)
+
+    # бесплатный фильтр: имя клиента админа ловится по границам слов
+    assert bot._mentions_admin_client("Кабылбеков Тыныбек\nИверклоз 100мл 2к")
+    assert bot._mentions_admin_client("заказ для Асыл на завтра")
+    assert not bot._mentions_admin_client("Асылбек приход 5000")  # другой клиент
+    # оплата клиенту админа не глушится (денежные слова)
+    assert bot.MONEY_WORDS_RE.search("Кабылбеков Тыныбек приход 50000")
+    # «заказ»/«заявка» в начале — молчание для всех
+    assert bot.ORDER_RE.match("Заказ: Асан — Дексатоп 5 шт")
+    assert bot.ORDER_RE.match("заявка на завтра")
+    assert not bot.ORDER_RE.match("Асан заказал 5 шт")
+
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd(chat_type):
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=DANIYAR),
+            effective_chat=SimpleNamespace(id=-1 if chat_type != "private"
+                                           else DANIYAR, type=chat_type),
+            message=Msg())
+
+    data = {"warehouse": wh["name"], "client": "Кабылбеков Тыныбек",
+            "items": [{"name": prices.BY_ID[16]["name"],
+                       "volume": prices.BY_ID[16]["volume"],
+                       "qty": 2, "price": 180}],
+            "payment": 0, "debt": 0}
+
+    async def run():
+        ctx = SimpleNamespace(bot=None)
+        # в группе — полная тишина
+        await bot.start_invoice(upd("supergroup"), ctx, daniyar, dict(data))
+        assert replies == [], replies
+        # в личке — честный отказ
+        await bot.start_invoice(upd("private"), ctx, daniyar, dict(data))
+        assert replies and "только админ" in replies[-1]
+        # опечатка в имени клиента админа — тоже тишина в группе
+        replies.clear()
+        d2 = dict(data, client="Кабылбеков Тыныбк")
+        await bot.start_invoice(upd("supergroup"), ctx, daniyar, d2)
+        assert replies == [], replies
+        # админу — можно (карточка)
+        replies.clear()
+        admin = db.get_user(ADMIN)
+        await bot.start_invoice(upd("private"), ctx, admin, dict(data))
+        assert replies and "только админ" not in replies[-1]
+    asyncio.run(run())
+    # замена накладной клиента админа сотруднику закрыта
+    from datetime import datetime
+    err = bot._replace_rights_error(
+        daniyar, {"user_id": DANIYAR, "warehouse_id": wh["id"],
+                  "client_id": c_admin["id"],
+                  "ts": datetime.now(db.BISHKEK).isoformat()})
+    assert err and "только админ" in err
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
