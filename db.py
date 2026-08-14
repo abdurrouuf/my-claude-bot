@@ -155,6 +155,15 @@ CREATE TABLE IF NOT EXISTS product_certs(
     ts           TEXT NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_certs_name ON product_certs(product_name);
+CREATE TABLE IF NOT EXISTS product_lots(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    product_id INTEGER NOT NULL,
+    expiry     TEXT NOT NULL,                    -- MM.YYYY, как в партиях
+    lot        TEXT NOT NULL COLLATE NOCASEU,    -- номер серии/партии завода
+    note       TEXT,                             -- напр. «приход №203, F260403»
+    ts         TEXT NOT NULL,
+    UNIQUE(product_id, expiry, lot)
+);
 CREATE TABLE IF NOT EXISTS promises(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT NOT NULL,
@@ -710,6 +719,32 @@ def known_client_names(limit: int = 40, wh_ids: list = None):
                 seen.add(k)
                 out.append(r["client"])
     return out[:limit]
+
+
+def lot_add(product_id: int, expiry: str, lot: str, note: str = None):
+    """Справочник заводских серий: серия партии (товар + срок). Не учёт —
+    только сведения для /expiry и документов (шаг 1 партионного учёта
+    серий, «делай» владельца 14.08.2026). Дубликаты молча пропускаются."""
+    lot = str(lot or "").strip()
+    if not lot:
+        return
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT OR IGNORE INTO product_lots(product_id, expiry, lot, note, ts) "
+            "VALUES(?,?,?,?,?)",
+            (product_id, expiry, lot, note,
+             datetime.now(BISHKEK).isoformat(timespec="seconds")))
+
+
+def lots_map() -> dict:
+    """{(product_id, expiry): 'серия1, серия2'} — для показа в отчётах."""
+    out = {}
+    for r in connect().execute(
+            "SELECT product_id, expiry, lot FROM product_lots ORDER BY id"):
+        key = (r["product_id"], r["expiry"])
+        out[key] = (out[key] + ", " + r["lot"]) if key in out else r["lot"]
+    return out
 
 
 def log_draft(user_id: int, client: str, total: float, items: list | None = None):

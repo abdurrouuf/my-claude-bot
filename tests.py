@@ -1410,6 +1410,51 @@ def test_forecast_pdf():
     assert "3 поз." in cap365 and "≤365" in cap365
 
 
+def test_f260403_arrival_data_and_lots():
+    # Шаг 1 учёта серий («делай» владельца 14.08.2026): таблица поставки
+    # F260403 и справочник заводских серий
+    import f260403_arrival_data as f2
+    _fresh_db()
+    assert len(f2.ARRIVAL) == 31
+    assert sum(q for _, q, _ in f2.ARRIVAL) == 113400
+    pids = [pid for pid, _, _ in f2.ARRIVAL]
+    assert len(set(pids)) == 31                       # без дублей
+    for pid, qty, lot in f2.ARRIVAL:
+        assert pid in prices.BY_ID, pid
+        assert qty > 0 and lot.isdigit()
+    lots = [l for _, _, l in f2.ARRIVAL]
+    assert len(set(lots)) == 31
+    # справочник серий: добавление, дубликаты, карта
+    db.lot_add(20, "06.2029", "2606912", "тест")
+    db.lot_add(20, "06.2029", "2606912")              # дубль молча
+    db.lot_add(20, "06.2029", "9999999")
+    m = db.lots_map()
+    assert m[(20, "06.2029")] == "2606912, 9999999"
+
+
+def test_expiry_shows_lots():
+    # /expiry показывает заводскую серию партии отдельной строкой
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {20: 100}, {(wh["id"], 20): [("06.2029", 100)]})
+    db.lot_add(20, "06.2029", "2606912", "приход №1")
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"] = document.input_file_content
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.expiry_cmd(upd, SimpleNamespace(args=[wh["name"]])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
