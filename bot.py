@@ -4261,6 +4261,39 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await _expiry_report(shim, whs)
         return
 
+    if kind == "pfc":  # выбран склад для прогноза «скоро закончится»
+        if p.get("kind") != "pick_forecast":
+            await q.answer()
+            return
+        PENDING.pop(token, None)
+        await q.answer()
+        owner_row = db.get_user(p["user_id"])
+        if owner_row is None:
+            return
+        if len(parts) > 2 and parts[2] == "all":
+            whs = db.visible_warehouses(owner_row)
+            label = "все склады"
+        else:
+            try:
+                wh = db.warehouse_by_id(int(parts[2]))
+            except (ValueError, IndexError):
+                wh = None
+            if wh is None or not db.can_view_warehouse(owner_row, wh["id"]):
+                await q.edit_message_text("Склад не найден или нет доступа.")
+                return
+            whs = [wh]
+            label = f"«{wh['name']}»"
+        try:
+            await q.edit_message_text(f"⏳ Прогноз: {esc(label)}",
+                                      parse_mode="HTML")
+        except Exception:
+            pass
+        shim = SimpleNamespace(message=q.message,
+                               effective_chat=q.message.chat,
+                               effective_user=q.from_user)
+        await _forecast_report(shim, whs)
+        return
+
     if kind == "pdbt":  # выбран склад для отчёта о долгах
         if p.get("kind") != "pick_debts":
             await q.answer()
@@ -7057,15 +7090,44 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    # В чате склада — только склад этого чата (как /stock и /debts).
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group and not whs_group:
+        return
     arg = " ".join(context.args).strip() if context.args else ""
-    if arg:
+    if in_group:
+        whs = whs_group
+    elif arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text("Склад не найден или нет доступа.")
             return
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
+        if not whs:
+            await update.message.reply_text("У вас нет склада. Пример: /forecast Каракол")
+            return
+        if not arg and len(whs) > 1:
+            # Несколько складов — спрашиваем кнопками, какой показать
+            # (просьба владельца 14.08.2026, как /stock, /debts и /expiry).
+            # «Все сразу» — кнопкой или /forecast all.
+            payload = {"kind": "pick_forecast", "user_id": actor["id"],
+                       "chat_id": update.effective_chat.id}
+            token = new_pending(payload)
+            kb = [[InlineKeyboardButton(f"⏳ {w['name']}",
+                                        callback_data=f"pfc:{token}:{w['id']}")]
+                  for w in whs]
+            kb.append([InlineKeyboardButton("🗂 Все склады сразу",
+                                            callback_data=f"pfc:{token}:all")])
+            kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+            await update.message.reply_text("Прогноз какого склада показать?",
+                                            reply_markup=InlineKeyboardMarkup(kb))
+            return
+    await _forecast_report(update, whs)
+
+
+async def _forecast_report(update, whs):
     report = build_forecast_report(whs)
     if report is None:
         await update.message.reply_text(

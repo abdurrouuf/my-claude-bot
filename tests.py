@@ -1293,6 +1293,39 @@ def test_client_name_expansion_incident():
     assert names.index("Нурлан") < names.index("Уникум Ош")
 
 
+def test_forecast_asks_warehouse_buttons():
+    # /forecast без склада при нескольких доступных — вопрос кнопками
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append((text, kw.get("reply_markup")))
+
+        async def reply_document(self, **kw):
+            replies.append(("<pdf>", None))
+
+    def upd(uid):
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=uid),
+            effective_chat=SimpleNamespace(id=uid, type="private"),
+            message=Msg())
+
+    async def run():
+        await bot.forecast_cmd(upd(ADMIN), SimpleNamespace(args=[]))
+        text, kb = replies[-1]
+        assert "какого склада" in text and kb is not None
+        await bot.forecast_cmd(upd(ADMIN), SimpleNamespace(args=["all"]))
+        text, kb = replies[-1]
+        assert kb is None  # сразу ответ (пусто — текст «ничего не …»)
+        await bot.forecast_cmd(upd(DANIYAR), SimpleNamespace(args=[]))
+        text, kb = replies[-1]
+        assert kb is None
+    asyncio.run(run())
+
+
 def test_forecast_pdf():
     # /forecast — PDF в фирменном стиле («что за беспорядок?» 14.08.2026)
     wh = _fresh_db()
