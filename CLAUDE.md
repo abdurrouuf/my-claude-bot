@@ -448,9 +448,17 @@ elevenlabs.io (бесплатный тариф ограничен, дальше 
   «что за беспорядок?» владельца про текстовую простыню) и ТОЖЕ
   спрашивает кнопками (kind pick_forecast, callback pfc; /forecast all —
   без вопросов; в чате склада — склад чата; доступ can_view_warehouse;
-  отчёт вынесен в _forecast_report). Остальные отчёты
-  (/report, /olddebts) без склада показывают все
-  доступные склады секциями одного PDF.
+  отчёт вынесен в _forecast_report).
+  С 15.08.2026 («сколько раз мне писать про выбор складов?» владельца) —
+  УНИВЕРСАЛЬНАЯ ПАНЕЛЬ выбора склада: REPORT_PICKS +
+  _maybe_ask_warehouse + callback prp (kind pick_report, params в
+  payload), подключены /clients, /report, /olddebts, /minstock,
+  /deadstock, /stockcost (рендеры _clients_report/_report_render/
+  _olddebts_report/_minstock_report/_deadstock_report/_stockcost_report).
+  ПРАВИЛО ПРОЕКТА: каждый НОВЫЙ отчёт по складам обязан регистрироваться
+  в REPORT_PICKS и спрашивать склад кнопками — не вываливать все склады.
+  Аргумент склада и «all» работают без вопросов; в группе — склад чата.
+  Тест test_all_reports_ask_warehouse.
   Отчёт по закупочным ценам сделан 02.08.2026 — /stockcost (см. раздел
   «Маржа по закупочным ценам»).
 - **add_clients теперь с долгами**: clients: [{"name":..., "debt":...}] —

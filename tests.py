@@ -1526,6 +1526,63 @@ def test_admin_only_clients():
     assert err and "только админ" in err
 
 
+def test_all_reports_ask_warehouse():
+    # Правило проекта 15.08.2026: любой отчёт по складам без аргумента
+    # спрашивает кнопками, какой склад показать (+ «Все сразу»)
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append((text, kw.get("reply_markup")))
+
+        async def reply_document(self, **kw):
+            replies.append(("<pdf>", None))
+
+    def upd():
+        return SimpleNamespace(
+            effective_user=SimpleNamespace(id=ADMIN),
+            effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+            message=Msg())
+
+    cmds = [bot.clients_cmd, bot.report_cmd, bot.olddebts_cmd,
+            bot.minstock_cmd, bot.deadstock_cmd, bot.stockcost_cmd]
+
+    async def run():
+        db.set_setting("usd_rate", "87.5")   # для /stockcost
+        for cmd in cmds:
+            replies.clear()
+            await cmd(upd(), SimpleNamespace(args=[]))
+            text, kb = replies[-1]
+            assert kb is not None and "какого склада" in text or \
+                "какому складу" in text, (cmd.__name__, text)
+        # выбор кнопкой «все сразу» отдаёт отчёт
+        token = bot.new_pending({"kind": "pick_report", "report": "clients",
+                                 "user_id": ADMIN, "chat_id": 1, "params": {}})
+        answers, edits = [], []
+        u = _cb_update(ADMIN, f"prp:{token}:all", answers, edits)
+        u.callback_query.message.reply_text = \
+            (lambda *a, **k: _noop(replies, a, k))
+        sent = []
+
+        async def reply_doc(**kw):
+            sent.append(1)
+        u.callback_query.message.reply_document = reply_doc
+
+        async def reply_txt(text, **kw):
+            sent.append(text)
+        u.callback_query.message.reply_text = reply_txt
+        await bot.on_callback(u, SimpleNamespace(bot=None))
+        assert sent, "отчёт по кнопке не пришёл"
+    asyncio.run(run())
+
+
+def _noop(*a, **k):
+    pass
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
