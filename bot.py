@@ -408,6 +408,36 @@ async def _require_private(update) -> bool:
     return True
 
 
+# --- Универсальная панель выбора склада для отчётов ---
+# ПРАВИЛО ПРОЕКТА (владелец, 15.08.2026: «при ЛЮБОМ запросе — панель выбора
+# складов и „все сразу“»): каждый отчёт по складам без явного склада в
+# аргументах обязан спрашивать кнопками через _maybe_ask_warehouse, а не
+# вываливать все склады. Новые отчёты — регистрировать в REPORT_PICKS.
+REPORT_PICKS: dict = {}   # key -> {emoji, question, whs(actor), render}
+
+
+async def _maybe_ask_warehouse(update, actor, key, params=None) -> bool:
+    """Складов больше одного — спрашиваем кнопками (+ «Все сразу»).
+    True — вопрос задан, команда должна выйти; False — склад один
+    (или ни одного), пусть команда показывает сразу."""
+    spec = REPORT_PICKS[key]
+    whs = spec["whs"](actor)
+    if len(whs) <= 1:
+        return False
+    payload = {"kind": "pick_report", "report": key, "user_id": actor["id"],
+               "chat_id": update.effective_chat.id, "params": params or {}}
+    token = new_pending(payload)
+    kb = [[InlineKeyboardButton(f"{spec['emoji']} {w['name']}",
+                                callback_data=f"prp:{token}:{w['id']}")]
+          for w in whs]
+    kb.append([InlineKeyboardButton("🗂 Все склады сразу",
+                                    callback_data=f"prp:{token}:all")])
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+    await update.message.reply_text(spec["question"],
+                                    reply_markup=InlineKeyboardMarkup(kb))
+    return True
+
+
 KNOWN_COMMANDS: set = set()  # заполняется в main() из зарегистрированных команд
 
 
@@ -3552,6 +3582,12 @@ async def minstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
+        if not arg and await _maybe_ask_warehouse(update, actor, "minstock"):
+            return
+    await _minstock_report(update, whs, actor, {})
+
+
+async def _minstock_report(update, whs, actor, params):
     lines = []
     for wh in whs:
         mmap = db.min_stock_map(wh["id"])
@@ -4346,6 +4382,43 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                effective_chat=q.message.chat,
                                effective_user=q.from_user)
         await _expiry_report(shim, whs)
+        return
+
+    if kind == "prp":  # универсальная панель выбора склада для отчётов
+        if p.get("kind") != "pick_report" or p.get("report") not in REPORT_PICKS:
+            await q.answer()
+            return
+        PENDING.pop(token, None)
+        await q.answer()
+        owner_row = db.get_user(p["user_id"])
+        if owner_row is None:
+            return
+        spec = REPORT_PICKS[p["report"]]
+        allowed = spec["whs"](owner_row)   # права перепроверяются на кнопке
+        if len(parts) > 2 and parts[2] == "all":
+            whs, label = allowed, "все склады"
+        else:
+            try:
+                wid = int(parts[2])
+            except (ValueError, IndexError):
+                return
+            whs = [w for w in allowed if w["id"] == wid]
+            if not whs:
+                await q.edit_message_text("Склад не найден или нет доступа.")
+                return
+            label = f"«{whs[0]['name']}»"
+        if not whs:
+            await q.edit_message_text("Нет доступных складов.")
+            return
+        try:
+            await q.edit_message_text(f"{spec['emoji']} {esc(label)}",
+                                      parse_mode="HTML")
+        except Exception:
+            pass
+        shim = SimpleNamespace(message=q.message,
+                               effective_chat=q.message.chat,
+                               effective_user=q.from_user)
+        await spec["render"](shim, whs, owner_row, p.get("params") or {})
         return
 
     if kind == "pfc":  # выбран склад для прогноза «скоро закончится»
@@ -6586,6 +6659,12 @@ async def clients_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not whs:
             await update.message.reply_text(HIDDEN_DEBT_MSG)
             return
+        if not arg and await _maybe_ask_warehouse(update, actor, "clients"):
+            return
+    await _clients_report(update, whs, actor, {})
+
+
+async def _clients_report(update, whs, actor, params):
     open_ids = open_debt_client_ids()
     sections, summary = [], []
     for wh in whs:
@@ -6753,7 +6832,17 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
-    pdf, caption = build_report_pdf(whs, days_back, label)
+        if not in_group and await _maybe_ask_warehouse(
+                update, actor, "report",
+                {"days_back": days_back, "label": label}):
+            return
+    await _report_render(update, whs, actor,
+                         {"days_back": days_back, "label": label})
+
+
+async def _report_render(update, whs, actor, params):
+    pdf, caption = build_report_pdf(whs, params.get("days_back", 0),
+                                    params.get("label", "за сегодня"))
     if pdf is None:
         await update.message.reply_text(caption)
         return
@@ -7377,6 +7466,14 @@ async def deadstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
+        if not wh_words and await _maybe_ask_warehouse(
+                update, actor, "deadstock", {"days": days}):
+            return
+    await _deadstock_report(update, whs, actor, {"days": days})
+
+
+async def _deadstock_report(update, whs, actor, params):
+    days = params.get("days", DEADSTOCK_DAYS)
     text = build_deadstock(whs, days)
     if not text:
         await update.message.reply_text(
@@ -7618,8 +7715,17 @@ async def olddebts_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 "Использование: /olddebts [дней]\nПример: /olddebts 45")
             return
-    report = overdue_report(
-        debt_whs_for(actor, db.visible_warehouses(actor)), min_days)
+    if await _maybe_ask_warehouse(update, actor, "olddebts",
+                                  {"min_days": min_days}):
+        return
+    await _olddebts_report(
+        update, debt_whs_for(actor, db.visible_warehouses(actor)), actor,
+        {"min_days": min_days})
+
+
+async def _olddebts_report(update, whs, actor, params):
+    min_days = params.get("min_days", DEBT_ALERT_DAYS)
+    report = overdue_report(whs, min_days)
     if report is None:
         await update.message.reply_text(
             f"✅ Нет клиентов без оплат дольше {min_days} дней, "
@@ -8104,6 +8210,17 @@ async def stockcost_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Учебный полигон — не настоящие деньги: в сводный отчёт не входит
         # (посмотреть его можно явно: /stockcost Учебный).
         whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)]
+        if not arg and await _maybe_ask_warehouse(update, actor, "stockcost"):
+            return
+    await _stockcost_report(update, whs, actor, {})
+
+
+async def _stockcost_report(update, whs, actor, params):
+    bmap = buy_som_map()
+    if not bmap:
+        await update.message.reply_text(
+            "Курс доллара не задан — напишите «курс 87.5» (см. /rate).")
+        return
     sections, summary = [], []
     g_buy = g_sale = 0.0
     for wh in whs:
@@ -9795,6 +9912,42 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("api", "Расходы на ИИ"),
     ("apibalance", "Остаток баланса ИИ"),
 ]
+
+
+def _register_report_picks():
+    """Панель выбора склада: все отчёты по складам — через одну механику
+    (кнопки + «Все склады сразу», правило проекта 15.08.2026)."""
+    REPORT_PICKS.update({
+        "clients": {
+            "emoji": "👥", "question": "Клиентов какого склада показать?",
+            "whs": lambda a: debt_report_whs(a, db.visible_warehouses(a)),
+            "render": _clients_report},
+        "report": {
+            "emoji": "📊", "question": "Отчёт по какому складу показать?",
+            "whs": lambda a: db.visible_warehouses(a),
+            "render": _report_render},
+        "olddebts": {
+            "emoji": "⏰", "question": "Зависшие долги какого склада показать?",
+            "whs": lambda a: debt_whs_for(a, db.visible_warehouses(a)),
+            "render": _olddebts_report},
+        "minstock": {
+            "emoji": "📉", "question": "Минимумы какого склада показать?",
+            "whs": lambda a: db.visible_warehouses(a),
+            "render": _minstock_report},
+        "deadstock": {
+            "emoji": "🐌", "question": "Мёртвый товар какого склада показать?",
+            "whs": lambda a: db.visible_warehouses(a),
+            "render": _deadstock_report},
+        "stockcost": {
+            "emoji": "💼",
+            "question": "Остатки в закупочных ценах какого склада показать?",
+            "whs": lambda a: [w for w in db.visible_warehouses(a)
+                              if not is_training_wh(w)],
+            "render": _stockcost_report},
+    })
+
+
+_register_report_picks()
 
 
 async def _setup_command_menu(app):
