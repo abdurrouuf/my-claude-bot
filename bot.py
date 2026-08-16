@@ -1039,6 +1039,12 @@ def parse_items(raw_items: list):
     return items, warnings
 
 
+def box_prefix(it) -> str:
+    """«N кор / » перед количеством позиции — только для целых коробок."""
+    boxes = prices.whole_boxes(it.get("product_id"), it.get("qty"))
+    return f"{boxes} кор / " if boxes else ""
+
+
 def box_breakdown(items):
     """Сколько это коробок и штук (просьба владельца 16.08.2026).
 
@@ -1177,7 +1183,7 @@ def invoice_summary(p) -> str:
     for i, it in enumerate(p["items"], 1):
         sub = it["qty"] * it["price"]
         total += sub
-        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        box = box_prefix(it)
         special = " 💲спеццена" if it.get("special") else ""
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
                      f"{fmt_num(it['price'])}{special} = <b>{money(sub)}</b>")
@@ -1766,7 +1772,7 @@ def amend_summary(p, old_total: float) -> str:
              f"Старая накладная на {money(old_total)} {what}", ""]
     for i, it in enumerate(p["items"], 1):
         sub = it["qty"] * it["price"]
-        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        box = box_prefix(it)
         mark = " 🆕" if i > p["old_count"] and not p.get("full_replace") else ""
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
                      f"{fmt_num(it['price'])} = <b>{money(sub)}</b>{mark}")
@@ -2331,7 +2337,7 @@ def return_summary(p) -> str:
     for i, it in enumerate(p["items"], 1):
         sub = it["qty"] * it["price"]
         total += sub
-        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        box = box_prefix(it)
         special = " 💲спеццена" if it.get("special") else ""
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
                      f"{fmt_num(it['price'])}{special} = <b>{money(sub)}</b>")
@@ -2627,7 +2633,7 @@ def transfer_summary(p) -> str:
     lines.append(f"🏬 На склад: <b>{esc(p['wh_name'])}</b>")
     lines.append("")
     for i, it in enumerate(p["items"], 1):
-        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        box = box_prefix(it)
         exp = f" · срок {it['expiry']}" if it.get("expiry") else ""
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт{exp}")
     warns = list(p["warnings"])
@@ -2651,7 +2657,7 @@ async def send_transfer_pdf(context, chat_id, p, op_id, summary, caption=None):
     """PDF прихода/перемещения: позиции, количества, сроки годности."""
     rows, total = [], 0
     for it in p["items"]:
-        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        box = box_prefix(it)
         rows.append([it["name"], it["volume"], f"{box}{it['qty']} шт",
                      it.get("expiry") or "—"])
         total += it["qty"]
@@ -3433,7 +3439,7 @@ def writeoff_summary(p) -> str:
     lines.append("")
     total = 0.0
     for i, it in enumerate(p["items"], 1):
-        box = f"{it['box_qty']} кор / " if it.get("box_qty") else ""
+        box = box_prefix(it)
         exp = f" · срок {it['expiry']}" if it.get("expiry") else ""
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — "
                      f"{box}{it['qty']} шт{exp}")

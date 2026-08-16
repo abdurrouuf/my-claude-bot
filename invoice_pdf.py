@@ -16,6 +16,7 @@ from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.platypus import (HRFlowable, Image, Paragraph, SimpleDocTemplate,
                                 Spacer, Table, TableStyle)
 
+import prices
 from db import BISHKEK
 
 log = logging.getLogger(__name__)
@@ -522,7 +523,9 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
     table_data = [header]
     for i, it in enumerate(items, 1):
         subtotal = it["qty"] * it["price"]
-        box_qty = it.get("box_qty")
+        # Коробки в строке — только когда количество делится на коробку ровно
+        # (просьба владельца 16.08.2026: «2 кор (170 шт)» путает людей).
+        box_qty = prices.whole_boxes(it.get("product_id"), it.get("qty"))
         qty_text = f"{it['qty']} шт"
         if box_qty:
             qty_text = f"{box_qty} кор<br/>({it['qty']} шт)"
