@@ -613,7 +613,11 @@ def _build_static_system() -> str:
     parts.append("=== РЕЖИМ 3: ПРИХОД ДЕНЕГ (без товаров) ===")
     parts.append('Если сообщение — только оплата без товаров («Асан приход 5000», «Асан оплатил 3000»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "payment", "client": "Имя контрагента", "amount": сумма, "warehouse": null}')
-    parts.append('- "warehouse": имя склада, если явно указан («со склада Ош»), иначе null.')
+    parts.append('- "client": имя целиком, как написал сотрудник. У многих клиентов в имени '
+                 'есть город или село («Ден Каракол», «Асан Токмок», «Аку Куба Карабалта») — '
+                 'это ЧАСТЬ ИМЕНИ, включай её в "client" и НЕ считай складом.')
+    parts.append('- "warehouse": заполняй ТОЛЬКО если явно прозвучало слово «склад» '
+                 '(«со склада Ош»). Город рядом с именем — не склад, тогда warehouse = null.')
     parts.append("")
     parts.append("=== РЕЖИМ 4: ПРИХОД / ПЕРЕМЕЩЕНИЕ ТОВАРА ===")
     parts.append('Если сообщение — пополнение склада товаром или перемещение между складами '
@@ -836,6 +840,13 @@ def _build_static_system() -> str:
                  'списка — подставь точное имя из списка. Если не похоже ни '
                  'на одно — это новый клиент: оформляй с именем как есть, '
                  'НЕ спрашивай подтверждения и не проверяй существование.')
+    parts.append('- ВАЖНО про подстановку имён: заменяй имя только когда это '
+                 'ОЧЕВИДНО тот же человек (совпадает почти всё слово: '
+                 '«Осон Токмон» → «Асан Токмок»). Короткое имя НЕ раздувай до '
+                 'длинного чужого («Ден» — это НЕ «Данияр Алышбаев») и не '
+                 'выбрасывай из имени слова, включая города («Ден Каракол» '
+                 'остаётся «Ден Каракол»). Сомневаешься — оставь имя как есть, '
+                 'бот сам предложит похожих кнопками.')
     parts.append("")
     parts.append("ПРАЙС-ЛИСТ (формат: №. Название | Фасовка | шт/кор | цена):")
     parts.append(prices.PRICE_LIST_TEXT)
@@ -1393,6 +1404,26 @@ async def start_invoice(update, context, actor, data, draft=False):
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
+    client_name = str(data.get("client") or "").strip()
+    if not client_name:
+        await update.message.reply_text("Не понял имя клиента — напишите ещё раз, имя обязательно.")
+        return
+    # Модель могла подменить имя клиента на созвучное из списка известных
+    # (16.08.2026: «Ден Каракол» → чужой клиент на другом складе). Если имени
+    # нет в самом сообщении — верим тексту человека, а не правке модели.
+    guess = db.client_exact(wh["id"], client_name)
+    if guess and not _name_traceable(str(data.get("_src_text") or ""), guess["name"]):
+        hint = _text_name_hint(str(data.get("_src_text") or ""))
+        alt, alt_wh = _client_by_text(actor, hint)
+        if alt and alt["id"] != guess["id"]:
+            log.warning("Накладная: имя «%s» заменено моделью на «%s» — "
+                        "беру клиента из текста", hint, guess["name"])
+            client_name, wh = alt["name"], alt_wh
+        elif alt is None:
+            await update.message.reply_text(
+                _client_mismatch_msg(hint, guess["name"], wh["name"], "накладную"),
+                parse_mode="HTML")
+            return
     if not draft and not wh["full_mode"]:
         # Склад в режиме черновиков (/fullmode выкл): накладная автоматически
         # становится черновиком. Раньше это зависело ещё и от глобального
@@ -1400,10 +1431,6 @@ async def start_invoice(update, context, actor, data, draft=False):
         # режим определяет только сам склад, иначе «/fullmode выкл» молча
         # проводил бы всё по-настоящему.
         draft = True
-    client_name = str(data.get("client") or "").strip()
-    if not client_name:
-        await update.message.reply_text("Не понял имя клиента — напишите ещё раз, имя обязательно.")
-        return
     try:
         items, warnings = parse_items(data.get("items") or [])
     except ValueError as e:
@@ -2570,13 +2597,73 @@ def commit_payment(p):
     return op_id, c["name"], old_debt, summary
 
 
+# Служебные слова, которые не могут быть частью имени клиента — выкидываем
+# их, чтобы осталось то, как человек НАПИСАЛ имя (защита ниже).
+_PAY_WORDS_RE = re.compile(
+    r"\b(приход\w*|оплат\w*|заплат\w*|плат\w*|погас\w*|внес\w*|внёс|сдал\w*|"
+    r"верн\w*|долг\w*|сом\w*|тысяч\w*|штук\w*|склад\w*|клиент\w*|"
+    r"джарвис|от|за|на|мне|нам|ему|её|его|и|в|с)\b", re.IGNORECASE)
+
+
+def _text_name_hint(src_text: str) -> str:
+    """Имя клиента так, как его написал человек: без чисел и служебных слов."""
+    t = re.sub(r"[\d'’`«»\"().,;:!?—–-]+", " ", str(src_text or ""))
+    return " ".join(_PAY_WORDS_RE.sub(" ", t).split())
+
+
+def _name_traceable(src_text: str, name: str) -> bool:
+    """Есть ли имя клиента в самом сообщении (хотя бы одним словом).
+
+    Защита от подмены имени моделью: 16.08.2026 «Ден Каракол 41'500»
+    (клиент Бишкека) превратилось в оплату другого клиента «Данияр
+    Алышбаев» на складе Каракол — бот показал готовую карточку, деньги
+    ушли бы не туда. Сравнение нечёткое: голосовые распознаются с
+    ошибками («Осон Токмон» → «Асан Токмок» — это нормально).
+    """
+    if not str(src_text or "").strip():
+        return True                       # фото или голос без текста — не с чем сверять
+    words = [w for w in re.findall(r"[^\W\d_]+", src_text.lower()) if len(w) >= 3]
+    parts = [w for w in re.findall(r"[^\W\d_]+", str(name).lower()) if len(w) >= 3]
+    if not parts or not words:
+        return True                       # сверять нечего — не мешаем работать
+    for part in parts:
+        for w in words:
+            if w == part or w[:4] == part[:4] or \
+                    difflib.SequenceMatcher(None, w, part).ratio() >= 0.7:
+                return True
+    return False
+
+
+def _client_mismatch_msg(hint: str, guess_name: str, wh_name: str, what: str) -> str:
+    """Отказ, когда модель подставила клиента, которого в сообщении нет."""
+    seen = (f"В сообщении я вижу «<b>{esc(hint)}</b>», но такого клиента в базе нет. "
+            if hint and len(hint) <= 40 else "")
+    return (f"🤔 {seen}Похоже, я мог перепутать клиента с "
+            f"«<b>{esc(guess_name)}</b>» (склад «{esc(wh_name)}»), поэтому {what} "
+            f"не провожу.\nНапишите имя клиента точно, как в справочнике — "
+            f"посмотреть его можно командой /clients.")
+
+
+def _client_by_text(actor, hint: str):
+    """Клиент по тому, что человек написал сам (без правок ИИ).
+
+    Возвращает (клиент, склад) только при ЕДИНСТВЕННОМ совпадении среди
+    складов, где сотрудник вправе проводить операции; иначе (None, None).
+    """
+    if len(hint) < 3:
+        return None, None
+    found = []
+    for wh in db.operable_warehouses(actor):
+        c = db.client_exact(wh["id"], hint)
+        if c and not any(x[0]["id"] == c["id"] for x in found):
+            found.append((c, wh))
+    return found[0] if len(found) == 1 else (None, None)
+
+
 async def start_payment(update, context, actor, data):
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
-        return
-    if not is_admin(actor) and not wh["full_mode"]:
-        await update.message.reply_text(TRANSITION_HINT)
         return
     client_name = str(data.get("client") or "").strip()
     try:
@@ -2587,13 +2674,33 @@ async def start_payment(update, context, actor, data):
         await update.message.reply_text("Не понял клиента или сумму. Пример: «Асан приход 5000».")
         return
 
+    exact = db.client_exact(wh["id"], client_name)
+    # Имя, которого в сообщении нет, — верить ему нельзя (см. _name_traceable).
+    src_text = str(data.get("_src_text") or "")
+    if exact and not _name_traceable(src_text, exact["name"]):
+        hint = _text_name_hint(src_text)
+        alt, alt_wh = _client_by_text(actor, hint)
+        if alt and alt["id"] != exact["id"]:
+            # Написанное человеком имя нашлось точно — оно и главнее
+            log.warning("Оплата: имя «%s» заменено моделью на «%s» — "
+                        "беру клиента из текста", hint, exact["name"])
+            exact, wh = alt, alt_wh
+        elif alt is None:
+            await update.message.reply_text(
+                _client_mismatch_msg(hint, exact["name"], wh["name"], "оплату"),
+                parse_mode="HTML")
+            return
+
+    if not is_admin(actor) and not wh["full_mode"]:
+        await update.message.reply_text(TRANSITION_HINT)
+        return
+
     payload = {
         "kind": "payment", "user_id": actor["id"], "chat_id": update.effective_chat.id,
         "wh_id": wh["id"], "wh_name": wh["name"],
         "client_name": client_name, "client_id": None, "amount": amount,
     }
 
-    exact = db.client_exact(wh["id"], client_name)
     if exact:
         payload["client_id"] = exact["id"]
         token = new_pending(payload)
@@ -5226,7 +5333,8 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
     chat_histories[chat_id].append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = chat_histories[chat_id][-HISTORY_LIMIT:]
 
-    await dispatch_action(update, context, actor, reply, draft, quiet=quiet)
+    await dispatch_action(update, context, actor, reply, draft, quiet=quiet,
+                          src_text=text)
 
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
@@ -5235,9 +5343,14 @@ WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory", "writeoff",
                      "set_price", "client_alias"}
 
 
-async def dispatch_action(update, context, actor, reply, draft=False, quiet=False):
+async def dispatch_action(update, context, actor, reply, draft=False, quiet=False,
+                          src_text=""):
     data = extract_action(reply)
     if data is not None:
+        # Исходный текст сообщения едет вместе с действием: по нему проверяем,
+        # что модель не подменила имя клиента (_name_traceable). Переживает и
+        # кнопку выбора склада — pick_wh хранит action_data целиком.
+        data["_src_text"] = str(src_text or "")
         # «Проведи за Данияра: Валя приход 1490» — операция от имени сотрудника:
         # запишется на него в журнал, деньги лягут в ЕГО кассу. Только админ.
         as_emp = str(data.pop("as_employee", "") or "").strip()
@@ -5457,7 +5570,8 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history.append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = history[-HISTORY_LIMIT:]
 
-    await dispatch_action(update, context, actor, reply, draft=draft)
+    await dispatch_action(update, context, actor, reply, draft=draft,
+                          src_text=caption)
 
 
 def _build_stt_prompt() -> str:
