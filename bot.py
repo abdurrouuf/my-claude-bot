@@ -9763,6 +9763,61 @@ async def _expiry_report(update, whs):
         caption="\n".join(summary))
 
 
+async def instock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Список товаров В НАЛИЧИИ без количеств (просьба владельца 16.08.2026:
+    «какие товары есть — просто список, без количества»). Удобно пересылать
+    клиентам: цифры остатков — внутренняя кухня."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group and not whs_group:
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if in_group:
+        whs = whs_group
+    elif arg and arg.lower() != "all":
+        wh = db.warehouse_by_name(arg)
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
+            await update.message.reply_text(
+                f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = db.visible_warehouses(actor)
+        if not whs:
+            await update.message.reply_text("У вас нет склада. Пример: /instock Бишкек")
+            return
+        if not arg and await _maybe_ask_warehouse(update, actor, "instock"):
+            return
+    await _instock_report(update, whs, actor, {})
+
+
+async def _instock_report(update, whs, actor, params):
+    sections, summary = [], []
+    for wh in whs:
+        smap = db.stock_map(wh["id"])
+        rows = [[p["name"].split("(")[0].strip(), p["volume"]]
+                for p in prices.PRICE_LIST_DATA if smap.get(p["id"], 0) > 0]
+        if not rows:
+            summary.append(f"📋 «{wh['name']}»: в наличии ничего нет")
+            continue
+        sections.append({"title": f"Склад «{wh['name']}»",
+                         "headers": ["Товар", "Фасовка"],
+                         "rows": rows, "widths": [110, 40], "numbered": True,
+                         "footer": f"В наличии: {len(rows)} поз."})
+        summary.append(f"📋 «{wh['name']}»: в наличии {len(rows)} поз.")
+    if not sections:
+        await update.message.reply_text("\n".join(summary))
+        return
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ТОВАРЫ В НАЛИЧИИ", f"ОсОО «ВЕТОП» · на {date_str}", sections)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"наличие_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary))
+
+
 async def abc_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """АВС-анализ: какие товары и клиенты дают выручку. По реальным накладным;
     пока их нет (переходный период) — по черновикам."""
@@ -9938,6 +9993,10 @@ def _register_report_picks():
             "emoji": "🐌", "question": "Мёртвый товар какого склада показать?",
             "whs": lambda a: db.visible_warehouses(a),
             "render": _deadstock_report},
+        "instock": {
+            "emoji": "📋", "question": "Наличие какого склада показать?",
+            "whs": lambda a: db.visible_warehouses(a),
+            "render": _instock_report},
         "stockcost": {
             "emoji": "💼",
             "question": "Остатки в закупочных ценах какого склада показать?",
@@ -10023,6 +10082,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("price", show_price))
     app.add_handler(CommandHandler("pricepdf", pricepdf_cmd))
     app.add_handler(CommandHandler("stock", show_stock))
+    app.add_handler(CommandHandler("instock", instock_cmd))
     app.add_handler(CommandHandler("stockprice", show_stock_price))
     app.add_handler(CommandHandler("stockat", stockat_cmd))
     app.add_handler(CommandHandler("debts", show_debts))
