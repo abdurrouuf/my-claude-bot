@@ -1083,23 +1083,42 @@ def client_exact(wh_id: int, name: str):
     ).fetchone()
     if row is not None:
         return row
-    if " " not in name:
-        return None
-    # Перестановка слов: считаем совпадением, только если такой клиент
-    # ровно один (двусмысленность решают кнопки похожих в fuzzy_clients).
-    key = _name_key(name)
-    cands = {}
+    if " " in name:
+        # Перестановка слов: считаем совпадением, только если такой клиент
+        # ровно один (двусмысленность решают кнопки похожих в fuzzy_clients).
+        key = _name_key(name)
+        cands = {}
+        for r in conn.execute("SELECT * FROM clients WHERE warehouse_id=?",
+                              (wh_id,)):
+            if _name_key(r["name"]) == key:
+                cands[r["id"]] = r
+        for r in conn.execute(
+                "SELECT a.alias, c.* FROM client_aliases a "
+                "JOIN clients c ON c.id = a.client_id WHERE c.warehouse_id=?",
+                (wh_id,)):
+            if _name_key(r["alias"]) == key:
+                cands[r["id"]] = r
+        if len(cands) == 1:
+            return next(iter(cands.values()))
+        if cands:
+            return None
+    # Почти точное совпадение — опечатка в одну-две буквы («Алмагуль» →
+    # «Алмагул», случай владельца 16.08.2026: бот не находил клиента из-за
+    # мягкого знака). Авто-совпадение только при ЕДИНСТВЕННОМ кандидате
+    # с очень высокой похожестью; двусмысленность решают кнопки fuzzy.
+    low = name.lower()
+    near = {}
     for r in conn.execute("SELECT * FROM clients WHERE warehouse_id=?", (wh_id,)):
-        if _name_key(r["name"]) == key:
-            cands[r["id"]] = r
+        if difflib.SequenceMatcher(None, low, r["name"].lower()).ratio() >= 0.92:
+            near[r["id"]] = r
     for r in conn.execute(
             "SELECT a.alias, c.* FROM client_aliases a "
             "JOIN clients c ON c.id = a.client_id WHERE c.warehouse_id=?",
             (wh_id,)):
-        if _name_key(r["alias"]) == key:
-            cands[r["id"]] = r
-    if len(cands) == 1:
-        return next(iter(cands.values()))
+        if difflib.SequenceMatcher(None, low, r["alias"].lower()).ratio() >= 0.92:
+            near[r["id"]] = r
+    if len(near) == 1:
+        return next(iter(near.values()))
     return None
 
 
