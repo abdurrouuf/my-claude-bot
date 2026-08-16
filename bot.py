@@ -9773,7 +9773,16 @@ async def instock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     whs_group, in_group = await _group_only_feed_whs(update, actor)
     if in_group and not whs_group:
         return
-    arg = " ".join(context.args).strip() if context.args else ""
+    # Число в аргументах — порог остатка: показываем то, чего БОЛЬШЕ N шт
+    # (по умолчанию 5 — просьба владельца 16.08.2026: остатки в 1–5 шт
+    # клиентам не предлагать)
+    min_qty, wh_words = INSTOCK_MIN, []
+    for w in (context.args or []):
+        if w.isdigit():
+            min_qty = max(0, int(w))
+        else:
+            wh_words.append(w)
+    arg = " ".join(wh_words).strip()
     if in_group:
         whs = whs_group
     elif arg and arg.lower() != "all":
@@ -9788,17 +9797,22 @@ async def instock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not whs:
             await update.message.reply_text("У вас нет склада. Пример: /instock Бишкек")
             return
-        if not arg and await _maybe_ask_warehouse(update, actor, "instock"):
+        if not arg and await _maybe_ask_warehouse(update, actor, "instock",
+                                                  {"min": min_qty}):
             return
-    await _instock_report(update, whs, actor, {})
+    await _instock_report(update, whs, actor, {"min": min_qty})
+
+
+INSTOCK_MIN = 5   # «в наличии» = больше стольких штук
 
 
 async def _instock_report(update, whs, actor, params):
+    min_qty = params.get("min", INSTOCK_MIN)
     sections, summary = [], []
     for wh in whs:
         smap = db.stock_map(wh["id"])
         rows = [[p["name"].split("(")[0].strip(), p["volume"]]
-                for p in prices.PRICE_LIST_DATA if smap.get(p["id"], 0) > 0]
+                for p in prices.PRICE_LIST_DATA if smap.get(p["id"], 0) > min_qty]
         if not rows:
             summary.append(f"📋 «{wh['name']}»: в наличии ничего нет")
             continue
