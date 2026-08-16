@@ -149,6 +149,25 @@ def set_data(rows: list):
 _rebuild()
 
 
+def whole_boxes(product_id, qty):
+    """Сколько ЦЕЛЫХ коробок в количестве — только если делится без остатка.
+
+    Иначе None: в документах и сводках пишем просто штуки (просьба владельца
+    16.08.2026 — «2 кор / 170 шт» путает людей, 170 штук это не две коробки;
+    общий итог по коробкам и россыпи стоит внизу документа).
+    """
+    p = BY_ID.get(product_id)
+    if p is None:
+        return None
+    try:
+        per_box, qty = int(p["box"]), int(qty)
+    except (TypeError, ValueError, KeyError):
+        return None
+    if per_box <= 0 or qty <= 0 or qty % per_box:
+        return None
+    return qty // per_box
+
+
 def match_product(name: str, volume: str):
     """Находит товар прайса по названию и фасовке (точно, затем нечётко)."""
     name_l = (name or "").strip().lower()

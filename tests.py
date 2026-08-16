@@ -722,6 +722,15 @@ def test_box_note():
     no_price = {**_item(6, 4, 90), "product_id": None}
     assert bot.box_note_text([no_price]) == "Всего: 4 шт россыпью"
     assert bot.box_note_text([]) == ""
+    # «N кор» в строке позиции — ТОЛЬКО при целых коробках (просьба владельца
+    # 16.08.2026: «170 шт» это не 2 коробки, людей путает)
+    assert bot.box_prefix(_item(6, 170, 90)) == ""        # 170 из 80 — не целые
+    assert bot.box_prefix(_item(6, 160, 90)) == "2 кор / "
+    assert bot.box_prefix(_item(16, 100, 180)) == "1 кор / "
+    assert bot.box_prefix(_item(8, 5, 570)) == ""
+    # старое поле box_qty от ИИ («2к») на показ больше не влияет
+    assert bot.box_prefix({**_item(6, 170, 90), "box_qty": 2}) == ""
+    assert bot.box_prefix({**_item(6, 170, 90), "product_id": None}) == ""
     # строка доезжает до PDF накладной
     pdf = invoice_pdf.generate_pdf_invoice("Мустанг", items, 36150,
                                            prev_debt=0, box_note=note)
