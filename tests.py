@@ -1526,6 +1526,20 @@ def test_admin_only_clients():
     assert err and "только админ" in err
 
 
+def test_client_near_exact_typo():
+    # «Алмагуль» → «Алмагул» (16.08.2026): опечатка в одну-две буквы
+    # находит клиента автоматически, двусмысленность — нет
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], ["Сапаркулова Алмагул", "Асель Талас"])
+    c = db.client_exact(wh["id"], "Сапаркулова Алмагуль")
+    assert c is not None and c["name"] == "Сапаркулова Алмагул"
+    # короткое «Алмагул» — не почти-совпадение с «Сапаркулова Алмагул»
+    assert db.client_exact(wh["id"], "Алмагул") is None
+    # двусмысленность: два очень похожих клиента — авто-совпадения нет
+    db.clients_add_bulk(wh["id"], ["Асел Талас"])
+    assert db.client_exact(wh["id"], "Асэл Талас") is None
+
+
 def test_all_reports_ask_warehouse():
     # Правило проекта 15.08.2026: любой отчёт по складам без аргумента
     # спрашивает кнопками, какой склад показать (+ «Все сразу»)
