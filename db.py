@@ -1102,11 +1102,31 @@ def client_exact(wh_id: int, name: str):
             return next(iter(cands.values()))
         if cands:
             return None
-    # Почти точное совпадение — опечатка в одну-две буквы («Алмагуль» →
-    # «Алмагул», случай владельца 16.08.2026: бот не находил клиента из-за
-    # мягкого знака). Авто-совпадение только при ЕДИНСТВЕННОМ кандидате
-    # с очень высокой похожестью; двусмысленность решают кнопки fuzzy.
     low = name.lower()
+    # Часть имени целыми словами («Алмагул» → «Сапаркулова Алмагул»,
+    # случай владельца 16.08.2026: ИИ сократил имя до одного слова, и
+    # клиент «не находился»). Авто-совпадение — только если клиент с
+    # такими словами в имени/псевдониме ровно один на складе.
+    qwords = set(low.split())
+    if len(low) >= 3:
+        part = {}
+        for r in conn.execute("SELECT * FROM clients WHERE warehouse_id=?",
+                              (wh_id,)):
+            if qwords <= set(r["name"].lower().split()):
+                part[r["id"]] = r
+        for r in conn.execute(
+                "SELECT a.alias, c.* FROM client_aliases a "
+                "JOIN clients c ON c.id = a.client_id WHERE c.warehouse_id=?",
+                (wh_id,)):
+            if qwords <= set(r["alias"].lower().split()):
+                part[r["id"]] = r
+        if len(part) == 1:
+            return next(iter(part.values()))
+        if part:
+            return None   # двусмысленность решают кнопки fuzzy
+    # Почти точное совпадение — опечатка в одну-две буквы («Алмагуль» →
+    # «Алмагул»). Авто-совпадение только при ЕДИНСТВЕННОМ кандидате
+    # с очень высокой похожестью; двусмысленность решают кнопки fuzzy.
     near = {}
     for r in conn.execute("SELECT * FROM clients WHERE warehouse_id=?", (wh_id,)):
         if difflib.SequenceMatcher(None, low, r["name"].lower()).ratio() >= 0.92:
@@ -1415,8 +1435,13 @@ def fuzzy_clients(wh_id: int, name: str, n: int = 3):
     qwords = set(query.split())
     contained = [k for k in mapping if k not in matches and k not in perm and
                  set(k.split()) <= qwords]
+    # И обратное включение: написана ЧАСТЬ имени клиента («Алмагул» ⊂
+    # «Сапаркулова Алмагул») — таких показываем тоже (16.08.2026).
+    containing = [k for k in mapping
+                  if k not in matches and k not in perm
+                  and k not in contained and qwords and qwords <= set(k.split())]
     out, seen = [], set()
-    for m in contained + perm + matches:
+    for m in contained + containing + perm + matches:
         r = mapping[m]
         if r["id"] not in seen:
             seen.add(r["id"])

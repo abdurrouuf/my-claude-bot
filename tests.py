@@ -772,11 +772,13 @@ def test_client_word_order():
     # и в кандидатах-кнопках перестановка тоже есть (первой)
     cands = db.fuzzy_clients(wh["id"], "Чооров Кубан")
     assert cands and cands[0]["name"] == "Кубан Чооров"
-    # одно слово — как раньше, без сюрпризов
-    assert db.client_exact(wh["id"], "Кубан") is None
+    # одно слово имени: единственный клиент со словом находится сам
+    # (с 16.08.2026, случай «Алмагул» → «Сапаркулова Алмагул»)
+    assert db.client_exact(wh["id"], "Кубан")["name"] == "Кубан Чооров"
     # два клиента с одинаковым набором слов — авто-совпадения нет
     _invoice(wh, DANIYAR, "Чооров Кубан", [_item(16, 1, 180)])
     assert db.client_exact(wh["id"], "Кубан Чооров")["name"] == "Кубан Чооров"
+    assert db.client_exact(wh["id"], "Кубан") is None  # теперь их двое
 
 
 def test_log_filters():
@@ -1533,8 +1535,14 @@ def test_client_near_exact_typo():
     db.clients_add_bulk(wh["id"], ["Сапаркулова Алмагул", "Асель Талас"])
     c = db.client_exact(wh["id"], "Сапаркулова Алмагуль")
     assert c is not None and c["name"] == "Сапаркулова Алмагул"
-    # короткое «Алмагул» — не почти-совпадение с «Сапаркулова Алмагул»
+    # часть имени целым словом: «Алмагул» — единственная на складе
+    c = db.client_exact(wh["id"], "Алмагул")
+    assert c is not None and c["name"] == "Сапаркулова Алмагул"
+    # двусмысленность части имени: два клиента со словом — авто-нет, кнопки
+    db.clients_add_bulk(wh["id"], ["Алмагул Ош"])
     assert db.client_exact(wh["id"], "Алмагул") is None
+    names = [x["name"] for x in db.fuzzy_clients(wh["id"], "Алмагул")]
+    assert "Сапаркулова Алмагул" in names and "Алмагул Ош" in names
     # двусмысленность: два очень похожих клиента — авто-совпадения нет
     db.clients_add_bulk(wh["id"], ["Асел Талас"])
     assert db.client_exact(wh["id"], "Асэл Талас") is None
