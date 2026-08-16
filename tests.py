@@ -755,6 +755,67 @@ def test_box_note():
     assert "1 кор / 100 шт" in bot.transfer_summary(tr)
 
 
+def test_client_substitution_guard():
+    """Модель не должна подменять клиента на созвучного (16.08.2026).
+
+
+    Владелец написал «Ден Каракол 41'500» (клиент Бишкека) — бот показал
+    карточку прихода другого клиента «Данияр Алышбаев» на складе Каракол.
+    Теперь имя, которого нет в сообщении, не принимается на веру.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    kk = _fresh_db()
+    bish = db.warehouse_by_name("Бишкек")
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1")
+    conn.commit()
+    db.clients_add_bulk(bish["id"], [("Ден Каракол", 4969660)])
+    db.clients_add_bulk(kk["id"], [("Данияр Алышбаев", 101835), ("Асан Токмок", 5000)])
+    admin = db.get_user(ADMIN)
+
+    assert not bot._name_traceable("Ден Каракол 41500", "Данияр Алышбаев")
+    # голосовое распознаётся с ошибками — такую правку модели не трогаем
+    assert bot._name_traceable("Осон Токмон оплатил 3000", "Асан Токмок")
+    assert bot._name_traceable("", "Кто угодно")      # фото: сверять не с чем
+    assert bot._text_name_hint("Ден Каракол 41'500") == "Ден Каракол"
+
+    sent = []
+
+    async def reply(text, **kw):
+        sent.append(text)
+
+    upd = SimpleNamespace(message=SimpleNamespace(reply_text=reply),
+                          effective_chat=SimpleNamespace(id=1, type="private"))
+
+    def pay(client, wh_name, src):
+        asyncio.run(bot.start_payment(upd, None, admin, {
+            "action": "payment", "client": client, "amount": 41500,
+            "warehouse": wh_name, "_src_text": src}))
+        return sent[-1]
+
+    # подмена: бот берёт клиента из текста человека, вместе с его складом
+    out = pay("Данияр Алышбаев", "Каракол", "Ден Каракол 41'500")
+    assert "Ден Каракол" in out and "Бишкек" in out and "4'969'660" in out
+    assert "Данияр" not in out
+    # подмена, а в тексте клиента нет вовсе — оплата не проводится
+    out = pay("Данияр Алышбаев", "Каракол", "Бекмурат Ош 41500")
+    assert "не провожу" in out and "Подтвердите приход" not in out
+    # обычная оплата не пострадала
+    out = pay("Асан Токмок", "Каракол", "Асан Токмок приход 41500")
+    assert "Подтвердите приход" in out and "Асан Токмок" in out
+
+    # накладная: та же защита
+    items = [_item(6, 5, 90)]
+    _load(kk, {6: 100})
+    asyncio.run(bot.start_invoice(upd, None, admin, {
+        "action": "invoice", "client": "Данияр Алышбаев", "warehouse": "Каракол",
+        "items": [{"name": i["name"], "volume": i["volume"], "qty": i["qty"],
+                   "price": i["price"]} for i in items],
+        "payment": 0, "_src_text": "Бекмурат Ош Альтопен 100мл 5 шт"}))
+    assert "не провожу" in sent[-1]
+
+
 def test_certs():
     """Сертификаты соответствия: хранение, поиск препарата, удаление."""
     _fresh_db()
