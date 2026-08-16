@@ -1548,6 +1548,29 @@ def test_client_near_exact_typo():
     assert db.client_exact(wh["id"], "Асэл Талас") is None
 
 
+def test_instock_report():
+    # /instock — список товаров в наличии без количеств (16.08.2026)
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {16: 50, 28: 3})
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"], out["cap"] = document.input_file_content, caption
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.instock_cmd(upd, SimpleNamespace(args=[wh["name"]])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+    assert "в наличии 2 поз." in out["cap"]
+
+
 def test_all_reports_ask_warehouse():
     # Правило проекта 15.08.2026: любой отчёт по складам без аргумента
     # спрашивает кнопками, какой склад показать (+ «Все сразу»)
@@ -1570,7 +1593,8 @@ def test_all_reports_ask_warehouse():
             message=Msg())
 
     cmds = [bot.clients_cmd, bot.report_cmd, bot.olddebts_cmd,
-            bot.minstock_cmd, bot.deadstock_cmd, bot.stockcost_cmd]
+            bot.minstock_cmd, bot.deadstock_cmd, bot.stockcost_cmd,
+            bot.instock_cmd]
 
     async def run():
         db.set_setting("usd_rate", "87.5")   # для /stockcost
