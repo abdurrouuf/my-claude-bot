@@ -1553,7 +1553,7 @@ def test_instock_report():
     import asyncio
     from types import SimpleNamespace
     wh = _fresh_db()
-    _load(wh, {16: 50, 28: 3})
+    _load(wh, {16: 50, 28: 3, 30: 6})
     out = {}
 
     class Msg:
@@ -1566,9 +1566,14 @@ def test_instock_report():
     upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
                           effective_chat=SimpleNamespace(id=1, type="private"),
                           message=Msg())
+    # по умолчанию показывается только то, чего больше 5 шт (16.08.2026):
+    # 50 и 6 попадают, 3 — нет
     asyncio.run(bot.instock_cmd(upd, SimpleNamespace(args=[wh["name"]])))
     assert out.get("pdf", b"")[:4] == b"%PDF"
     assert "в наличии 2 поз." in out["cap"]
+    # свой порог числом: /instock Склад 10 — только 50 шт
+    asyncio.run(bot.instock_cmd(upd, SimpleNamespace(args=[wh["name"], "10"])))
+    assert "в наличии 1 поз." in out["cap"]
 
 
 def test_all_reports_ask_warehouse():
