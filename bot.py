@@ -9767,6 +9767,16 @@ async def instock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Список товаров В НАЛИЧИИ без количеств (просьба владельца 16.08.2026:
     «какие товары есть — просто список, без количества»). Удобно пересылать
     клиентам: цифры остатков — внутренняя кухня."""
+    await _instock_cmd(update, context, with_prices=False)
+
+
+async def instockprice_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """То же, но с ценой прайса у каждой позиции (просьба владельца
+    16.08.2026) — готовый «прайс наличия» для клиента."""
+    await _instock_cmd(update, context, with_prices=True)
+
+
+async def _instock_cmd(update, context, with_prices: bool):
     actor = await get_actor(update)
     if actor is None:
         return
@@ -9797,10 +9807,12 @@ async def instock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not whs:
             await update.message.reply_text("У вас нет склада. Пример: /instock Бишкек")
             return
-        if not arg and await _maybe_ask_warehouse(update, actor, "instock",
-                                                  {"min": min_qty}):
+        key = "instockprice" if with_prices else "instock"
+        if not arg and await _maybe_ask_warehouse(
+                update, actor, key, {"min": min_qty, "prices": with_prices}):
             return
-    await _instock_report(update, whs, actor, {"min": min_qty})
+    await _instock_report(update, whs, actor,
+                          {"min": min_qty, "prices": with_prices})
 
 
 INSTOCK_MIN = 5   # «в наличии» = больше стольких штук
@@ -9808,17 +9820,26 @@ INSTOCK_MIN = 5   # «в наличии» = больше стольких шту
 
 async def _instock_report(update, whs, actor, params):
     min_qty = params.get("min", INSTOCK_MIN)
+    with_prices = params.get("prices", False)
     sections, summary = [], []
     for wh in whs:
         smap = db.stock_map(wh["id"])
-        rows = [[p["name"].split("(")[0].strip(), p["volume"]]
-                for p in prices.PRICE_LIST_DATA if smap.get(p["id"], 0) > min_qty]
+        rows = []
+        for p in prices.PRICE_LIST_DATA:
+            if smap.get(p["id"], 0) <= min_qty:
+                continue
+            row = [p["name"].split("(")[0].strip(), p["volume"]]
+            if with_prices:
+                row.append(fmt_num(p["price"]))
+            rows.append(row)
         if not rows:
             summary.append(f"📋 «{wh['name']}»: в наличии ничего нет")
             continue
+        headers = ["Товар", "Фасовка"] + (["Цена, сом"] if with_prices else [])
+        widths = [88, 32, 30] if with_prices else [110, 40]
         sections.append({"title": f"Склад «{wh['name']}»",
-                         "headers": ["Товар", "Фасовка"],
-                         "rows": rows, "widths": [110, 40], "numbered": True,
+                         "headers": headers,
+                         "rows": rows, "widths": widths, "numbered": True,
                          "footer": f"В наличии: {len(rows)} поз."})
         summary.append(f"📋 «{wh['name']}»: в наличии {len(rows)} поз.")
     if not sections:
@@ -10011,6 +10032,10 @@ def _register_report_picks():
             "emoji": "📋", "question": "Наличие какого склада показать?",
             "whs": lambda a: db.visible_warehouses(a),
             "render": _instock_report},
+        "instockprice": {
+            "emoji": "💰", "question": "Наличие с ценами какого склада показать?",
+            "whs": lambda a: db.visible_warehouses(a),
+            "render": _instock_report},
         "stockcost": {
             "emoji": "💼",
             "question": "Остатки в закупочных ценах какого склада показать?",
@@ -10097,6 +10122,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("pricepdf", pricepdf_cmd))
     app.add_handler(CommandHandler("stock", show_stock))
     app.add_handler(CommandHandler("instock", instock_cmd))
+    app.add_handler(CommandHandler("instockprice", instockprice_cmd))
     app.add_handler(CommandHandler("stockprice", show_stock_price))
     app.add_handler(CommandHandler("stockat", stockat_cmd))
     app.add_handler(CommandHandler("debts", show_debts))

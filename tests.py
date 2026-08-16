@@ -1574,6 +1574,10 @@ def test_instock_report():
     # свой порог числом: /instock Склад 10 — только 50 шт
     asyncio.run(bot.instock_cmd(upd, SimpleNamespace(args=[wh["name"], "10"])))
     assert "в наличии 1 поз." in out["cap"]
+    # /instockprice — то же с ценами (16.08.2026)
+    asyncio.run(bot.instockprice_cmd(upd, SimpleNamespace(args=[wh["name"]])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+    assert "в наличии 2 поз." in out["cap"]
 
 
 def test_all_reports_ask_warehouse():
