@@ -1045,6 +1045,16 @@ def box_prefix(it) -> str:
     return f"{boxes} кор / " if boxes else ""
 
 
+def box_lines(items) -> list:
+    """Строка «сколько это коробок» для карточки подтверждения в чате.
+
+    Просьба владельца 16.08.2026: итог по коробкам виден не только в PDF,
+    но и при подтверждении операции — до нажатия «Провести».
+    """
+    note = box_note_text(items)
+    return ["", f"📦 {esc(note)}"] if note else []
+
+
 def box_breakdown(items):
     """Сколько это коробок и штук (просьба владельца 16.08.2026).
 
@@ -1211,6 +1221,7 @@ def invoice_summary(p) -> str:
         lines.append("")
         for w in warns:
             lines.append(f"⚠️ {esc(w)}")
+    lines += box_lines(p["items"])
     lines.append("")
     lines.append("Провести накладную?")
     return "\n".join(lines)
@@ -1783,6 +1794,7 @@ def amend_summary(p, old_total: float) -> str:
     if p["warnings"]:
         lines.append("")
         lines += [f"⚠️ {esc(w)}" for w in p["warnings"]]
+    lines += box_lines(p["items"])
     lines += ["", "Заменить накладную?"]
     return "\n".join(lines)
 
@@ -2350,6 +2362,7 @@ def return_summary(p) -> str:
         lines.append(f"📊 Долг после возврата: <b>{money(new_debt)}</b>")
     for w in p.get("warnings", []):
         lines.append(f"⚠️ {esc(w)}")
+    lines += box_lines(p["items"])
     lines.append("")
     lines.append("Товар вернётся на склад, долг клиента уменьшится. Провести возврат?")
     return "\n".join(lines)
@@ -2648,6 +2661,7 @@ def transfer_summary(p) -> str:
         lines.append("")
         for w in warns:
             lines.append(f"⚠️ {esc(w)}")
+    lines += box_lines(p["items"])
     lines.append("")
     lines.append("Провести?")
     return "\n".join(lines)
@@ -3454,6 +3468,7 @@ def writeoff_summary(p) -> str:
                          f"{smap.get(pid, 0)} шт — остаток уйдёт в минус")
     for w in p.get("warnings", []):
         lines.append(f"⚠️ {esc(w)}")
+    lines += box_lines(p["items"])
     lines.append("")
     lines.append("Списать этот товар со склада?")
     return "\n".join(lines)
