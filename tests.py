@@ -735,6 +735,24 @@ def test_box_note():
     pdf = invoice_pdf.generate_pdf_invoice("Мустанг", items, 36150,
                                            prev_debt=0, box_note=note)
     assert pdf.getvalue().startswith(b"%PDF")
+    # ...и до карточек подтверждения в чате (просьба владельца 16.08.2026)
+    wh = db.warehouse_by_name("Каракол")
+    inv = {"kind": "invoice", "user_id": ADMIN, "wh_id": wh["id"],
+           "wh_name": wh["name"], "client_name": "Мустанг", "client_id": None,
+           "items": items, "payment": 0, "parsed_debt": 0, "phone": None,
+           "warnings": []}
+    assert f"📦 {note}" in bot.invoice_summary(inv)
+    tr = {"kind": "transfer", "from_wh_id": None, "from_wh_name": None,
+          "wh_id": wh["id"], "wh_name": wh["name"], "items": items,
+          "warnings": []}
+    assert f"📦 {note}" in bot.transfer_summary(tr)
+    wo = {"kind": "writeoff", "user_id": ADMIN, "wh_id": wh["id"],
+          "wh_name": wh["name"], "reason": "просрочка", "items": items,
+          "warnings": []}
+    assert f"📦 {note}" in bot.writeoff_summary(wo)
+    # в карточке позиции показаны по тому же правилу целых коробок
+    assert "— 170 шт" in bot.transfer_summary(tr)
+    assert "1 кор / 100 шт" in bot.transfer_summary(tr)
 
 
 def test_certs():
