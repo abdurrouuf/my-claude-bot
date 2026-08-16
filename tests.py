@@ -16,6 +16,7 @@ os.environ["DB_PATH"] = os.path.join(_TMP, "test.db")
 import bot                                    # noqa: E402
 import buy_prices_data                        # noqa: E402
 import db                                     # noqa: E402
+import invoice_pdf                             # noqa: E402
 import prices                                 # noqa: E402
 
 ADMIN = bot.ADMIN_ID
@@ -693,6 +694,38 @@ def test_writeoff_pdf_and_summary():
           "items": [_item(16, 3, 180)]}
     _, s2, _ = bot.commit_writeoff(p2)
     assert s2.startswith("Списание (просрочка): ")
+
+
+def test_box_note():
+    """Строка «сколько это коробок» в накладной и приходе (16.08.2026).
+
+    Коробки считаются по вместимости прайса на каждую позицию: целые
+    складываются, остаток идёт россыпью; «места» — с неполными коробками.
+    """
+    _fresh_db()
+    # №6 АЛЬТОПЕН 100 мл — 80 шт/кор, №16 ДЕКСАТОП 50 мл — 100 шт/кор,
+    # №8 АЛЬТОПЕН 1 л — 12 шт/кор
+    items = [_item(6, 170, 90), _item(16, 100, 180), _item(8, 5, 570)]
+    assert bot.box_breakdown(items) == (3, 15, 275, 5)
+    note = bot.box_note_text(items)
+    assert note == "Всего: 3 кор. + 15 шт россыпью (275 шт) · мест примерно 5"
+    # в приходе общее число штук уже есть в строке «Итого» — не повторяем
+    assert bot.box_note_text(items, with_total=False) == \
+        "Всего: 3 кор. + 15 шт россыпью · мест примерно 5"
+    # ровно коробка — без россыпи и без «мест» (число то же самое)
+    assert bot.box_note_text([_item(6, 160, 90)]) == "Всего: 2 кор. (160 шт)"
+    # мелочь: одна позиция — просто штуки, без лишнего «мест примерно 1»
+    assert bot.box_note_text([_item(6, 7, 90)]) == "Всего: 7 шт россыпью"
+    assert bot.box_note_text([_item(6, 7, 90), _item(8, 3, 570)]) == \
+        "Всего: 10 шт россыпью · мест примерно 2"
+    # товар вне прайса коробки не имеет — считается только в штуках
+    no_price = {**_item(6, 4, 90), "product_id": None}
+    assert bot.box_note_text([no_price]) == "Всего: 4 шт россыпью"
+    assert bot.box_note_text([]) == ""
+    # строка доезжает до PDF накладной
+    pdf = invoice_pdf.generate_pdf_invoice("Мустанг", items, 36150,
+                                           prev_debt=0, box_note=note)
+    assert pdf.getvalue().startswith(b"%PDF")
 
 
 def test_certs():

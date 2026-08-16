@@ -7,7 +7,7 @@ from datetime import datetime
 from xml.sax.saxutils import escape as xml_escape
 
 from reportlab.lib import colors
-from reportlab.lib.enums import TA_CENTER, TA_LEFT
+from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_RIGHT
 from reportlab.lib.pagesizes import A5
 from reportlab.lib.styles import ParagraphStyle
 from reportlab.lib.units import mm
@@ -439,7 +439,7 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                          payment=0, is_payment=False, warehouse_name=None,
                          draft=False, watermark=True, doc_title=None,
                          total_label=None, extra_totals=None,
-                         doc_number=None) -> io.BytesIO:
+                         doc_number=None, box_note=None) -> io.BytesIO:
     """Красивый PDF: логотип, таблица товаров, итоги.
 
     draft=True не меняет содержимое, только оформление: водяной знак и пометка
@@ -447,6 +447,8 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
     doc_title/total_label/extra_totals позволяют строить производные документы
     (например, возвратную накладную): extra_totals — список (подпись, сумма),
     он заменяет стандартный блок долгов и оплат.
+    box_note — строка «сколько это коробок» мелким шрифтом в правом нижнем
+    углу под итогами (просьба владельца 16.08.2026).
     """
     show_mark = draft and watermark
     font_name, font_bold_name = _register_fonts()
@@ -473,6 +475,11 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
     slogan_style = ParagraphStyle('slogan', fontName=font_name, fontSize=9,
                                   leading=12, alignment=TA_CENTER,
                                   textColor=HEADER_GREEN, spaceAfter=3)
+    # Коробки/штуки — мелко и в правом углу, чтобы не спорить с итогами денег
+    box_style = ParagraphStyle('boxnote', fontName=font_name, fontSize=7,
+                               leading=9, alignment=TA_RIGHT,
+                               textColor=colors.HexColor("#555555"),
+                               spaceBefore=1)
 
     story = []
 
@@ -591,6 +598,9 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                                    total_style))
         else:
             story.append(Paragraph("Переплата полностью зачтена.", total_style))
+
+    if box_note:
+        story.append(Paragraph(xml_escape(str(box_note)), box_style))
 
     story.append(Spacer(1, 2*mm))
     story.append(HRFlowable(width="100%", thickness=0.6, color=HEADER_GREEN))

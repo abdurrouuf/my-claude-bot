@@ -1039,6 +1039,61 @@ def parse_items(raw_items: list):
     return items, warnings
 
 
+def box_breakdown(items):
+    """Сколько это коробок и штук (просьба владельца 16.08.2026).
+
+    По каждой позиции количество раскладывается по вместимости коробки из
+    прайса (поле box): целые коробки складываются, остаток идёт «россыпью».
+    «Места» — сколько коробок займёт при погрузке, неполная коробка тоже
+    место. Товар вне прайса (product_id пуст) считается только в штуках.
+    Возвращает (коробки, россыпь, всего_штук, места).
+    """
+    boxes = loose = total = places = 0
+    for it in items:
+        try:
+            qty = int(it.get("qty") or 0)
+        except (TypeError, ValueError):
+            continue
+        if qty <= 0:
+            continue
+        total += qty
+        product = prices.BY_ID.get(it.get("product_id")) if it.get("product_id") else None
+        try:
+            per_box = int(product["box"]) if product else 0
+        except (TypeError, ValueError, KeyError):
+            per_box = 0
+        if per_box <= 0:
+            loose += qty
+            continue
+        boxes += qty // per_box
+        rest = qty % per_box
+        loose += rest
+        places += qty // per_box + (1 if rest else 0)
+    return boxes, loose, total, places
+
+
+def box_note_text(items, with_total=True, prefix="Всего: ") -> str:
+    """Строка «сколько это коробок» для накладной и прихода/перемещения."""
+    boxes, loose, total, places = box_breakdown(items)
+    if total <= 0:
+        return ""
+    if boxes and loose:
+        text = f"{prefix}{fmt_num(boxes)} кор. + {fmt_num(loose)} шт россыпью"
+        if with_total:
+            text += f" ({fmt_num(total)} шт)"
+    elif boxes:
+        text = f"{prefix}{fmt_num(boxes)} кор."
+        if with_total:
+            text += f" ({fmt_num(total)} шт)"
+    else:
+        # Целых коробок нет — общее число штук уже названо, не повторяем
+        text = f"{prefix}{fmt_num(total)} шт россыпью"
+    if places > 1 and places != boxes:
+        # Полные коробки + неполные: сколько мест реально поедет в машине
+        text += f" · мест примерно {fmt_num(places)}"
+    return text
+
+
 def resolve_warehouse(actor, wh_name: str):
     """Склад для операции: указанный (с проверкой доступа) или собственный.
 
@@ -1262,6 +1317,7 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total,
         prev_debt=old_debt, payment=p["payment"], is_payment=p["payment"] > 0,
         warehouse_name=p["wh_name"], draft=draft, watermark=DRAFT_WATERMARK,
         doc_number=op_id,  # у черновика номера нет — он не операция журнала
+        box_note=box_note_text(p["items"]),
     )
     date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
     marked = draft and DRAFT_WATERMARK
@@ -2612,7 +2668,10 @@ async def send_transfer_pdf(context, chat_id, p, op_id, summary, caption=None):
         f"операция №{op_id}",
         [{"headers": ["Товар", "Фасовка", "Количество", "Срок годности"],
           "rows": rows, "widths": [82, 26, 32, 27], "numbered": True,
-          "footer": f"Итого: {len(rows)} позиций · {fmt_num(total)} шт"}])
+          "footer": f"Итого: {len(rows)} позиций · {fmt_num(total)} шт"}],
+        # Коробки внизу отчёта (просьба владельца 16.08.2026); общее число
+        # штук уже стоит в строке «Итого» — здесь только коробки и места
+        footer=box_note_text(p["items"], with_total=False))
     await context.bot.send_document(
         chat_id=chat_id,
         document=InputFile(pdf, filename=(
