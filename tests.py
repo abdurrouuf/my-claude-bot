@@ -937,6 +937,63 @@ def test_feed_return_pdf():
     assert not sent
 
 
+def test_rename_client():
+    """«переименуй клиента X в Y»: имя меняется, долг/история/спеццены
+    остаются, старое имя — псевдонимом; занятое имя — отказ (17.08.2026)."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], [("Сапаркулова Алмагул", 170840),
+                                   ("Асан Токмок", 5000)])
+    c = db.client_exact(wh["id"], "Сапаркулова Алмагул")
+    db.set_client_price(c["id"], 6, 85)
+    admin = db.get_user(ADMIN)
+    sent = []
+
+    async def reply(text, **kw):
+        sent.append(text)
+
+    upd = SimpleNamespace(message=SimpleNamespace(reply_text=reply),
+                          effective_chat=SimpleNamespace(id=1, type="private"))
+
+    def start(client, new_name):
+        asyncio.run(bot.start_rename_client(upd, None, admin, {
+            "action": "rename_client", "client": client, "new_name": new_name}))
+        return sent[-1]
+
+    # занятое имя — отказ без карточки
+    out = start("Сапаркулова Алмагул", "Асан Токмок")
+    assert "уже занято" in out
+    # нормальный путь: карточка → кнопка «Провести»
+    out = start("Сапаркулова Алмагул", "Сапаркулова Алмагуль")
+    assert "Переименование клиента" in out and "170'840" in out
+    token = next(iter(bot.PENDING))
+    q = SimpleNamespace(data=f"ok:{token}",
+                        from_user=SimpleNamespace(id=ADMIN),
+                        message=SimpleNamespace(chat=SimpleNamespace(id=1)),
+                        answer=_noop_async, edit_message_text=reply)
+    u2 = SimpleNamespace(callback_query=q, effective_user=SimpleNamespace(id=ADMIN))
+    asyncio.run(bot.on_callback(u2, SimpleNamespace(bot=None)))
+    assert "Переименовано" in sent[-1]
+    c2 = db.client_get(c["id"])
+    assert c2["name"] == "Сапаркулова Алмагуль"
+    assert c2["debt"] == 170840                            # долг не тронут
+    assert db.client_prices_map(c["id"]) == {6: 85.0}      # спеццена на месте
+    # старое имя — псевдонимом: находится и по нему, и по новому
+    assert "Сапаркулова Алмагул" in db.client_aliases_list(c["id"])
+    assert db.client_exact(wh["id"], "Сапаркулова Алмагул")["id"] == c["id"]
+    assert db.client_exact(wh["id"], "Сапаркулова Алмагуль")["id"] == c["id"]
+    # сотруднику — отказ
+    dan = db.get_user(DANIYAR)
+    asyncio.run(bot.start_rename_client(upd, None, dan, {
+        "action": "rename_client", "client": "Асан Токмок", "new_name": "X"}))
+    assert "только админ" in sent[-1]
+
+
+async def _noop_async(*a, **k):
+    pass
+
+
 def test_certs():
     """Сертификаты соответствия: хранение, поиск препарата, удаление."""
     _fresh_db()

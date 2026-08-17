@@ -1154,6 +1154,33 @@ def client_aliases_list(client_id: int) -> list:
         "SELECT alias FROM client_aliases WHERE client_id=? ORDER BY alias", (client_id,))]
 
 
+def rename_client(client_id: int, new_name: str, keep_old_alias: bool = True):
+    """Переименование контрагента (17.08.2026, просьба владельца).
+
+    Долг, журнал операций, телефон, спеццены и псевдонимы привязаны к id —
+    меняется только имя. Старое имя по умолчанию остаётся псевдонимом, чтобы
+    привычные фразы и голосовые продолжили находить клиента. Псевдоним,
+    совпавший с новым именем, убирается (дубль). Проверку занятости нового
+    имени делает вызывающий код (bot.start_rename_client).
+    Возвращает старое имя."""
+    conn = connect()
+    with _lock, conn:
+        row = conn.execute("SELECT name FROM clients WHERE id=?",
+                           (client_id,)).fetchone()
+        if row is None:
+            raise ValueError("клиент не найден")
+        old_name = row["name"]
+        conn.execute("UPDATE clients SET name=? WHERE id=?",
+                     (new_name.strip(), client_id))
+        conn.execute("DELETE FROM client_aliases WHERE client_id=? "
+                     "AND alias=? COLLATE NOCASEU", (client_id, new_name.strip()))
+        if keep_old_alias and old_name.lower() != new_name.strip().lower():
+            conn.execute(
+                "INSERT OR IGNORE INTO client_aliases(client_id, alias) VALUES(?,?)",
+                (client_id, old_name))
+        return old_name
+
+
 # ---------- Заявки-карточки: зеркало в базе (переживают деплой) ----------
 
 def pending_save(token: str, payload_json: str, expires: float):
