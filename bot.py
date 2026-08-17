@@ -7589,6 +7589,57 @@ async def cash_alert_loop(app):
             log.exception("Ошибка напоминания о кассах")
 
 
+API_ALERT_USD = float(os.environ.get("API_ALERT_USD", "3"))
+
+
+async def send_api_balance_alert(bot) -> bool:
+    """Тревога админу, когда счёт API на исходе (18.08.2026, «делай» владельца
+    после скриншота консоли: $5.92 на счёте и выключенный auto reload).
+
+    Работает только если владелец задал /apibalance; ниже порога
+    API_ALERT_USD (по умолчанию $3) — письмо с оценкой, на сколько дней
+    хватит по расходу последних 14 дней. Возвращает, отправлено ли."""
+    balance = db.get_setting("api_balance")
+    balance_ts = db.get_setting("api_balance_ts")
+    if not balance or not balance_ts:
+        return False
+    _, spent_since = db.api_usage_since(balance_ts)
+    remaining = float(balance) - spent_since
+    if remaining >= API_ALERT_USD:
+        return False
+    two_weeks_ago = (datetime.now(BISHKEK) - timedelta(days=14)).isoformat(
+        timespec="seconds")
+    _, spent_14d = db.api_usage_since(two_weeks_ago)
+    per_day = spent_14d / 14
+    days = f" — при текущем расходе это ~{int(remaining / per_day)} дн." \
+        if per_day > 0 and remaining > 0 else ""
+    text = (f"⚠️ <b>Счёт API заканчивается</b>\n"
+            f"Осталось примерно <b>${max(remaining, 0):.2f}</b>{days}\n\n"
+            f"Когда деньги кончатся, бот перестанет понимать обычные "
+            f"сообщения и голосовые (команды /stock, /debts и кнопки "
+            f"продолжат работать).\n"
+            f"Пополните на platform.claude.com → Billing (лучше включить "
+            f"Set up auto reload) и напишите /apibalance с новой суммой.")
+    await bot.send_message(ADMIN_ID, text, parse_mode="HTML")
+    return True
+
+
+async def api_balance_alert_loop(app):
+    while True:
+        now = datetime.now(BISHKEK)
+        target = now.replace(hour=9, minute=5, second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            if not db.claim_daily_job(
+                    f"api_alert:{datetime.now(BISHKEK).date().isoformat()}"):
+                continue
+            await send_api_balance_alert(app.bot)
+        except Exception:
+            log.exception("Ошибка тревоги о балансе API")
+
+
 async def evening_summary_loop(app):
     while True:
         now = datetime.now(BISHKEK)
@@ -10582,6 +10633,7 @@ async def _post_init(app):
     app.create_task(monthly_deadstock_loop(app))
     app.create_task(draft_summary_loop(app))
     app.create_task(promise_reminder_loop(app))
+    app.create_task(api_balance_alert_loop(app))
 
 
 if __name__ == "__main__":
