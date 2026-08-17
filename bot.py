@@ -1420,6 +1420,13 @@ async def start_invoice(update, context, actor, data, draft=False):
                         "беру клиента из текста", hint, guess["name"])
             client_name, wh = alt["name"], alt_wh
         elif alt is None:
+            # Клиент админа в чате склада — там бот молчит всегда (вариант 3А:
+            # сообщение сотрудника про такого клиента = сборочный лист).
+            if (update.effective_chat is not None
+                    and update.effective_chat.type != "private"
+                    and guess["id"] in admin_only_client_ids()
+                    and not is_admin(actor)):
+                return
             await update.message.reply_text(
                 _client_mismatch_msg(hint, guess["name"], wh["name"], "накладную"),
                 parse_mode="HTML")
