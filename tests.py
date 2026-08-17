@@ -897,6 +897,46 @@ def test_revision_170826():
     assert "не провожу" in sent[-1]
 
 
+def test_feed_return_pdf():
+    """Возврат в ленту чата — PDF без цен и без долга (18.08.2026).
+
+    Текстовая сводка возврата светила долг клиента в общий чат
+    (долги Бишкека скрыты /hidedebts) — теперь в ленту идёт PDF
+    «как перемещение»: товар, количество, срок.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET feed_chat_id=-100500 WHERE id=?",
+                 (wh["id"],))
+    conn.commit()
+    sent = {}
+
+    class Bot:
+        async def send_document(self, chat_id, document, caption=None,
+                                parse_mode=None):
+            sent["chat"] = chat_id
+            sent["caption"] = caption
+            sent["pdf"] = document.input_file_content
+
+    ctx = SimpleNamespace(bot=Bot())
+    p = {"items": [{**_item(10, 20, 120), "expiry": "11.2027"}],
+         "wh_id": wh["id"], "wh_name": wh["name"]}
+    asyncio.run(bot.feed_return_pdf(ctx, wh["id"], "Динислам Токмок", p,
+                                    215, "Абдурроууф"))
+    assert sent["chat"] == -100500
+    assert sent["pdf"][:4] == b"%PDF"
+    assert "долг" not in sent["caption"].lower()
+    assert "сом" not in sent["caption"].lower()      # ни сумм, ни цен
+    assert "Динислам Токмок" in sent["caption"]
+    # чат-исключение: операция из самого чата склада не дублируется
+    sent.clear()
+    asyncio.run(bot.feed_return_pdf(ctx, wh["id"], "Клиент", p, 1, "X",
+                                    exclude_chat_id=-100500))
+    assert not sent
+
+
 def test_certs():
     """Сертификаты соответствия: хранение, поиск препарата, удаление."""
     _fresh_db()
