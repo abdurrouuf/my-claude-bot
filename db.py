@@ -1518,9 +1518,21 @@ def product_batches_of(wh_id: int, product_id: int):
         f"ORDER BY {_BATCH_ORDER}", (wh_id, product_id)).fetchall()
 
 
-def _revert_batches(conn, batch_deltas):
-    for wh, pid, exp, chg in batch_deltas or []:
-        _batch_add(conn, wh, pid, exp, -chg)
+def _revert_batches(conn, batch_deltas, stock_deltas=None):
+    """Откат партий операции.
+
+    У операций ДО партионного учёта (до миграции batches_v1 от 24.07.2026)
+    batch_deltas нет вовсе: сторно тогда меняло остаток, но не партии, и
+    инвариант «сумма партий = остаток склада» ломался навсегда (находка
+    ревизии 17.08.2026). Для таких операций откатываем партии по остаткам:
+    минус — FEFO, плюс — в партию «без срока».
+    """
+    if batch_deltas:
+        for wh, pid, exp, chg in batch_deltas:
+            _batch_add(conn, wh, pid, exp, -chg)
+        return
+    for wh, pid, d in stock_deltas or []:
+        _apply_batches(conn, wh, pid, -d)
 
 
 def _commit_op(conn, user_id: int, op_type: str, warehouse_id, client_id,
@@ -1605,7 +1617,8 @@ def replace_operation(old_op_id: int, user_id: int, op_type: str, warehouse_id,
         data = json.loads(op["data"])
         for wh, pid, d in data.get("stock_deltas", []):
             _apply_stock(conn, wh, pid, -d)
-        _revert_batches(conn, data.get("batch_deltas"))
+        _revert_batches(conn, data.get("batch_deltas"),
+                        data.get("stock_deltas"))
         for cid, d in data.get("debt_deltas", []):
             conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?", (d, cid))
         conn.execute("UPDATE operations SET status='cancelled' WHERE id=?", (old_op_id,))
@@ -1711,7 +1724,8 @@ def cancel_operation(op_id: int):
         data = json.loads(op["data"])
         for wh, pid, d in data.get("stock_deltas", []):
             _apply_stock(conn, wh, pid, -d)
-        _revert_batches(conn, data.get("batch_deltas"))
+        _revert_batches(conn, data.get("batch_deltas"),
+                        data.get("stock_deltas"))
         for cid, d in data.get("debt_deltas", []):
             conn.execute("UPDATE clients SET debt = debt - ? WHERE id=?", (d, cid))
         conn.execute("UPDATE operations SET status='cancelled' WHERE id=?", (op_id,))

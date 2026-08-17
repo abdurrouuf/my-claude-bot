@@ -814,6 +814,89 @@ def test_client_substitution_guard():
     assert "не провожу" in sent[-1]
 
 
+def test_revision_170826():
+    """Находки ревизии 17.08.2026 (три параллельных аудита)."""
+    import asyncio
+    import json
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    bish = db.warehouse_by_name("Бишкек")
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1")
+    conn.commit()
+    db.clients_add_bulk(bish["id"], [("Ден Каракол", 4969660)])
+    db.clients_add_bulk(wh["id"], [("Данияр Алышбаев", 101835), ("Асан Токмок", 5000)])
+    admin = db.get_user(ADMIN)
+    sent = []
+
+    async def reply(text, **kw):
+        sent.append(text)
+
+    upd = SimpleNamespace(message=SimpleNamespace(reply_text=reply),
+                          effective_chat=SimpleNamespace(id=1, type="private"))
+
+    def pay(client, wh_name, src):
+        asyncio.run(bot.start_payment(upd, None, admin, {
+            "action": "payment", "client": client, "amount": 5000,
+            "warehouse": wh_name, "_src_text": src}))
+        return sent[-1]
+
+    # 1. Уточняющий вопрос: имя стоит в предыдущей реплике — операция идёт
+    #    как обычно, а не подменяется клиентом по слову «Каракол».
+    assert bot._name_traceable("Асан оплатил Каракол, 5000", "Асан Токмок")
+    #    и подменить клиента можно только при ПОЛНОМ совпадении имени
+    assert bot._name_covered("Ден Каракол 41500", "Ден Каракол")
+    assert not bot._name_covered("Каракол 5000", "Ден Каракол")
+    # 2. Голосовое с одним словом: «Осон» → «Асан» (длина та же) проходит,
+    #    а раздувание «Ден» → «Данияр Алышбаев» — нет.
+    assert bot._name_traceable("Осон оплатил 5000", "Асан Токмок")
+    assert not bot._name_traceable("Ден Каракол 41500", "Данияр Алышбаев")
+    out = pay("Асан Токмок", "Каракол", "Осон оплатил 5000")
+    assert "Асан Токмок" in out and "Подтвердите приход" in out
+    # 3. Фото: текста нет — проверка не мешает (src_text пустой)
+    out = pay("Данияр Алышбаев", "Каракол", "")
+    assert "Подтвердите приход" in out
+
+    # 4. Заявка переживает деплой ПОСЛЕ выбора клиента кнопкой: снимок в базу
+    p = {"kind": "payment", "user_id": ADMIN, "chat_id": 1, "wh_id": wh["id"],
+         "wh_name": wh["name"], "client_name": "Асан", "client_id": None,
+         "amount": 1000}
+    token = bot.new_pending(p)
+    p["client_id"] = db.client_exact(wh["id"], "Асан Токмок")["id"]
+    bot._persist_pending(token)
+    # перезапуск: память пуста, снимок в базе остаётся (PENDING.pop чистил бы
+    # и базу — это отмена заявки, а не рестарт)
+    dict.pop(bot.PENDING, token, None)
+    restored = bot.get_pending(token)
+    assert restored and restored["client_id"] == p["client_id"], \
+        "выбранный кнопкой клиент потерялся при рестарте"
+
+    # 5. returned_qty из JSON (строковые ключи) не ломает проверку остатка
+    _load(wh, {6: 10})
+    back = json.loads(json.dumps({6: 10}))          # {"6": 10}
+    fixed = {int(k): v for k, v in back.items()}
+    assert bot.insufficient_stock(wh["id"], [_item(6, 12, 90)],
+                                  extra_available=fixed) == []
+
+    # 6. /undo операции БЕЗ batch_deltas (до партионного учёта) не ломает
+    #    инвариант «сумма партий = остаток склада»
+    op_id, _ = db.commit_operation(ADMIN, "inventory", wh["id"], None,
+                                   "старая загрузка", [(wh["id"], 16, 40)], [], {})
+    conn.execute("UPDATE operations SET data=? WHERE id=?",
+                 (json.dumps({"stock_deltas": [[wh["id"], 16, 40]]}), op_id))
+    conn.commit()
+    ok, _ = db.cancel_operation(op_id)
+    assert ok
+    total = sum(b["qty"] for b in db.product_batches_of(wh["id"], 16))
+    assert total == db.stock_qty(wh["id"], 16), "партии разошлись с остатком"
+
+    # 7. Замена накладной не трогает клиента, которого нет в сообщении
+    asyncio.run(bot.start_replace_invoice(upd, None, admin, {
+        "action": "replace_invoice", "client": "Данияр Алышбаев",
+        "warehouse": "Каракол", "items": [], "_src_text": "Бекмурат Ош"}))
+    assert "не провожу" in sent[-1]
+
+
 def test_certs():
     """Сертификаты соответствия: хранение, поиск препарата, удаление."""
     _fresh_db()
