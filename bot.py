@@ -3597,7 +3597,12 @@ async def start_set_price(update, context, actor, data):
         items.append({"product_id": product["id"], "name": product["name"],
                       "volume": product["volume"], "price": price})
     if not items:
-        await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу.")
+        # Показываем, ЧТО не узнали — иначе непонятно, что исправлять
+        await update.message.reply_text(
+            "⚠️ Ни один товар не распознан по прайсу:\n• "
+            + "\n• ".join(esc(m) for m in missing[:10])
+            + ("\n…" if len(missing) > 10 else "")
+            + "\nПроверьте названия и фасовки: /pricepdf", parse_mode="HTML")
         return
 
     payload = {
@@ -3712,7 +3717,12 @@ async def start_inventory(update, context, actor, data):
         items.append({"product_id": product["id"], "name": product["name"],
                       "volume": product["volume"], "fact": fact})
     if not items:
-        await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу.")
+        # Показываем, ЧТО не узнали — иначе непонятно, что исправлять
+        await update.message.reply_text(
+            "⚠️ Ни один товар не распознан по прайсу:\n• "
+            + "\n• ".join(esc(m) for m in missing[:10])
+            + ("\n…" if len(missing) > 10 else "")
+            + "\nПроверьте названия и фасовки: /pricepdf", parse_mode="HTML")
         return
 
     payload = {
@@ -3948,7 +3958,12 @@ async def start_set_min(update, context, actor, data):
         items.append({"product_id": product["id"], "name": product["name"],
                       "volume": product["volume"], "qty": qty})
     if not items:
-        await update.message.reply_text("⚠️ Ни один товар не распознан по прайсу.")
+        # Показываем, ЧТО не узнали — иначе непонятно, что исправлять
+        await update.message.reply_text(
+            "⚠️ Ни один товар не распознан по прайсу:\n• "
+            + "\n• ".join(esc(m) for m in missing[:10])
+            + ("\n…" if len(missing) > 10 else "")
+            + "\nПроверьте названия и фасовки: /pricepdf", parse_mode="HTML")
         return
     payload = {
         "kind": "set_min", "user_id": actor["id"], "chat_id": update.effective_chat.id,

@@ -1,6 +1,7 @@
 # Прайс-лист ВЕТОП. Исходные данные (SEED_DATA) заполняют базу при первом
 # запуске; дальше прайс живёт в таблице products и загружается через set_data().
 import difflib
+import re
 
 SEED_DATA = [
     {"id": 1,  "name": "АЛЬТОПЕН-ФОРТЕ (альбен, левамизоль суспензия)",          "volume": "100 мл",        "box": 80,  "price": 160},
@@ -168,12 +169,48 @@ def whole_boxes(product_id, qty):
     return qty // per_box
 
 
+def _base_name(name: str) -> str:
+    """Имя товара без пояснения в скобках: «БУТАСТИМ (бутафосфан…)» → «бутастим»."""
+    return str(name or "").split("(")[0].strip().lower()
+
+
+def _vol_key(volume: str) -> str:
+    """Фасовка без пробелов: «100 мл» и «100мл» — одно и то же."""
+    return re.sub(r"\s+", "", str(volume or "").strip().lower())
+
+
 def match_product(name: str, volume: str):
-    """Находит товар прайса по названию и фасовке (точно, затем нечётко)."""
+    """Находит товар прайса по названию и фасовке.
+
+    Цепочка: точное имя+фасовка → нечёткое полное имя → КОРОТКОЕ имя без
+    скобок при точной фасовке → опечатка в коротком имени. Последние две
+    ступени добавлены 18.08.2026: владелец задавал спеццены списком
+    («Бутастим 100 мл 420»), и короткие имена не дотягивали до порога —
+    бот отвечал «ни один товар не распознан».
+    """
     name_l = (name or "").strip().lower()
     vol_l = (volume or "").strip().lower()
     for p in PRICE_LIST_DATA:
         if p["name"].lower() == name_l and p["volume"].lower() == vol_l:
             return p
     m = difflib.get_close_matches(f"{name_l} | {vol_l}", list(_KEYS), n=1, cutoff=0.85)
-    return _KEYS[m[0]] if m else None
+    if m:
+        return _KEYS[m[0]]
+    base, vkey = _base_name(name), _vol_key(volume)
+    if not base or not vkey:
+        return None
+    same_vol = [p for p in PRICE_LIST_DATA if _vol_key(p["volume"]) == vkey]
+    exact_base = [p for p in same_vol if _base_name(p["name"]) == base]
+    if len(exact_base) == 1:
+        return exact_base[0]
+    if exact_base:
+        return None                      # двусмысленно — не гадаем
+    scored = sorted(
+        ((difflib.SequenceMatcher(None, base, _base_name(p["name"])).ratio(), p)
+         for p in same_vol), key=lambda x: -x[0])
+    # Берём только уверенного и явного лидера: «Клозатоп» не должен
+    # превратиться в «Клозатоп-Форте», а «Топмектин» — в «Топмектин гель».
+    if scored and scored[0][0] >= 0.86 and (
+            len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
+        return scored[0][1]
+    return None
