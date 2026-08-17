@@ -492,7 +492,6 @@ def test_cash_pdf_sections():
     # имя файла оканчивается на «.pdf»: safe_filename съедала точку,
     # телефон не открывал файл (скриншот владельца 07.08.2026)
     import asyncio
-    from types import SimpleNamespace
     sent = {}
 
     class M:
@@ -593,7 +592,6 @@ def test_warehouse_name_typos():
 def test_cash_alert():
     """Ежедневное напоминание админу о несданных кассах (любая сумма)."""
     import asyncio
-    from types import SimpleNamespace
     wh = _fresh_db()
     _load(wh, {16: 100})
     _invoice(wh, DANIYAR, "Клиент К", [_item(16, 1, 180)], payment=5)
@@ -1004,7 +1002,7 @@ def test_sales_history():
     возвраты и черновики видны, чужой товар не попадает."""
     wh = _fresh_db()
     _load(wh, {16: 100, 17: 100})
-    pr16, pr17 = prices.BY_ID[16], prices.BY_ID[17]
+    pr16 = prices.BY_ID[16]
     base16 = pr16["name"].split("(")[0].strip()
     # Разбор: точное имя без фасовки — обе фасовки товара с этим именем
     label, pids, cli, _ = bot._parse_sales_query(base16.lower())

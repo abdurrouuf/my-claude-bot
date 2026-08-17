@@ -2606,9 +2606,13 @@ _PAY_WORDS_RE = re.compile(
 
 
 def _text_name_hint(src_text: str) -> str:
-    """Имя клиента так, как его написал человек: без чисел и служебных слов."""
-    t = re.sub(r"[\d'’`«»\"().,;:!?—–-]+", " ", str(src_text or ""))
-    return " ".join(_PAY_WORDS_RE.sub(" ", t).split())
+    """Имя клиента так, как его написал человек: без чисел и служебных слов.
+
+    Дефис внутри слова сохраняется — «Кара-Балта» есть в именах клиентов.
+    """
+    t = re.sub(r"[\d'’`«»\"().,;:!?]+", " ", str(src_text or ""))
+    words = (w.strip("-–—") for w in _PAY_WORDS_RE.sub(" ", t).split())
+    return " ".join(w for w in words if w)
 
 
 def _name_traceable(src_text: str, name: str) -> bool:
@@ -8450,7 +8454,7 @@ async def _stockcost_report(update, whs, actor, params):
                     "SELECT name, volume, price FROM products WHERE id=?",
                     (pid,)).fetchone()
                 add_row(pid, (row["name"] + " (вне прайса)") if row
-                        else f"товар (вне прайса)", row["volume"] if row else "",
+                        else f"товар №{pid} (вне прайса)", row["volume"] if row else "",
                         row["price"] if row else 0, qty)
         if not rows:
             summary.append(f"🏬 «{wh['name']}»: пусто")
