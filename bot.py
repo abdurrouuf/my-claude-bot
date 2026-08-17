@@ -1375,6 +1375,7 @@ async def _route_invoice_admin(message, context, p, requester,
         token = new_pending(p, ttl=APPROVAL_TTL)
     else:
         p["ttl"] = APPROVAL_TTL
+        _persist_pending(token)   # выбранный кнопкой клиент и срок — в базу
     note = (f"📨 Накладная по складу «{esc(p['wh_name'])}» отправлена "
             "админу на подтверждение — накладные этого склада выписывает "
             "только он. Я сообщу результат.")
@@ -1415,11 +1416,20 @@ async def start_invoice(update, context, actor, data, draft=False):
     if guess and not _name_traceable(str(data.get("_src_text") or ""), guess["name"]):
         hint = _text_name_hint(str(data.get("_src_text") or ""))
         alt, alt_wh = _client_by_text(actor, hint)
-        if alt and alt["id"] != guess["id"]:
+        if alt and alt["id"] == guess["id"]:
+            pass                       # это тот же клиент — работаем как обычно
+        elif alt and _name_covered(hint, alt["name"]):
             log.warning("Накладная: имя «%s» заменено моделью на «%s» — "
                         "беру клиента из текста", hint, guess["name"])
             client_name, wh = alt["name"], alt_wh
-        elif alt is None:
+        else:
+            # Клиент админа в чате склада — там бот молчит всегда (вариант 3А:
+            # сообщение сотрудника про такого клиента = сборочный лист).
+            if (update.effective_chat is not None
+                    and update.effective_chat.type != "private"
+                    and guess["id"] in admin_only_client_ids()
+                    and not is_admin(actor)):
+                return
             await update.message.reply_text(
                 _client_mismatch_msg(hint, guess["name"], wh["name"], "накладную"),
                 parse_mode="HTML")
@@ -1927,6 +1937,12 @@ async def start_amend_invoice(update, context, actor, data):
                     + (" Похожие: " + ", ".join(x["name"] for x in cand) if cand else ""),
                     parse_mode="HTML")
                 return
+        if _client_guess_blocked(data, c):
+            await update.message.reply_text(
+                _client_mismatch_msg(_text_name_hint(str(data.get("_src_text") or "")),
+                                     c["name"], wh["name"], "дополнение накладной"),
+                parse_mode="HTML")
+            return
         op = db.last_invoice_for_client(c["id"])
         if op is None:
             await update.message.reply_text(
@@ -1945,11 +1961,19 @@ async def start_amend_invoice(update, context, actor, data):
     old = json.loads(op["data"])
     old_items = []
     for it in old.get("items", []):
-        product = prices.match_product(str(it.get("name") or ""), str(it.get("volume") or ""))
+        # Товар берём по product_id из журнала (миграция _migrate_price_items
+        # его чинила именно для этого); поиск по имени — только фолбэк для
+        # совсем старых записей, иначе переименованный товар потерял бы id и
+        # сторно вернуло бы его на склад без нового списания.
+        pid = it.get("product_id")
+        if not pid:
+            product = prices.match_product(str(it.get("name") or ""),
+                                           str(it.get("volume") or ""))
+            pid = product["id"] if product else None
         old_items.append({
             "name": it.get("name"), "volume": it.get("volume"), "qty": it.get("qty"),
             "price": it.get("price"), "box_qty": it.get("box_qty"),
-            "product_id": product["id"] if product else None,
+            "product_id": pid,
             "price_explicit": True,  # цены старой накладной не пересчитываем
         })
     old_total = sum((it["qty"] or 0) * (it["price"] or 0) for it in old_items)
@@ -2013,6 +2037,12 @@ async def start_replace_invoice(update, context, actor, data):
                     + (" Похожие: " + ", ".join(x["name"] for x in cand) if cand else ""),
                     parse_mode="HTML")
                 return
+        if _client_guess_blocked(data, c0):
+            await update.message.reply_text(
+                _client_mismatch_msg(_text_name_hint(str(data.get("_src_text") or "")),
+                                     c0["name"], wh["name"], "замену накладной"),
+                parse_mode="HTML")
+            return
         op = db.last_invoice_for_client(c0["id"])
         if op is None:
             await update.message.reply_text(
@@ -2606,9 +2636,13 @@ _PAY_WORDS_RE = re.compile(
 
 
 def _text_name_hint(src_text: str) -> str:
-    """Имя клиента так, как его написал человек: без чисел и служебных слов."""
-    t = re.sub(r"[\d'’`«»\"().,;:!?—–-]+", " ", str(src_text or ""))
-    return " ".join(_PAY_WORDS_RE.sub(" ", t).split())
+    """Имя клиента так, как его написал человек: без чисел и служебных слов.
+
+    Дефис внутри слова сохраняется — «Кара-Балта» есть в именах клиентов.
+    """
+    t = re.sub(r"[\d'’`«»\"().,;:!?]+", " ", str(src_text or ""))
+    words = (w.strip("-–—") for w in _PAY_WORDS_RE.sub(" ", t).split())
+    return " ".join(w for w in words if w)
 
 
 def _name_traceable(src_text: str, name: str) -> bool:
@@ -2626,12 +2660,34 @@ def _name_traceable(src_text: str, name: str) -> bool:
     parts = [w for w in re.findall(r"[^\W\d_]+", str(name).lower()) if len(w) >= 3]
     if not parts or not words:
         return True                       # сверять нечего — не мешаем работать
-    for part in parts:
-        for w in words:
-            if w == part or w[:4] == part[:4] or \
-                    difflib.SequenceMatcher(None, w, part).ratio() >= 0.7:
-                return True
-    return False
+    return any(_word_alike(w, part) for part in parts for w in words)
+
+
+def _word_alike(w: str, part: str) -> bool:
+    """Одно ли это слово с поправкой на ошибки распознавания.
+
+    Ошибка распознавания длину слова почти не меняет («Осон» → «Асан»),
+    а вот раздувание короткого имени в чужое длинное («Ден» → «Данияр»)
+    — меняет: поэтому близким словам одной длины хватает меньшего сходства.
+    """
+    if w == part or w[:4] == part[:4]:
+        return True
+    ratio = difflib.SequenceMatcher(None, w, part).ratio()
+    return ratio >= 0.7 or (abs(len(w) - len(part)) <= 1 and ratio >= 0.5)
+
+
+def _name_covered(hint: str, name: str) -> bool:
+    """Все ли слова имени клиента есть в том, что написал человек.
+
+    Нужно перед подменой клиента: «Ден Каракол» покрывает клиента
+    «Ден Каракол» целиком, а одно слово «Каракол» из ответа на уточняющий
+    вопрос — нет, и подставлять по нему чужого клиента нельзя.
+    """
+    words = [w for w in re.findall(r"[^\W\d_]+", hint.lower()) if len(w) >= 3]
+    parts = [w for w in re.findall(r"[^\W\d_]+", str(name).lower()) if len(w) >= 3]
+    if not parts or not words:
+        return False
+    return all(any(_word_alike(w, part) for w in words) for part in parts)
 
 
 def _client_mismatch_msg(hint: str, guess_name: str, wh_name: str, what: str) -> str:
@@ -2642,6 +2698,18 @@ def _client_mismatch_msg(hint: str, guess_name: str, wh_name: str, what: str) ->
             f"«<b>{esc(guess_name)}</b>» (склад «{esc(wh_name)}»), поэтому {what} "
             f"не провожу.\nНапишите имя клиента точно, как в справочнике — "
             f"посмотреть его можно командой /clients.")
+
+
+def _client_guess_blocked(data, client) -> bool:
+    """Клиента, которого нет в сообщении, трогать нельзя.
+
+    Правило проекта после инцидента 16.08.2026: любое место, где клиент
+    берётся из имени от ИИ, обязано пройти сверку с текстом человека.
+    Здесь (замена и дополнение накладной) молча подменять клиента нечем —
+    операция просто не проводится.
+    """
+    return client is not None and not _name_traceable(
+        str(data.get("_src_text") or ""), client["name"])
 
 
 def _client_by_text(actor, hint: str):
@@ -2680,12 +2748,14 @@ async def start_payment(update, context, actor, data):
     if exact and not _name_traceable(src_text, exact["name"]):
         hint = _text_name_hint(src_text)
         alt, alt_wh = _client_by_text(actor, hint)
-        if alt and alt["id"] != exact["id"]:
-            # Написанное человеком имя нашлось точно — оно и главнее
+        if alt and alt["id"] == exact["id"]:
+            pass                       # это тот же клиент — работаем как обычно
+        elif alt and _name_covered(hint, alt["name"]):
+            # Написанное человеком имя нашлось целиком — оно и главнее
             log.warning("Оплата: имя «%s» заменено моделью на «%s» — "
                         "беру клиента из текста", hint, exact["name"])
             exact, wh = alt, alt_wh
-        elif alt is None:
+        else:
             await update.message.reply_text(
                 _client_mismatch_msg(hint, exact["name"], wh["name"], "оплату"),
                 parse_mode="HTML")
@@ -3760,9 +3830,10 @@ async def minstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if actor is None:
         return
     arg = " ".join(context.args).strip() if context.args else ""
-    if arg:
+    if arg and arg.lower() not in ("all", "все", "всё"):
+        # Отчёт, а не операция: хватает права просмотра (/watch у снабженца)
         wh = db.warehouse_by_name(arg)
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text(
                 f"Склад «{esc(arg)}» не найден или нет доступа.", parse_mode="HTML")
             return
@@ -4057,6 +4128,15 @@ async def _continue_op(q, context, actor, p, chat_id, user_id):
 
 async def _finish_amend(q, context, actor, p):
     """Проведение замены/дополнения накладной после выбора партий."""
+    # Остаток мог измениться, пока висел вопрос о партии (см. _finish_invoice).
+    back = {int(k): v for k, v in (p.get("returned_qty") or {}).items()}
+    for it in p["items"][:p.get("old_count") or 0]:
+        if it.get("product_id"):
+            back[it["product_id"]] = back.get(it["product_id"], 0) + it["qty"]
+    lack = insufficient_stock(p["wh_id"], p["items"], extra_available=back)
+    if lack:
+        await q.edit_message_text(lack_message(lack), parse_mode="HTML")
+        return
     try:
         # Сторно старой и проведение новой — одна транзакция в базе.
         op_id, client_label, old_debt, total, summary = commit_invoice(
@@ -4132,6 +4212,13 @@ async def _finish_return(q, context, actor, p):
 
 async def _finish_invoice(q, context, actor, p):
     """Проведение накладной после всех проверок и выбора партий."""
+    # Пока висел вопрос «из какой партии продано?», товар могли продать —
+    # запрет «сверх остатка не проводить» (решение владельца 21.07.2026)
+    # обходился этим окном (находка ревизии 17.08.2026).
+    lack = insufficient_stock(p["wh_id"], p["items"])
+    if lack:
+        await q.edit_message_text(lack_message(lack), parse_mode="HTML")
+        return
     if p.get("client_id") is None:
         # Клиент мог появиться, пока заявка ждала кнопки (вторая
         # накладная, add_clients) — иначе INSERT упадёт по UNIQUE.
@@ -4581,6 +4668,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if owner_row is None:
             return
         spec = REPORT_PICKS[p["report"]]
+        if spec.get("admin_only") and not is_admin(owner_row):
+            await q.edit_message_text("⛔ Этот отчёт доступен только админу.")
+            return
         allowed = spec["whs"](owner_row)   # права перепроверяются на кнопке
         if len(parts) > 2 and parts[2] == "all":
             whs, label = allowed, "все склады"
@@ -4720,6 +4810,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer("Клиент не найден", show_alert=True)
             return
         p["client_id"] = chosen["id"]
+        # Снимок в базу СРАЗУ: заявка живёт сутки, и после деплоя между
+        # кнопками выбранный клиент иначе терялся — «Провести» создавало
+        # клиента-двойника с долгом (ревизия 16.08.2026).
+        _persist_pending(token)
         await q.answer()
         if p["kind"] == "set_phone":
             PENDING.pop(token, None)
@@ -4735,6 +4829,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 p["approver_id"] = ADMIN_ID
                 p["requester_name"] = requester["name"]
                 p["ttl"] = APPROVAL_TTL
+                _persist_pending(token)   # заявка ждёт админа до суток
                 try:
                     await context.bot.send_message(
                         ADMIN_ID, return_summary(p), parse_mode="HTML",
@@ -4773,7 +4868,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "nw":  # создаём нового клиента (только накладная)
+        if p.get("kind") != "invoice":   # сверка kind, как у соседних кнопок
+            await q.answer()
+            return
         p["client_id"] = None
+        _persist_pending(token)
         await q.answer()
         requester = db.get_user(p["user_id"])
         if p.get("parsed_debt") and requester["role"] != "admin":
@@ -4811,6 +4910,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     if kind == "pbat":  # выбор партии (срока годности) для позиции накладной
+        if p.get("kind") not in ("invoice", "amend_invoice", "transfer",
+                                 "writeoff", "return"):
+            await q.answer()
+            return
         PENDING.pop(token, None)
         await q.answer()
         try:
@@ -5000,7 +5103,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Запас, который вернёт сторно старой накладной: при полной
                 # замене он посчитан заранее (returned_qty), при дополнении —
                 # это старые строки (первые old_count позиций).
-                back = dict(p.get("returned_qty") or {})
+                # int-ключи: после рестарта заявка приходит из JSON, где ключи
+                # словаря стали строками — иначе запас сторно считался нулевым
+                # и корректная замена падала в «не хватает товара».
+                back = {int(k): v for k, v in (p.get("returned_qty") or {}).items()}
                 for it in p["items"][:p["old_count"]]:
                     if it.get("product_id"):
                         back[it["product_id"]] = back.get(it["product_id"], 0) + it["qty"]
@@ -5333,8 +5439,13 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
     chat_histories[chat_id].append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = chat_histories[chat_id][-HISTORY_LIMIT:]
 
+    # Сверять имя клиента только с последним сообщением нельзя: модель
+    # отвечает по всему диалогу («Асан оплатил» → вопрос → «Каракол, 5000»),
+    # и имя стоит в предыдущей реплике. Берём последние три реплики человека.
+    said = [m["content"] for m in chat_histories.get(chat_id, [])
+            if m["role"] == "user" and isinstance(m["content"], str)]
     await dispatch_action(update, context, actor, reply, draft, quiet=quiet,
-                          src_text=text)
+                          src_text=" ".join(said[-3:]))
 
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
@@ -5570,8 +5681,9 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     history.append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = history[-HISTORY_LIMIT:]
 
-    await dispatch_action(update, context, actor, reply, draft=draft,
-                          src_text=caption)
+    # Имя клиента модель читает С ФОТО, а не из подписи — сверять его с
+    # подписью нельзя (иначе накладная по фото не проводится вовсе).
+    await dispatch_action(update, context, actor, reply, draft=draft, src_text="")
 
 
 def _build_stt_prompt() -> str:
@@ -7652,15 +7764,17 @@ async def deadstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             days = max(7, int(word))
         else:
             wh_words.append(word)
-    if wh_words:
-        wh = db.warehouse_by_name(" ".join(wh_words))
-        if wh is None or not db.can_use_warehouse(actor, wh["id"]):
+    arg = " ".join(wh_words)
+    if arg and arg.lower() not in ("all", "все", "всё"):
+        # Отчёт, а не операция: хватает права просмотра (/watch у снабженца)
+        wh = db.warehouse_by_name(arg)
+        if wh is None or not db.can_view_warehouse(actor, wh["id"]):
             await update.message.reply_text("Склад не найден или нет доступа.")
             return
         whs = [wh]
     else:
         whs = db.visible_warehouses(actor)
-        if not wh_words and await _maybe_ask_warehouse(
+        if not arg and await _maybe_ask_warehouse(
                 update, actor, "deadstock", {"days": days}):
             return
     await _deadstock_report(update, whs, actor, {"days": days})
@@ -8450,7 +8564,7 @@ async def _stockcost_report(update, whs, actor, params):
                     "SELECT name, volume, price FROM products WHERE id=?",
                     (pid,)).fetchone()
                 add_row(pid, (row["name"] + " (вне прайса)") if row
-                        else f"товар (вне прайса)", row["volume"] if row else "",
+                        else f"товар №{pid} (вне прайса)", row["volume"] if row else "",
                         row["price"] if row else 0, qty)
         if not rows:
             summary.append(f"🏬 «{wh['name']}»: пусто")
@@ -10233,6 +10347,9 @@ def _register_report_picks():
         "stockcost": {
             "emoji": "💼",
             "question": "Остатки в закупочных ценах какого склада показать?",
+            # Закупочные цены — секрет от сотрудников: роль перепроверяется
+            # и на кнопке, а не только в самой команде (аудит 17.08.2026).
+            "admin_only": True,
             "whs": lambda a: [w for w in db.visible_warehouses(a)
                               if not is_training_wh(w)],
             "render": _stockcost_report},
