@@ -852,6 +852,15 @@ def _build_static_system() -> str:
     parts.append('- "Дексатоп 50мл 10 шт" → qty: 10, box_qty: null (просто штуки, без пересчёта)')
     parts.append('Другие обозначения коробок: "к", "кор", "коробка", "коробок", "box"')
     parts.append("")
+    parts.append("=== РЕЖИМ: ПЕРЕИМЕНОВАНИЕ КЛИЕНТА (только админ) ===")
+    parts.append('«переименуй клиента Сапаркулова Алмагул в Сапаркулова Алмагуль» / '
+                 '«исправь имя Ден Каракол на Денис Каракол» → верни ТОЛЬКО JSON: '
+                 '{"action": "rename_client", "client": "старое имя", '
+                 '"new_name": "новое имя", "warehouse": null}')
+    parts.append('- Оба имени пиши В ТОЧНОСТИ как в сообщении — ничего не исправляй '
+                 'и не подставляй из списка известных клиентов. warehouse — только '
+                 'если явно назван склад, иначе null.')
+    parts.append("")
     parts.append("=== РЕЖИМ: ПСЕВДОНИМЫ КЛИЕНТОВ (только админ) ===")
     parts.append('«Вика Уманец — она же Виктория» / «запомни: Валя это Валентина и Валя '
                  'Липатова» → верни ТОЛЬКО JSON: {"action": "client_alias", '
@@ -3240,6 +3249,77 @@ async def promise_reminder_loop(app):
             log.exception("Ошибка напоминания об обещаниях")
 
 
+async def start_rename_client(update, context, actor, data):
+    """«переименуй клиента X в Y» — смена имени контрагента (только админ).
+
+    Долг, журнал, телефон, спеццены и псевдонимы привязаны к id клиента и
+    не меняются; старое имя остаётся псевдонимом (голосовые продолжают
+    находить). В СТАРЫХ накладных журнала остаётся прежнее имя — документ
+    показывает то имя, под которым его выписали, это правильно."""
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Переименовать клиента может только админ.")
+        return
+    name = str(data.get("client") or "").strip()
+    new_name = str(data.get("new_name") or "").strip()
+    if not name or not new_name:
+        await update.message.reply_text(
+            "Пример: «переименуй клиента Асан в Асан Токмок»")
+        return
+    wh_name = str(data.get("warehouse") or "").strip()
+    if wh_name:
+        wh, err = resolve_warehouse(actor, wh_name)
+        if err:
+            await update.message.reply_text(err, parse_mode="HTML")
+            return
+        search_whs = [wh]
+    else:
+        search_whs = db.visible_warehouses(actor)
+    hits = []
+    for w in search_whs:
+        c_ = db.client_exact(w["id"], name)
+        if c_ is not None:
+            hits.append((w, c_))
+    if not hits:
+        where = (f"на складе «{esc(search_whs[0]['name'])}»" if len(search_whs) == 1
+                 else "ни на одном складе")
+        await update.message.reply_text(
+            f"Клиент «{esc(name)}» не найден {where}. Проверьте имя: /clients",
+            parse_mode="HTML")
+        return
+    if len(hits) > 1:
+        await update.message.reply_text(
+            f"Клиент «{esc(name)}» есть на нескольких складах: "
+            + ", ".join(f"«{esc(w['name'])}»" for w, _ in hits)
+            + ". Укажите склад: «переименуй клиента Асан со склада Каракол в …»",
+            parse_mode="HTML")
+        return
+    wh, c = hits[0]
+    if new_name.lower() == c["name"].lower():
+        await update.message.reply_text("Новое имя совпадает со старым — нечего менять.")
+        return
+    # Новое имя не должно быть занято на этом складе (имена и псевдонимы) —
+    # иначе получится два клиента под одним именем.
+    other = db.client_exact(wh["id"], new_name)
+    if other is not None and other["id"] != c["id"]:
+        await update.message.reply_text(
+            f"⚠️ Имя «{esc(new_name)}» на складе «{esc(wh['name'])}» уже занято "
+            f"клиентом «{esc(other['name'])}» — переименование отменено.",
+            parse_mode="HTML")
+        return
+    payload = {"kind": "rename_client", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id, "client_id": c["id"],
+               "old_name": c["name"], "new_name": new_name, "wh_name": wh["name"]}
+    token = new_pending(payload)
+    await update.message.reply_text(
+        f"✏️ <b>Переименование клиента</b> — склад «{esc(wh['name'])}»\n\n"
+        f"«{esc(c['name'])}» → <b>«{esc(new_name)}»</b>\n"
+        f"Текущий долг: {money(c['debt'])} — долг, история операций, телефон и "
+        f"спеццены сохранятся.\n"
+        f"Старое имя останется псевдонимом (бот продолжит его понимать); "
+        f"в уже выписанных накладных имя не меняется.\n\nПереименовать?",
+        parse_mode="HTML", reply_markup=confirm_kb(token))
+
+
 async def start_client_alias(update, context, actor, data):
     """«Вика Уманец — она же Виктория»: дополнительные имена клиента (админ)."""
     if not is_admin(actor):
@@ -5316,6 +5396,25 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     msg += f" Пропущено (уже были): {len(skipped)}."
                 msg += "\nТеперь голосовые будут распознавать эти имена точнее."
                 await q.edit_message_text(msg, parse_mode="HTML")
+            elif p["kind"] == "rename_client":
+                # Перепроверка занятости: имя могли занять, пока заявка ждала
+                c_now = db.client_get(p["client_id"])
+                wh_row = db.warehouse_by_name(p["wh_name"])
+                other = db.client_exact(wh_row["id"], p["new_name"]) if wh_row else None
+                if c_now is None:
+                    await q.edit_message_text("⚠️ Клиент уже не существует.")
+                elif other is not None and other["id"] != p["client_id"]:
+                    await q.edit_message_text(
+                        f"⚠️ Имя «{esc(p['new_name'])}» уже занято клиентом "
+                        f"«{esc(other['name'])}» — переименование отменено.",
+                        parse_mode="HTML")
+                else:
+                    old = db.rename_client(p["client_id"], p["new_name"])
+                    _KNOWN_CLIENTS_CACHE["ts"] = 0.0
+                    await q.edit_message_text(
+                        f"✅ Переименовано: «{esc(old)}» → «{esc(p['new_name'])}» "
+                        f"(склад «{esc(p['wh_name'])}»).\nДолг и история — на месте; "
+                        f"старое имя осталось псевдонимом.", parse_mode="HTML")
             elif p["kind"] == "client_alias":
                 for a in p["aliases"]:
                     db.add_client_alias(p["client_id"], a)
@@ -5491,7 +5590,7 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
 WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory", "writeoff",
                      "amend_invoice", "replace_invoice", "set_min", "set_phone",
-                     "set_price", "client_alias"}
+                     "set_price", "client_alias", "rename_client"}
 
 
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False,
@@ -5598,6 +5697,8 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             await start_add_clients(update, context, actor, data)
         elif action == "client_alias":
             await start_client_alias(update, context, actor, data)
+        elif action == "rename_client":
+            await start_rename_client(update, context, actor, data)
         elif action == "amend_invoice":
             await start_amend_invoice(update, context, actor, data)
         elif action == "replace_invoice":
