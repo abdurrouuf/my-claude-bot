@@ -983,6 +983,16 @@ def test_rename_client():
     assert "Сапаркулова Алмагул" in db.client_aliases_list(c["id"])
     assert db.client_exact(wh["id"], "Сапаркулова Алмагул")["id"] == c["id"]
     assert db.client_exact(wh["id"], "Сапаркулова Алмагуль")["id"] == c["id"]
+    # имена перепутаны местами (реальный случай 17.08.2026: модель отдала
+    # новое имя как старое) — бот распознаёт по тому, какое имя есть в базе
+    out = start("Нураалы Токмок", "Асан Токмок")     # в базе только второе
+    assert "Переименование клиента" in out
+    assert "«Асан Токмок» → <b>«Нураалы Токмок»</b>" in out
+    bot.PENDING.clear()
+    # оба имени неизвестны — честный отказ, ничего не выдумываем
+    out = start("Кто-то Незнакомый", "Другой Незнакомый")
+    assert "не найден" in out
+
     # сотруднику — отказ
     dan = db.get_user(DANIYAR)
     asyncio.run(bot.start_rename_client(upd, None, dan, {

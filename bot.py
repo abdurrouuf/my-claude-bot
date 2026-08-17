@@ -854,9 +854,13 @@ def _build_static_system() -> str:
     parts.append("")
     parts.append("=== РЕЖИМ: ПЕРЕИМЕНОВАНИЕ КЛИЕНТА (только админ) ===")
     parts.append('«переименуй клиента Сапаркулова Алмагул в Сапаркулова Алмагуль» / '
+                 '«переименуй Динислам Токмок на Нураалы Токмок» / '
                  '«исправь имя Ден Каракол на Денис Каракол» → верни ТОЛЬКО JSON: '
                  '{"action": "rename_client", "client": "старое имя", '
                  '"new_name": "новое имя", "warehouse": null}')
+    parts.append('- ПОРЯДОК ВАЖЕН: "client" — имя, которое стоит в сообщении ПЕРВЫМ '
+                 '(оно уже есть в базе), "new_name" — имя ПОСЛЕ слова «в», «на» или '
+                 '«→» (его в базе ещё нет). Местами не меняй.')
     parts.append('- Оба имени пиши В ТОЧНОСТИ как в сообщении — ничего не исправляй '
                  'и не подставляй из списка известных клиентов. warehouse — только '
                  'если явно назван склад, иначе null.')
@@ -3274,11 +3278,25 @@ async def start_rename_client(update, context, actor, data):
         search_whs = [wh]
     else:
         search_whs = db.visible_warehouses(actor)
-    hits = []
-    for w in search_whs:
-        c_ = db.client_exact(w["id"], name)
-        if c_ is not None:
-            hits.append((w, c_))
+    def _find(who: str) -> list:
+        found = []
+        for w in search_whs:
+            c_ = db.client_exact(w["id"], who)
+            if c_ is not None:
+                found.append((w, c_))
+        return found
+
+    hits = _find(name)
+    if not hits:
+        # Модель могла поменять имена местами («переименуй X на Y» — 17.08.2026,
+        # реальный случай владельца). В базе существует ровно одно из двух имён:
+        # оно и есть старое, второе — новое.
+        back = _find(new_name)
+        if len(back) == 1:
+            log.warning("Переименование: имена переставлены — «%s» → «%s»",
+                        new_name, name)
+            name, new_name = new_name, name
+            hits = back
     if not hits:
         where = (f"на складе «{esc(search_whs[0]['name'])}»" if len(search_whs) == 1
                  else "ни на одном складе")
