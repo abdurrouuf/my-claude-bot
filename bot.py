@@ -7560,12 +7560,13 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     specials = db.client_prices_map(c["id"])
     if specials:
         lines.append("")
-        lines.append("💲 <b>Спеццены:</b>")
-        for pid, price in specials.items():
+        lines.append("💲 <b>Спеццены</b> (подставляются в накладные сами):")
+        for pid, price in sorted(specials.items()):
             p_row = prices.BY_ID.get(pid)
             if p_row:
                 lines.append(f"• {esc(p_row['name'])} {esc(p_row['volume'])}: "
                              f"{fmt_num(price)} сом (прайс {fmt_num(p_row['price'])})")
+        lines.append(f"<i>Убрать: «спеццена для {esc(c['name'])}: Товар 0»</i>")
     if rows:
         lines.append("")
         lines.append(f"🗒 <b>Последние операции ({min(len(rows), 15)} из {len(rows)}):</b>")
