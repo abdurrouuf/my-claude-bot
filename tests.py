@@ -1004,6 +1004,30 @@ async def _noop_async(*a, **k):
     pass
 
 
+def test_api_balance_alert():
+    """Тревога о заканчивающемся счёте API (18.08.2026)."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    sent = []
+
+    class Bot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+    # баланс не задан — тишина
+    assert not asyncio.run(bot.send_api_balance_alert(Bot()))
+    # задан и высокий — тишина
+    db.set_setting("api_balance", "50")
+    db.set_setting("api_balance_ts", "2026-08-01T00:00:00")
+    assert not asyncio.run(bot.send_api_balance_alert(Bot()))
+    # низкий — тревога админу с советом про auto reload
+    db.set_setting("api_balance", "2.50")
+    assert asyncio.run(bot.send_api_balance_alert(Bot()))
+    assert sent and sent[-1][0] == ADMIN
+    assert "заканчивается" in sent[-1][1] and "auto reload" in sent[-1][1]
+
+
 def test_short_product_names():
     """Короткие названия без скобок находятся в прайсе (18.08.2026).
 
