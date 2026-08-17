@@ -550,6 +550,44 @@ def _feed_muted(user_id, wh_id) -> bool:
     return user_id == ADMIN_ID and wh_id in hidden_debt_wh_ids()
 
 
+async def feed_return_pdf(context, wh_id, client_label, p, op_id,
+                          actor_name, note="", exclude_chat_id=None):
+    """Возврат в ленту чата — PDF БЕЗ цен и БЕЗ долга (просьба владельца
+    18.08.2026): только товар, количество и срок, как у перемещения.
+    Долги Бишкека скрыты — текстовая сводка возврата светила долг клиента
+    в общий чат. Возвратная накладная с ценами остаётся в личке."""
+    wh = db.warehouse_by_id(wh_id)
+    if not wh or not wh["feed_chat_id"] or wh["feed_chat_id"] == exclude_chat_id:
+        return
+    rows = []
+    for it in p["items"]:
+        rows.append([it["name"], it["volume"], f"{it['qty']} шт",
+                     it.get("expiry") or "—"])
+    total_qty = sum(it["qty"] for it in p["items"])
+    now = datetime.now(BISHKEK)
+    pdf = generate_report_pdf(
+        "ВОЗВРАТ ТОВАРА",
+        f"ОсОО «ВЕТОП» · от «{client_label}» · склад «{wh['name']}» · "
+        f"{now.strftime('%d.%m.%Y %H:%M')} · операция №{op_id}",
+        [{"headers": ["Товар", "Фасовка", "Количество", "Срок годности"],
+          "rows": rows, "widths": [82, 26, 32, 27], "numbered": True,
+          "footer": f"Итого: {len(rows)} позиций · {fmt_num(total_qty)} шт"}],
+        footer=box_note_text(p["items"], with_total=False))
+    caption = (f"🔙 <b>{esc(actor_name)}</b> — возврат от "
+               f"«{esc(client_label)}» ({len(rows)} поз.)")
+    if note:
+        caption += f"\n{esc(note)}"
+    try:
+        await context.bot.send_document(
+            chat_id=wh["feed_chat_id"],
+            document=InputFile(pdf, filename=(
+                f"возврат_{safe_filename(client_label)}_"
+                f"{now.strftime('%d%m%Y_%H%M')}.pdf")),
+            caption=caption, parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не удалось отправить возврат в ленту склада %s: %s", wh_id, e)
+
+
 async def feed_invoice_pdf(context, wh_id, client_label, p, old_debt, total,
                            caption=None, exclude_chat_id=None, op_id=None):
     """PDF проведённой накладной — в чат-ленту склада (просьба владельца:
@@ -4198,8 +4236,10 @@ async def _finish_return(q, context, actor, p):
                 log.warning("Не удалось уведомить заявителя")
         actor_name = db.get_user(p["user_id"])["name"]
         note = "Подтвердил админ" if p.get("approver_id") else ""
-        await feed_operation(context, op_id, actor_name, "🔙", note,
-                             exclude_chat_id=p["chat_id"])
+        # В ленту — PDF без цен и долга (просьба владельца 18.08.2026),
+        # вместо текстовой сводки с хвостом «долг: N сом».
+        await feed_return_pdf(context, p["wh_id"], client_label, p, op_id,
+                              actor_name, note, exclude_chat_id=p["chat_id"])
     except Exception:
         log.exception("Возврат №%s проведён, уведомления не дошли", op_id)
         try:
