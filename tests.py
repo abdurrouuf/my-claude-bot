@@ -1004,6 +1004,29 @@ async def _noop_async(*a, **k):
     pass
 
 
+def test_stock_box_column():
+    """Колонка «Коробок» в /stock (18.08.2026, «делай А» владельца)."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {6: 170, 16: 100, 8: 5})   # 80/кор → 2+10; 100/кор → 1; 12/кор → россыпь
+    admin = db.get_user(ADMIN)
+    sent = {}
+
+    async def reply_document(document=None, caption=None, **kw):
+        sent["pdf"] = document.input_file_content
+
+    upd = SimpleNamespace(
+        message=SimpleNamespace(reply_document=reply_document),
+        effective_chat=SimpleNamespace(id=1, type="private"),
+        effective_user=SimpleNamespace(id=ADMIN))
+    asyncio.run(bot._stock_report(upd, None, admin, [wh]))
+    assert sent["pdf"][:4] == b"%PDF"
+    # содержимое проверяем на уровне строк секции
+    smap = db.stock_map(wh["id"])
+    assert smap[6] == 170 and smap[16] == 100 and smap[8] == 5
+
+
 def test_api_balance_alert():
     """Тревога о заканчивающемся счёте API (18.08.2026)."""
     import asyncio
