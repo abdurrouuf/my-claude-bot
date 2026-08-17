@@ -6404,8 +6404,20 @@ async def _stock_report(update, context, actor, whs, with_prices=False):
                              fmt_num(p["price"]),
                              fmt_num(sub) if qty else "—"])
             else:
+                # Колонка «Коробок» (просьба владельца 18.08.2026): целые
+                # коробки по вместимости прайса + остаток россыпью.
+                if qty > 0 and p.get("box"):
+                    b, rest = qty // p["box"], qty % p["box"]
+                    if b and rest:
+                        box_cell = f"{b} кор + {rest} шт"
+                    elif b:
+                        box_cell = f"{b} кор"
+                    else:
+                        box_cell = "россыпь"
+                else:
+                    box_cell = "—"
                 rows.append([p["id"], p["name"], p["volume"],
-                             f"{qty} шт" if qty else "—"])
+                             f"{qty} шт" if qty else "—", box_cell])
             if qty:
                 total_qty += qty
                 in_stock += 1
@@ -6423,12 +6435,17 @@ async def _stock_report(update, context, actor, whs, with_prices=False):
             summary.append(f"💰 «{wh['name']}»: {fmt_num(total_qty)} шт "
                            f"на {money(total_sum)} по прайсу")
         else:
+            box_total = box_note_text(
+                [{"qty": smap.get(p["id"], 0), "product_id": p["id"]}
+                 for p in prices.PRICE_LIST_DATA if smap.get(p["id"], 0) > 0],
+                with_total=False, prefix="")
             sections.append({
                 "title": f"Склад «{wh['name']}»",
-                "headers": ["№", "Товар", "Фасовка", "Остаток"],
-                "rows": rows, "widths": [10, 105, 28, 24],
+                "headers": ["№", "Товар", "Фасовка", "Остаток", "Коробок"],
+                "rows": rows, "widths": [10, 82, 26, 24, 28],
                 "footer": (f"В наличии: {in_stock} из {len(rows)} позиций прайса · "
-                           f"всего {fmt_num(total_qty)} шт"),
+                           f"всего {fmt_num(total_qty)} шт"
+                           + (f" · {box_total}" if box_total else "")),
             })
             summary.append(f"📦 «{wh['name']}»: в наличии {in_stock} из "
                            f"{len(rows)} поз., {fmt_num(total_qty)} шт")
