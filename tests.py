@@ -1027,6 +1027,31 @@ def test_stock_box_column():
     assert smap[6] == 170 and smap[16] == 100 and smap[8] == 5
 
 
+def test_client_card_pdf():
+    """/client — карточка клиента PDF-файлом (19.08.2026, просьба владельца)."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], [("Давран Карасуу", 100000)])
+    c = db.client_exact(wh["id"], "Давран Карасуу")
+    db.set_client_price(c["id"], 10, 120)
+    admin = db.get_user(ADMIN)
+    sent = {}
+
+    async def reply_document(document=None, caption=None, **kw):
+        sent["pdf"] = document.input_file_content
+        sent["caption"] = caption
+
+    upd = SimpleNamespace(
+        message=SimpleNamespace(reply_document=reply_document),
+        effective_chat=SimpleNamespace(id=1, type="private"),
+        effective_user=SimpleNamespace(id=ADMIN))
+    asyncio.run(bot.client_cmd(upd, SimpleNamespace(args=["Давран"])))
+    assert sent["pdf"][:4] == b"%PDF"
+    assert "долг 100'000 сом" in sent["caption"]
+    assert "/act Давран Карасуу" in sent["caption"]
+
+
 def test_api_balance_alert():
     """Тревога о заканчивающемся счёте API (18.08.2026)."""
     import asyncio

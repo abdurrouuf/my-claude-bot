@@ -7766,20 +7766,19 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     rows, start_debt = client_statement(c["id"])
     now = datetime.now(BISHKEK)
-    lines = [f"👤 <b>{esc(c['name'])}</b> · склад «{esc(wh['name'])}»"]
+    # Карточка — PDF-файлом в фирменном стиле (просьба владельца 19.08.2026:
+    # «ответ не нужен в формате текста, нужен в формате PDF»)
+    info_rows = []
     aliases = db.client_aliases_list(c["id"])
     if aliases:
-        lines.append(f"🏷 Также известен как: {esc(', '.join(aliases))}")
-    if c["phone"]:
-        lines.append(f"📞 {esc(c['phone'])}")
-    else:
-        lines.append(f"📞 нет номера — сохранить: «телефон {esc(c['name'])}: 0700...»")
+        info_rows.append(["Также известен как", ", ".join(aliases)])
+    info_rows.append(["Телефон", c["phone"] or "нет номера"])
     if c["debt"] > 0:
-        lines.append(f"⚠️ Текущий долг: <b>{money(c['debt'])}</b>")
+        info_rows.append(["Текущий долг", f"{fmt_num(c['debt'])} сом"])
     elif c["debt"] < 0:
-        lines.append(f"💚 Переплата: <b>{money(-c['debt'])}</b>")
+        info_rows.append(["Переплата", f"{fmt_num(-c['debt'])} сом"])
     else:
-        lines.append("✅ Долга нет")
+        info_rows.append(["Долг", "нет"])
     last_pay = None
     for op in reversed(db.client_operations(c["id"])):
         try:
@@ -7789,40 +7788,56 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if op["type"] == "payment" or (op["type"] == "invoice" and data.get("payment", 0) > 0):
             last_pay = op["ts"]
             break
+    last_pay_note = ""
     if last_pay:
         try:
             days = (now - datetime.fromisoformat(last_pay)).days
-            lines.append(f"💵 Последняя оплата: {days} дн. назад")
+            info_rows.append(["Последняя оплата", f"{days} дн. назад"])
+            last_pay_note = f" · оплата {days} дн. назад"
         except ValueError:
             pass
     elif c["debt"] > 0:
-        lines.append("💵 Оплат ещё не было")
+        info_rows.append(["Последняя оплата", "оплат ещё не было"])
+        last_pay_note = " · оплат ещё не было"
     if start_debt:
-        lines.append(f"📌 Начальный долг (до бота): {money(start_debt)}")
+        info_rows.append(["Начальный долг (до бота)", f"{fmt_num(start_debt)} сом"])
+    sections = [{"headers": ["", ""], "rows": info_rows, "widths": [55, 110]}]
     specials = db.client_prices_map(c["id"])
     if specials:
-        lines.append("")
-        lines.append("💲 <b>Спеццены</b> (подставляются в накладные сами):")
+        sp_rows = []
         for pid, price in sorted(specials.items()):
             p_row = prices.BY_ID.get(pid)
             if p_row:
-                lines.append(f"• {esc(p_row['name'])} {esc(p_row['volume'])}: "
-                             f"{fmt_num(price)} сом (прайс {fmt_num(p_row['price'])})")
-        lines.append(f"<i>Убрать: «спеццена для {esc(c['name'])}: Товар 0»</i>")
+                sp_rows.append([p_row["name"], p_row["volume"],
+                                fmt_num(price), fmt_num(p_row["price"])])
+        sections.append({
+            "title": "Спеццены (подставляются в накладные сами)",
+            "headers": ["Товар", "Фасовка", "Спеццена", "Прайс"],
+            "rows": sp_rows, "widths": [88, 26, 26, 25], "numbered": True,
+            "footer": f"Убрать: «спеццена для {c['name']}: Товар 0»"})
     if rows:
-        lines.append("")
-        lines.append(f"🗒 <b>Последние операции ({min(len(rows), 15)} из {len(rows)}):</b>")
-        for date_str, doc, plus, minus, balance in rows[-15:]:
-            parts = [f"{date_str} {doc}:"]
-            if plus:
-                parts.append(f"+{fmt_num(plus)}")
-            if minus:
-                parts.append(f"−{fmt_num(minus)}")
-            parts.append(f"→ долг {fmt_num(balance)}")
-            lines.append(esc(" ".join(parts)))
-    lines.append("")
-    lines.append(f"📄 Акт сверки в PDF: /act {esc(c['name'])}")
-    await send_long(update.message, "\n".join(lines))
+        op_rows = [[date_str, doc,
+                    fmt_num(plus) if plus else "—",
+                    fmt_num(minus) if minus else "—",
+                    fmt_num(balance)]
+                   for date_str, doc, plus, minus, balance in rows[-15:]]
+        sections.append({
+            "title": f"Последние операции ({min(len(rows), 15)} из {len(rows)})",
+            "headers": ["Дата", "Документ", "Товар, +", "Оплата, −", "Долг после"],
+            "rows": op_rows, "widths": [22, 76, 24, 24, 25],
+            "footer": f"Полная история с составом накладных: /act {c['name']}"})
+    pdf = generate_report_pdf(
+        "КАРТОЧКА КЛИЕНТА",
+        f"{c['name']} · склад «{wh['name']}» · на {now.strftime('%d.%m.%Y')}",
+        sections)
+    debt_note = (f"долг {fmt_num(c['debt'])} сом" if c["debt"] > 0 else
+                 f"переплата {fmt_num(-c['debt'])} сом" if c["debt"] < 0 else
+                 "долга нет")
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=(
+            f"клиент_{safe_filename(c['name'])}_{now.strftime('%d%m%Y')}.pdf")),
+        caption=f"👤 {c['name']} ({wh['name']}) — {debt_note}{last_pay_note}\n"
+                f"📄 Акт сверки: /act {c['name']}")
 
 
 async def act_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
