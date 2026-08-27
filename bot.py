@@ -1091,6 +1091,14 @@ def parse_items(raw_items: list):
         product = prices.match_product(name, volume)
         if product is None:
             warnings.append(f"«{name} {volume}» не найден в прайсе — остаток по нему не изменится")
+        elif difflib.SequenceMatcher(
+                None, prices._base_name(name),
+                prices._base_name(product["name"])).ratio() < 0.75:
+            # Нечёткий подбор ушёл далеко от написанного — показать, ЧТО
+            # именно спишется (ревизия 27.08.2026: подмена товара была
+            # невидима на карточке подтверждения).
+            warnings.append(f"«{name}» принят как «{product['name']} "
+                            f"{product['volume']}» — проверьте")
         items.append({
             "name": name, "volume": volume, "qty": qty, "price": price,
             "box_qty": box_qty, "product_id": product["id"] if product else None,
@@ -3263,6 +3271,12 @@ async def start_rename_client(update, context, actor, data):
     if not is_admin(actor):
         await update.message.reply_text("⛔ Переименовать клиента может только админ.")
         return
+    # Только личка: карточка показывает долг клиента (ревизия 27.08.2026 —
+    # в чате склада долг скрытого Бишкека увидел бы весь чат).
+    if update.effective_chat is not None and update.effective_chat.type != "private":
+        await update.message.reply_text(
+            "Переименование клиента — в личке с ботом, карточка показывает долг.")
+        return
     name = str(data.get("client") or "").strip()
     new_name = str(data.get("new_name") or "").strip()
     if not name or not new_name:
@@ -3287,16 +3301,20 @@ async def start_rename_client(update, context, actor, data):
         return found
 
     hits = _find(name)
+    swapped = False
     if not hits:
         # Модель могла поменять имена местами («переименуй X на Y» — 17.08.2026,
-        # реальный случай владельца). В базе существует ровно одно из двух имён:
-        # оно и есть старое, второе — новое.
-        back = _find(new_name)
+        # реальный случай владельца). Перестановка — только по ТОЧНОМУ
+        # совпадению имени/псевдонима (ревизия 27.08.2026: нечёткие ступени
+        # могли предложить переименование задом наперёд или чужого клиента).
+        back = [(w, c_) for w in search_whs
+                for c_ in [db.client_exact_strict(w["id"], new_name)] if c_]
         if len(back) == 1:
             log.warning("Переименование: имена переставлены — «%s» → «%s»",
                         new_name, name)
             name, new_name = new_name, name
             hits = back
+            swapped = True
     if not hits:
         where = (f"на складе «{esc(search_whs[0]['name'])}»" if len(search_whs) == 1
                  else "ни на одном складе")
@@ -3326,9 +3344,13 @@ async def start_rename_client(update, context, actor, data):
         return
     payload = {"kind": "rename_client", "user_id": actor["id"],
                "chat_id": update.effective_chat.id, "client_id": c["id"],
-               "old_name": c["name"], "new_name": new_name, "wh_name": wh["name"]}
+               "old_name": c["name"], "new_name": new_name,
+               "wh_id": wh["id"], "wh_name": wh["name"]}
     token = new_pending(payload)
+    swap_note = ("⚠️ <b>Понял наоборот</b>: первое имя не нашлось, второе есть "
+                 "в базе — проверьте направление!\n" if swapped else "")
     await update.message.reply_text(
+        swap_note +
         f"✏️ <b>Переименование клиента</b> — склад «{esc(wh['name'])}»\n\n"
         f"«{esc(c['name'])}» → <b>«{esc(new_name)}»</b>\n"
         f"Текущий долг: {money(c['debt'])} — долг, история операций, телефон и "
@@ -3720,8 +3742,8 @@ async def start_inventory(update, context, actor, data):
         # Показываем, ЧТО не узнали — иначе непонятно, что исправлять
         await update.message.reply_text(
             "⚠️ Ни один товар не распознан по прайсу:\n• "
-            + "\n• ".join(esc(m) for m in missing[:10])
-            + ("\n…" if len(missing) > 10 else "")
+            + "\n• ".join(esc(w) for w in warnings[:10])
+            + ("\n…" if len(warnings) > 10 else "")
             + "\nПроверьте названия и фасовки: /pricepdf", parse_mode="HTML")
         return
 
@@ -4338,7 +4360,12 @@ async def _finish_return(q, context, actor, p):
     # «не проведено» (тот же принцип, что в _finish_invoice).
     try:
         await q.edit_message_text(f"✅ Возврат №{op_id} проведён.")
-        await send_return_pdf(context, p["chat_id"], client_label, p, old_debt, total)
+        # Возвратная накладная С ЦЕНАМИ И ДОЛГОМ — только в личку (ревизия
+        # 27.08.2026: возврат, созданный в чате склада, отправлял её в общий
+        # чат — ровно тот долг, который прячет /hidedebts). Если возврат
+        # писали в группе, платная версия уходит нажавшему кнопку (админу).
+        priced_dest = p["chat_id"] if p["chat_id"] > 0 else q.from_user.id
+        await send_return_pdf(context, priced_dest, client_label, p, old_debt, total)
         if p.get("approver_id"):
             try:
                 await context.bot.send_message(
@@ -4350,9 +4377,12 @@ async def _finish_return(q, context, actor, p):
         actor_name = db.get_user(p["user_id"])["name"]
         note = "Подтвердил админ" if p.get("approver_id") else ""
         # В ленту — PDF без цен и долга (просьба владельца 18.08.2026),
-        # вместо текстовой сводки с хвостом «долг: N сом».
+        # вместо текстовой сводки с хвостом «долг: N сом». Если возврат
+        # создан прямо в чате склада, безопасный PDF идёт и туда (раньше
+        # exclude гасил ленту, а в чат уезжала платная версия).
         await feed_return_pdf(context, p["wh_id"], client_label, p, op_id,
-                              actor_name, note, exclude_chat_id=p["chat_id"])
+                              actor_name, note,
+                              exclude_chat_id=p["chat_id"] if p["chat_id"] > 0 else None)
     except Exception:
         log.exception("Возврат №%s проведён, уведомления не дошли", op_id)
         try:
@@ -5430,9 +5460,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 msg += "\nТеперь голосовые будут распознавать эти имена точнее."
                 await q.edit_message_text(msg, parse_mode="HTML")
             elif p["kind"] == "rename_client":
-                # Перепроверка занятости: имя могли занять, пока заявка ждала
+                # Перепроверка занятости: имя могли занять, пока заявка ждала.
+                # Склад — по id (имя склада могли сменить за сутки, 27.08.2026)
                 c_now = db.client_get(p["client_id"])
-                wh_row = db.warehouse_by_name(p["wh_name"])
+                wh_row = (db.warehouse_by_id(p["wh_id"]) if p.get("wh_id")
+                          else db.warehouse_by_name(p["wh_name"]))
                 other = db.client_exact(wh_row["id"], p["new_name"]) if wh_row else None
                 if c_now is None:
                     await q.edit_message_text("⚠️ Клиент уже не существует.")
@@ -5613,17 +5645,23 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
 
     # Сверять имя клиента только с последним сообщением нельзя: модель
     # отвечает по всему диалогу («Асан оплатил» → вопрос → «Каракол, 5000»),
-    # и имя стоит в предыдущей реплике. Берём последние три реплики человека.
-    said = [m["content"] for m in chat_histories.get(chat_id, [])
-            if m["role"] == "user" and isinstance(m["content"], str)]
+    # и имя стоит в предыдущей реплике. Берём последние три реплики человека —
+    # но только В ЛИЧКЕ: в чате склада история общая на всех, и имя из
+    # сообщения СОСЕДА делало бы подмену «прослеживаемой» (ревизия 27.08.2026).
+    if update.effective_chat is not None and update.effective_chat.type == "private":
+        said = [m["content"] for m in chat_histories.get(chat_id, [])
+                if m["role"] == "user" and isinstance(m["content"], str)]
+        src_text = " ".join(said[-3:])
+    else:
+        src_text = text
     await dispatch_action(update, context, actor, reply, draft, quiet=quiet,
-                          src_text=" ".join(said[-3:]))
+                          src_text=src_text)
 
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
 WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory", "writeoff",
                      "amend_invoice", "replace_invoice", "set_min", "set_phone",
-                     "set_price", "client_alias", "rename_client"}
+                     "set_price", "client_alias"}
 
 
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False,
@@ -7836,8 +7874,8 @@ async def client_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_document(
         document=InputFile(pdf, filename=(
             f"клиент_{safe_filename(c['name'])}_{now.strftime('%d%m%Y')}.pdf")),
-        caption=f"👤 {c['name']} ({wh['name']}) — {debt_note}{last_pay_note}\n"
-                f"📄 Акт сверки: /act {c['name']}")
+        caption=(f"👤 {c['name']} ({wh['name']}) — {debt_note}{last_pay_note}\n"
+                 f"📄 Акт сверки: /act {c['name']}")[:1024])
 
 
 async def act_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):

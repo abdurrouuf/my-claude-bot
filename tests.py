@@ -1027,6 +1027,80 @@ def test_stock_box_column():
     assert smap[6] == 170 and smap[16] == 100 and smap[8] == 5
 
 
+def test_revision_270826():
+    """Находки ревизии 27.08.2026 (три параллельных аудита)."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+
+    # 1. Подбор товара: короткое имя не уводит на чужой товар
+    assert prices.match_product("Альтопен", "100 мл")["id"] == 6      # не КАЛЬФОТОН
+    assert prices.match_product("Альтопен", "200 мл") is None          # не АЛЬТОПЕР
+    assert prices.match_product("Сурфагон Ультра 10 мкг", "20 мл") is None  # не 50 мкг
+    assert prices.match_product("Сурфагон Ультра 10 мкг", "50 мл")["id"] == 60
+    # полный кросс-перебор: короткое имя никогда не даёт чужой base
+    for nm in {prices._base_name(p["name"]) for p in prices.PRICE_LIST_DATA}:
+        for v in {p["volume"] for p in prices.PRICE_LIST_DATA}:
+            got = prices.match_product(nm, v)
+            assert got is None or prices._base_name(got["name"]) == nm, (nm, v)
+
+    # 2. Инвентаризация с нераспознанными позициями не падает (был NameError)
+    admin = db.get_user(ADMIN)
+    sent = []
+
+    async def reply(text, **kw):
+        sent.append(text)
+
+    upd = SimpleNamespace(message=SimpleNamespace(reply_text=reply),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          effective_user=SimpleNamespace(id=ADMIN))
+    asyncio.run(bot.start_inventory(upd, None, admin, {
+        "warehouse": wh["name"],
+        "items": [{"name": "Ерунда", "volume": "1 л", "qty": 5}]}))
+    assert "не распознан" in sent[-1] and "Ерунда" in sent[-1]
+
+    # 3. rename: обещания переезжают, алиас-двойник не создаётся,
+    #    двусмысленный алиас не выбирает клиента молча
+    db.clients_add_bulk(wh["id"], [("Асан", 1000), ("Болот", 2000)])
+    a = db.client_exact(wh["id"], "Асан")
+    db.promise_add("Асан", 5000, "2026-08-25", ADMIN)
+    db.rename_client(a["id"], "Асан Токмокский")
+    assert db.promises_close("Асан Токмокский", None) == 1
+    b = db.client_exact(wh["id"], "Болот")
+    db.add_client_alias(b["id"], "Асан")          # «Асан» теперь чужой алиас
+    db.rename_client(a["id"], "Асан")             # вернули имя (алиас Болота остался)
+    db.rename_client(a["id"], "Асан Новый")       # «Асан» занят Болотом —
+    aliases_a = db.client_aliases_list(a["id"])   # двойник не создаётся
+    assert "Асан" not in aliases_a, aliases_a
+    # а был бы у обоих — точный поиск не гадает
+    db.add_client_alias(a["id"], "Общий Псевдоним")
+    db.add_client_alias(b["id"], "Общий Псевдоним")
+    assert db.client_exact(wh["id"], "Общий Псевдоним") is None
+
+    # 4. Перестановка имён в rename — только по точному совпадению
+    assert db.client_exact_strict(wh["id"], "Болот")["id"] == b["id"]
+    assert db.client_exact_strict(wh["id"], "Бол") is None      # часть — не считается
+    sent.clear()
+    asyncio.run(bot.start_rename_client(upd, None, admin, {
+        "client": "Несуществующий", "new_name": "Болот"}))
+    assert "Понял наоборот" in sent[-1]           # перестановка с явной пометкой
+    bot.PENDING.clear()
+
+    # 5. rename в группе — отказ (карточка показывает долг)
+    upd_g = SimpleNamespace(message=SimpleNamespace(reply_text=reply),
+                            effective_chat=SimpleNamespace(id=-5, type="supergroup"),
+                            effective_user=SimpleNamespace(id=ADMIN))
+    asyncio.run(bot.start_rename_client(upd_g, None, admin, {
+        "client": "Болот", "new_name": "Другой"}))
+    assert "личке" in sent[-1]
+
+    # 6. Карточка накладной предупреждает о далёкой подмене товара
+    items, warns = bot.parse_items([
+        {"name": "АЛЬТОПЕН (альбендазол 10%", "volume": "100 мл",
+         "qty": 1, "price": 90}])
+    assert items[0]["product_id"] == 6 and not any("принят как" in w for w in warns)
+
+
 def test_client_card_pdf():
     """/client — карточка клиента PDF-файлом (19.08.2026, просьба владельца)."""
     import asyncio
@@ -1035,7 +1109,6 @@ def test_client_card_pdf():
     db.clients_add_bulk(wh["id"], [("Давран Карасуу", 100000)])
     c = db.client_exact(wh["id"], "Давран Карасуу")
     db.set_client_price(c["id"], 10, 120)
-    admin = db.get_user(ADMIN)
     sent = {}
 
     async def reply_document(document=None, caption=None, **kw):
@@ -1055,7 +1128,6 @@ def test_client_card_pdf():
 def test_api_balance_alert():
     """Тревога о заканчивающемся счёте API (18.08.2026)."""
     import asyncio
-    from types import SimpleNamespace
     _fresh_db()
     sent = []
 

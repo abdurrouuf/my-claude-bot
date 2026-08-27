@@ -193,18 +193,28 @@ def match_product(name: str, volume: str):
     for p in PRICE_LIST_DATA:
         if p["name"].lower() == name_l and p["volume"].lower() == vol_l:
             return p
-    m = difflib.get_close_matches(f"{name_l} | {vol_l}", list(_KEYS), n=1, cutoff=0.85)
-    if m:
-        return _KEYS[m[0]]
     base, vkey = _base_name(name), _vol_key(volume)
-    if not base or not vkey:
-        return None
-    same_vol = [p for p in PRICE_LIST_DATA if _vol_key(p["volume"]) == vkey]
+    same_vol = [p for p in PRICE_LIST_DATA if _vol_key(p["volume"]) == vkey] \
+        if base and vkey else []
+    # ТОЧНОЕ короткое имя + точная фасовка — РАНЬШЕ нечёткого поиска по
+    # полной строке (ревизия 27.08.2026: difflib находил «альтопен | 100 мл»
+    # ≈ «кальфотон | 100 мл» с 0.857 и продавал чужой товар).
     exact_base = [p for p in same_vol if _base_name(p["name"]) == base]
     if len(exact_base) == 1:
         return exact_base[0]
     if exact_base:
         return None                      # двусмысленно — не гадаем
+    # Имя, которое ТОЧНО существует в прайсе, но с ДРУГИМИ фасовками, не
+    # «дочиниваем» нечёткими ступенями до чужого товара: «Альтопен 200 мл»
+    # не должен стать АЛЬТОПЕРОМ, а «Сурфагон Ультра 10 мкг 20 мл» —
+    # СУРФАГОНОМ 50 мкг (другая дозировка!). Такой фасовки просто нет.
+    if base and any(_base_name(p["name"]) == base for p in PRICE_LIST_DATA):
+        return None
+    m = difflib.get_close_matches(f"{name_l} | {vol_l}", list(_KEYS), n=1, cutoff=0.85)
+    if m:
+        return _KEYS[m[0]]
+    if not base or not vkey:
+        return None
     scored = sorted(
         ((difflib.SequenceMatcher(None, base, _base_name(p["name"])).ratio(), p)
          for p in same_vol), key=lambda x: -x[0])
