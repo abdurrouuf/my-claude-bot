@@ -1077,12 +1077,14 @@ def client_exact(wh_id: int, name: str):
     ).fetchone()
     if row is not None:
         return row
-    row = conn.execute(
+    rows = conn.execute(
         "SELECT c.* FROM client_aliases a JOIN clients c ON c.id = a.client_id "
         "WHERE c.warehouse_id=? AND a.alias=?", (wh_id, name)
-    ).fetchone()
-    if row is not None:
-        return row
+    ).fetchall()
+    # Один и тот же псевдоним у ДВУХ клиентов склада (могло возникнуть через
+    # rename поверх add_clients) — двусмысленность, не гадаем (27.08.2026).
+    if len({r["id"] for r in rows}) == 1:
+        return rows[0]
     if " " in name:
         # Перестановка слов: считаем совпадением, только если такой клиент
         # ровно один (двусмысленность решают кнопки похожих в fuzzy_clients).
@@ -1154,6 +1156,25 @@ def client_aliases_list(client_id: int) -> list:
         "SELECT alias FROM client_aliases WHERE client_id=? ORDER BY alias", (client_id,))]
 
 
+def client_exact_strict(wh_id: int, text: str):
+    """Клиент по ТОЧНОМУ имени или псевдониму (NOCASEU), без нечётких
+    ступеней. Единственное совпадение — клиент, иначе None. Нужен
+    переименованию: перестановку имён нельзя строить на догадках."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    conn = connect()
+    ids = {r["id"] for r in conn.execute(
+        "SELECT id FROM clients WHERE warehouse_id=? AND name=? COLLATE NOCASEU",
+        (wh_id, t))}
+    ids |= {r["client_id"] for r in conn.execute(
+        "SELECT a.client_id FROM client_aliases a JOIN clients c ON c.id=a.client_id "
+        "WHERE c.warehouse_id=? AND a.alias=? COLLATE NOCASEU", (wh_id, t))}
+    if len(ids) != 1:
+        return None
+    return client_get(ids.pop())
+
+
 def rename_client(client_id: int, new_name: str, keep_old_alias: bool = True):
     """Переименование контрагента (17.08.2026, просьба владельца).
 
@@ -1174,10 +1195,29 @@ def rename_client(client_id: int, new_name: str, keep_old_alias: bool = True):
                      (new_name.strip(), client_id))
         conn.execute("DELETE FROM client_aliases WHERE client_id=? "
                      "AND alias=? COLLATE NOCASEU", (client_id, new_name.strip()))
+        # Открытые обещания оплаты записаны ТЕКСТОМ имени — переписываем на
+        # новое, иначе «выполнил обещание» с новым именем их не закроет
+        # (находка ревизии 27.08.2026).
+        conn.execute("UPDATE promises SET client=? "
+                     "WHERE status='open' AND client = ? COLLATE NOCASEU",
+                     (new_name.strip(), old_name))
         if keep_old_alias and old_name.lower() != new_name.strip().lower():
-            conn.execute(
-                "INSERT OR IGNORE INTO client_aliases(client_id, alias) VALUES(?,?)",
-                (client_id, old_name))
+            wh_row = conn.execute("SELECT warehouse_id FROM clients WHERE id=?",
+                                  (client_id,)).fetchone()
+            taken = conn.execute(
+                "SELECT 1 FROM clients WHERE warehouse_id=? AND id!=? "
+                "AND name=? COLLATE NOCASEU "
+                "UNION SELECT 1 FROM client_aliases a JOIN clients c "
+                "ON c.id=a.client_id WHERE c.warehouse_id=? AND a.client_id!=? "
+                "AND a.alias=? COLLATE NOCASEU",
+                (wh_row["warehouse_id"], client_id, old_name,
+                 wh_row["warehouse_id"], client_id, old_name)).fetchone()
+            # Старое имя уже носит другой клиент склада (имя или псевдоним) —
+            # алиас-двойник не создаём (27.08.2026)
+            if taken is None:
+                conn.execute(
+                    "INSERT OR IGNORE INTO client_aliases(client_id, alias) VALUES(?,?)",
+                    (client_id, old_name))
         return old_name
 
 
