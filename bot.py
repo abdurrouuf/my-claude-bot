@@ -656,6 +656,11 @@ def _build_static_system() -> str:
                  'это ЧАСТЬ ИМЕНИ, включай её в "client" и НЕ считай складом.')
     parts.append('- "warehouse": заполняй ТОЛЬКО если явно прозвучало слово «склад» '
                  '(«со склада Ош»). Город рядом с именем — не склад, тогда warehouse = null.')
+    parts.append('- Несколько сумм от ОДНОГО клиента («приход 13550 и 61620», «два прихода», '
+                 'ответ «можно отдельно» на твой вопрос) — добавь поле "amounts": [13550, 61620] '
+                 '(ВСЕ суммы списком, в порядке из сообщения), а в "amount" положи первую. '
+                 'Одна сумма — просто "amount", без "amounts". НИКОГДА не отбрасывай '
+                 'вторую и последующие суммы — бот проведёт каждую отдельной операцией.')
     parts.append("")
     parts.append("=== РЕЖИМ 4: ПРИХОД / ПЕРЕМЕЩЕНИЕ ТОВАРА ===")
     parts.append('Если сообщение — пополнение склада товаром или перемещение между складами '
@@ -2633,13 +2638,21 @@ async def start_return(update, context, actor, data):
 
 def payment_summary(p) -> str:
     c = db.client_get(p["client_id"])
-    old_debt = c["debt"]
+    # Несколько сумм одним сообщением («13550 и 61620, можно отдельно»):
+    # карточки после первой показывают долг с учётом предыдущих карточек,
+    # иначе остаток в них выглядел бы неверно (сам приход считается по
+    # живому долгу на момент кнопки — commit_payment).
+    offset = float(p.get("debt_offset") or 0)
+    old_debt = c["debt"] - offset
     remainder = old_debt - p["amount"]
+    part = (f" ({p['part_i']} из {p['part_n']})"
+            if p.get("part_n") and int(p["part_n"]) > 1 else "")
     lines = [
-        "💵 <b>Подтвердите приход</b>",
+        f"💵 <b>Подтвердите приход{part}</b>",
         f"🏬 Склад: <b>{esc(p['wh_name'])}</b>",
         f"👤 Клиент: <b>{esc(c['name'])}</b>",
-        f"⚠️ Текущий долг: {money(old_debt)}",
+        f"⚠️ Текущий долг: {money(old_debt)}"
+        + (" (с учётом карточки выше)" if offset else ""),
         f"✅ Оплата: <b>{money(p['amount'])}</b>",
     ]
     if remainder <= 0:
@@ -2787,19 +2800,43 @@ def _client_by_text(actor, hint: str):
     return found[0] if len(found) == 1 else (None, None)
 
 
+def _payment_amounts(data) -> list:
+    """Суммы прихода из ответа модели: обычно одна ("amount"), но клиент
+    может попросить провести несколько отдельно («13550 и 61620») —
+    тогда модель отдаёт "amounts" списком (инцидент 27.08.2026: вторая
+    сумма молча терялась). Кривые и неположительные значения выкидываются.
+    """
+    out = []
+    raw = data.get("amounts")
+    if isinstance(raw, (list, tuple)):
+        for a in raw:
+            try:
+                v = float(a)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                out.append(v)
+    if not out:
+        try:
+            v = float(data.get("amount") or 0)
+        except (TypeError, ValueError):
+            v = 0
+        if v > 0:
+            out = [v]
+    return out[:10]                       # страховка от бреда модели
+
+
 async def start_payment(update, context, actor, data):
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
         await update.message.reply_text(err, parse_mode="HTML")
         return
     client_name = str(data.get("client") or "").strip()
-    try:
-        amount = float(data.get("amount") or 0)
-    except (TypeError, ValueError):
-        amount = 0
-    if not client_name or amount <= 0:
+    amounts = _payment_amounts(data)
+    if not client_name or not amounts:
         await update.message.reply_text("Не понял клиента или сумму. Пример: «Асан приход 5000».")
         return
+    amount = amounts[0]
 
     exact = db.client_exact(wh["id"], client_name)
     # Имя, которого в сообщении нет, — верить ему нельзя (см. _name_traceable).
@@ -2829,12 +2866,25 @@ async def start_payment(update, context, actor, data):
         "wh_id": wh["id"], "wh_name": wh["name"],
         "client_name": client_name, "client_id": None, "amount": amount,
     }
+    if len(amounts) > 1:
+        payload["amounts"] = amounts      # для пути с кнопками выбора клиента
 
     if exact:
         payload["client_id"] = exact["id"]
-        token = new_pending(payload)
-        await update.message.reply_text(payment_summary(payload), parse_mode="HTML",
-                                        reply_markup=confirm_kb(token))
+        payload.pop("amounts", None)
+        # Несколько сумм — отдельная карточка на каждую (просьба владельца
+        # 27.08.2026: «можно отдельно» проводило только первую).
+        offset = 0.0
+        for i, amt in enumerate(amounts, 1):
+            pay = dict(payload)
+            pay["amount"] = amt
+            if len(amounts) > 1:
+                pay["debt_offset"] = offset
+                pay["part_i"], pay["part_n"] = i, len(amounts)
+            token = new_pending(pay)
+            await update.message.reply_text(payment_summary(pay), parse_mode="HTML",
+                                            reply_markup=confirm_kb(token))
+            offset += amt
         return
 
     candidates = db.fuzzy_clients(wh["id"], client_name)
@@ -5046,6 +5096,28 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         elif p["kind"] == "set_price":
             summary = set_price_summary(p)
         else:
+            amounts = _payment_amounts(p)
+            if len(amounts) > 1:
+                # Несколько сумм одного клиента: карточка на каждую (как в
+                # start_payment при точном совпадении имени).
+                p.pop("amounts", None)
+                p["amount"] = amounts[0]
+                p["debt_offset"] = 0.0
+                p["part_i"], p["part_n"] = 1, len(amounts)
+                _persist_pending(token)
+                await q.edit_message_text(payment_summary(p), parse_mode="HTML",
+                                          reply_markup=confirm_kb(token))
+                offset = amounts[0]
+                for i, amt in enumerate(amounts[1:], 2):
+                    pay = {k: v for k, v in p.items() if k not in ("created", "ttl")}
+                    pay["amount"] = amt
+                    pay["debt_offset"] = offset
+                    pay["part_i"], pay["part_n"] = i, len(amounts)
+                    tok2 = new_pending(pay)
+                    await q.message.reply_text(payment_summary(pay), parse_mode="HTML",
+                                               reply_markup=confirm_kb(tok2))
+                    offset += amt
+                return
             summary = payment_summary(p)
         await q.edit_message_text(summary, parse_mode="HTML", reply_markup=confirm_kb(token))
         return

@@ -2121,6 +2121,87 @@ def test_all_reports_ask_warehouse():
     asyncio.run(run())
 
 
+def test_multi_payment():
+    """Несколько сумм прихода одним сообщением (инцидент 27.08.2026).
+
+    Владелец: «Ден Каракол 13'550 и 61'620» → «Можно отдельно» — бот
+    провёл только первую сумму, вторую пришлось отправлять вручную.
+    Теперь модель отдаёт "amounts" списком, а бот строит отдельную
+    карточку подтверждения на каждую сумму.
+    """
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1")
+    conn.commit()
+    db.clients_add_bulk(wh["id"], [("Ден Каракол", 100000)])
+    admin = db.get_user(ADMIN)
+
+    # Парсер сумм: список, мусор и неположительное — вон, фолбэк на amount
+    assert bot._payment_amounts({"amounts": [13550, 61620]}) == [13550.0, 61620.0]
+    assert bot._payment_amounts({"amounts": ["x", -5, 0], "amount": 500}) == [500.0]
+    assert bot._payment_amounts({"amount": 500}) == [500.0]
+    assert bot._payment_amounts({}) == []
+
+    sent = []
+
+    async def reply(text, **kw):
+        sent.append(text)
+
+    upd = SimpleNamespace(message=SimpleNamespace(reply_text=reply),
+                          effective_chat=SimpleNamespace(id=1, type="private"))
+    before = set(bot.PENDING.keys())
+    asyncio.run(bot.start_payment(upd, None, admin, {
+        "action": "payment", "client": "Ден Каракол", "amount": 13550,
+        "amounts": [13550, 61620], "warehouse": wh["name"],
+        "_src_text": "Ден Каракол приход 13550 и 61620, можно отдельно"}))
+    cards = [t for t in sent if "Подтвердите приход" in t]
+    assert len(cards) == 2, f"карточек {len(cards)}, а не 2"
+    assert "(1 из 2)" in cards[0] and "13'550" in cards[0] and "100'000" in cards[0]
+    # вторая карточка считает долг с учётом первой: 100000−13550=86450,
+    # остаток после второй 86450−61620=24830
+    assert "(2 из 2)" in cards[1] and "61'620" in cards[1]
+    assert "86'450" in cards[1] and "24'830" in cards[1]
+    assert "с учётом карточки выше" in cards[1]
+
+    # проведение обеих карточек гасит долг на сумму двух приходов
+    pays = sorted((bot.PENDING[t] for t in bot.PENDING.keys() - before
+                   if bot.PENDING[t].get("kind") == "payment"),
+                  key=lambda p: p.get("part_i", 1))
+    assert len(pays) == 2
+    for p in pays:
+        bot.commit_payment(p)
+    c = db.client_exact(wh["id"], "Ден Каракол")
+    assert c["debt"] == 100000 - 13550 - 61620, c["debt"]
+
+    # одна сумма — обычная карточка без нумерации
+    asyncio.run(bot.start_payment(upd, None, admin, {
+        "action": "payment", "client": "Ден Каракол", "amount": 5000,
+        "warehouse": wh["name"], "_src_text": "Ден Каракол приход 5000"}))
+    assert "Подтвердите приход</b>" in sent[-1] and " из " not in sent[-1]
+
+    # путь через кнопку выбора клиента: карточки строятся после выбора
+    async def run_pk():
+        cid = db.client_exact(wh["id"], "Ден Каракол")["id"]
+        p = {"kind": "payment", "user_id": ADMIN, "chat_id": 1,
+             "wh_id": wh["id"], "wh_name": wh["name"],
+             "client_name": "Ден Кар", "client_id": None,
+             "amount": 1000.0, "amounts": [1000.0, 2000.0]}
+        token = bot.new_pending(p)
+        answers, edits = [], []
+        u = _cb_update(ADMIN, f"pk:{token}:{cid}", answers, edits)
+        replies = []
+
+        async def rt(text, **kw):
+            replies.append(text)
+        u.callback_query.message.reply_text = rt
+        await bot.on_callback(u, SimpleNamespace(bot=None))
+        assert edits and "(1 из 2)" in edits[-1] and "1'000" in edits[-1]
+        assert replies and "(2 из 2)" in replies[-1] and "2'000" in replies[-1]
+    asyncio.run(run_pk())
+
+
 def _noop(*a, **k):
     pass
 
