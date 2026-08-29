@@ -2202,6 +2202,63 @@ def test_multi_payment():
     asyncio.run(run_pk())
 
 
+def test_fix_expiry():
+    """Инцидент 22.08.2026 (Пенстоп-G): перемещение с ошибочным сроком,
+    которого нет на источнике. Карточка предупреждает; «исправь срок»
+    переносит партию (и минусовый фантом источника) без изменения
+    остатков; /undo исправления откатывает партии точно."""
+    wh = _fresh_db()                               # Каракол — источник
+    dst = db.warehouse_by_name("Кара-Балта")
+    _load(wh, {16: 100}, {(wh["id"], 16): [("06.2029", 100)]})
+    pr = prices.BY_ID[16]
+    p = {"kind": "transfer", "user_id": ADMIN, "chat_id": 1,
+         "wh_id": dst["id"], "wh_name": dst["name"],
+         "from_wh_id": wh["id"], "from_wh_name": wh["name"],
+         "items": [{"name": pr["name"], "volume": pr["volume"], "qty": 30,
+                    "box_qty": None, "product_id": 16, "expiry": "06.2028"}],
+         "warnings": []}
+    # 1. Карточка предупреждает: партии 06.2028 на источнике нет
+    card = bot.transfer_summary(p)
+    assert "НЕТ партии со сроком 06.2028" in card
+    # ...а совпадающий срок предупреждения не даёт
+    p_ok = {**p, "items": [{**p["items"][0], "expiry": "06.2029"}]}
+    assert "НЕТ партии" not in bot.transfer_summary(p_ok)
+    # 2. Ошибочное перемещение проводится (как в инциденте)
+    bot._fill_src_batches(p)
+    op_id, _ = bot.commit_transfer(p)
+    assert db.batch_qty(wh["id"], 16, "06.2028") == -30    # фантом-минус
+    assert db.batch_qty(wh["id"], 16, "06.2029") == 100
+    assert db.batch_qty(dst["id"], 16, "06.2028") == 30
+    # 3. Исправление на получателе: партия 06.2028 целиком -> 06.2029
+    fid, moved = db.fix_batch_expiry(ADMIN, dst["id"], 16, "06.2028",
+                                     "06.2029", None, "фикс получателя")
+    assert moved == 30
+    assert db.batch_qty(dst["id"], 16, "06.2028") == 0
+    assert db.batch_qty(dst["id"], 16, "06.2029") == 30
+    assert db.stock_qty(dst["id"], 16) == 30               # остаток не менялся
+    # 4. Исправление на источнике: минус переезжает в правильную партию
+    fid2, moved2 = db.fix_batch_expiry(ADMIN, wh["id"], 16, "06.2028",
+                                       "06.2029", None, "фикс источника")
+    assert moved2 == -30
+    assert db.batch_qty(wh["id"], 16, "06.2028") == 0
+    assert db.batch_qty(wh["id"], 16, "06.2029") == 70
+    assert _batch_sum(wh, 16) == _stock(wh, 16) == 70      # инвариант цел
+    # 5. /undo исправления возвращает партии как было
+    db.cancel_operation(fid2)
+    assert db.batch_qty(wh["id"], 16, "06.2028") == -30
+    assert db.batch_qty(wh["id"], 16, "06.2029") == 100
+    assert _batch_sum(wh, 16) == _stock(wh, 16) == 70
+    # 6. Несуществующую партию переносить нечего
+    assert db.fix_batch_expiry(ADMIN, dst["id"], 16, "01.2030", "02.2030",
+                               None, "пусто") == (None, 0)
+    # 7. Карточка исправления честно говорит про минусовый фантом
+    card2 = bot.fix_expiry_summary(
+        {"wh_name": wh["name"], "name": pr["name"], "volume": pr["volume"],
+         "old_expiry": "06.2028", "new_expiry": "06.2029",
+         "qty": None, "have": -30})
+    assert "фантом" in card2 and "не меняется" in card2.lower()
+
+
 def _noop(*a, **k):
     pass
 

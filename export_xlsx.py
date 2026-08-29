@@ -18,6 +18,7 @@ OP_TYPES = {
     "inventory": "Инвентаризация",
     "handover": "Инкассация",
     "writeoff": "Списание",
+    "fix_expiry": "Исправление срока",
 }
 
 HEADER_FILL = PatternFill("solid", fgColor="1B5E20")

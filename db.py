@@ -1585,6 +1585,62 @@ def product_batches_of(wh_id: int, product_id: int):
         f"ORDER BY {_BATCH_ORDER}", (wh_id, product_id)).fetchall()
 
 
+def product_batches_all(wh_id: int, product_id: int):
+    """Все партии товара, включая МИНУСОВЫЕ «фантомы» (перемещение с
+    ошибочным сроком уводит несуществующую партию источника в минус) —
+    product_batches_of их прячет, а исправлению срока они и нужны."""
+    return connect().execute(
+        "SELECT expiry, qty FROM product_batches "
+        "WHERE warehouse_id=? AND product_id=? AND qty != 0 "
+        f"ORDER BY {_BATCH_ORDER}", (wh_id, product_id)).fetchall()
+
+
+def batch_qty(wh_id: int, product_id: int, expiry: str) -> int:
+    """Текущее количество в партии (0 — партии нет; бывает и минус)."""
+    r = connect().execute(
+        "SELECT qty FROM product_batches "
+        "WHERE warehouse_id=? AND product_id=? AND expiry=?",
+        (wh_id, product_id, expiry or "")).fetchone()
+    return r["qty"] if r else 0
+
+
+def fix_batch_expiry(user_id: int, wh_id: int, product_id: int,
+                     old_expiry: str, new_expiry: str, qty, summary: str,
+                     extra: dict = None):
+    """Исправление ошибочного срока: переносит количество из партии
+    old_expiry в партию new_expiry ТОГО ЖЕ склада. Остаток склада не
+    меняется — правятся только партии (/expiry, FEFO). qty=None — вся
+    партия на момент проведения, включая минусовую партию-фантом (минус
+    переезжает в правильную партию). Журналируется операцией fix_expiry
+    с batch_deltas — /undo откатывает точно.
+    Возвращает (op_id, перенесённое количество); нечего переносить —
+    (None, 0)."""
+    conn = connect()
+    with _lock, conn:
+        if qty is None:
+            r = conn.execute(
+                "SELECT qty FROM product_batches "
+                "WHERE warehouse_id=? AND product_id=? AND expiry=?",
+                (wh_id, product_id, old_expiry or "")).fetchone()
+            qty = r["qty"] if r else 0
+        if not qty:
+            return None, 0
+        _batch_add(conn, wh_id, product_id, old_expiry or "", -qty)
+        _batch_add(conn, wh_id, product_id, new_expiry or "", qty)
+        batch_deltas = [[wh_id, product_id, old_expiry or "", -qty],
+                        [wh_id, product_id, new_expiry or "", qty]]
+        data = json.dumps(
+            {"stock_deltas": [], "debt_deltas": [],
+             "batch_deltas": batch_deltas, **(extra or {})},
+            ensure_ascii=False)
+        cur = conn.execute(
+            "INSERT INTO operations(ts, user_id, type, warehouse_id, "
+            "client_id, summary, data, status) VALUES(?,?,?,?,?,?,?, 'done')",
+            (datetime.now(BISHKEK).isoformat(timespec="seconds"),
+             user_id, "fix_expiry", wh_id, None, summary, data))
+        return cur.lastrowid, qty
+
+
 def _revert_batches(conn, batch_deltas, stock_deltas=None):
     """Откат партий операции.
 
