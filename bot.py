@@ -3624,6 +3624,11 @@ async def start_fix_expiry(update, context, actor, data):
             "проверьте название: /pricepdf", parse_mode="HTML")
         return
     old_raw = data.get("old_expiry")
+    # «без срока» модель должна отдавать как null, но может прислать и
+    # словами — понимаем оба варианта (владелец пишет «...: без срока
+    # на 06.2029»).
+    if isinstance(old_raw, str) and "без" in old_raw.lower():
+        old_raw = None
     old_exp = _norm_expiry(old_raw) if old_raw else ""
     if old_raw and not old_exp:
         await update.message.reply_text(
