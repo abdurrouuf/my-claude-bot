@@ -669,6 +669,19 @@ def expiry_list(wh_id: int):
         (wh_id,)).fetchall()
 
 
+def expiry_phantoms(wh_id: int):
+    """Минусовые ДАТИРОВАННЫЕ партии — «призраки» от операций с ошибочным
+    сроком (перемещение/списание/продажа списали партию, которой нет на
+    складе; инцидент Пенстоп-G 22.08.2026). Партию «без срока» не
+    показываем: минус в ней — обычный минусовой остаток, его видно
+    в /stock."""
+    return connect().execute(
+        "SELECT product_id, expiry, qty FROM product_batches "
+        "WHERE warehouse_id=? AND qty < 0 AND expiry != '' "
+        "ORDER BY substr(expiry, 4) || substr(expiry, 1, 2)",
+        (wh_id,)).fetchall()
+
+
 def known_client_names(limit: int = 40, wh_ids: list = None):
     """Имена клиентов для подсказок. wh_ids — только клиенты этих складов
     (сотруднику в промпт не даём имена чужих складов); None — вся база.
