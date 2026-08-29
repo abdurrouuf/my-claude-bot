@@ -10561,9 +10561,14 @@ async def _expiry_report(update, whs):
     soon = now + timedelta(days=92)
     lots = db.lots_map()   # заводские серии: (товар, срок) -> «2606912»
     sections, summary = [], []
+    any_phantoms = False
     for wh in whs:
         rows_db = [r for r in db.expiry_list(wh["id"]) if r["qty"] > 0]
-        if not rows_db:
+        # Минусовые партии-«призраки» от операций с ошибочным сроком —
+        # видны прямо в /expiry, чтобы не сверять его со /stock вручную
+        # (просьба владельца 29.08.2026 после инцидента Пенстоп-G).
+        phantoms = db.expiry_phantoms(wh["id"])
+        if not rows_db and not phantoms:
             summary.append(f"📅 «{wh['name']}»: сроков годности пока нет")
             continue
         # Партии одного товара — в ОДНОЙ строке (просьба владельца
@@ -10608,16 +10613,34 @@ async def _expiry_report(update, whs):
                         exp_cell.append(f"серия {lot}")
             total_qty = sum(q_ for _, q_ in batches)
             rows.append([exp_cell, label, volume, f"{total_qty} шт", status])
+        n_goods = len(rows)
+        for r in phantoms:
+            pr_ = prices.BY_ID.get(r["product_id"])
+            label = (pr_["name"].split("(")[0].strip() if pr_
+                     else f"товар №{r['product_id']}")
+            rows.append([r["expiry"], label, pr_["volume"] if pr_ else "",
+                         f"{fmt_num(r['qty'])} шт", "ПРИЗРАК!"])
+        footer = (f"Позиций: {n_goods} (партий: {n_batches}) · "
+                  f"просрочено: {n_expired} · "
+                  f"истекает в ближайшие 3 мес: {n_soon}")
+        if phantoms:
+            any_phantoms = True
+            footer += (f" · минусовых партий-призраков: {len(phantoms)} — "
+                       f"след операции с ошибочным сроком, реальный остаток "
+                       f"этих сроков меньше показанного")
         sections.append(
             {"title": f"Склад «{wh['name']}»",
              "headers": ["Срок (партии)", "Товар", "Фасовка", "Остаток", "Статус"],
              "rows": rows, "widths": [41, 55, 24, 20, 27], "numbered": True,
-             "footer": f"Позиций: {len(rows)} (партий: {n_batches}) · "
-                       f"просрочено: {n_expired} · "
-                       f"истекает в ближайшие 3 мес: {n_soon}"})
-        summary.append(f"📅 «{wh['name']}»: {len(rows)} поз."
+             "footer": footer})
+        summary.append(f"📅 «{wh['name']}»: {n_goods} поз."
                        + (f" · ‼️ просрочено: {n_expired}" if n_expired else "")
-                       + (f" · ⚠️ скоро: {n_soon}" if n_soon else ""))
+                       + (f" · ⚠️ скоро: {n_soon}" if n_soon else "")
+                       + (f" · 👻 призраков: {len(phantoms)}" if phantoms else ""))
+    if any_phantoms:
+        summary.append("👻 Призрак — минусовая партия от операции с ошибочным "
+                       "сроком. Админ лечит фразой: «исправь срок Товар "
+                       "Фасовка на Складе: неверный срок на верный».")
     if not sections:
         await update.message.reply_text("\n".join(summary))
         return

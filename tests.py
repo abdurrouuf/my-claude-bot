@@ -2259,6 +2259,54 @@ def test_fix_expiry():
     assert "фантом" in card2 and "не меняется" in card2.lower()
 
 
+def test_expiry_phantoms():
+    """/expiry показывает минусовые партии-призраки (доработка 29.08.2026):
+    строка «ПРИЗРАК!» в PDF, счётчик в подписи, подсказка про «исправь
+    срок». Минус в партии «без срока» призраком не считается."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    dst = db.warehouse_by_name("Кара-Балта")
+    _load(wh, {16: 100}, {(wh["id"], 16): [("06.2029", 100)]})
+    pr = prices.BY_ID[16]
+    p = {"kind": "transfer", "user_id": ADMIN, "chat_id": 1,
+         "wh_id": dst["id"], "wh_name": dst["name"],
+         "from_wh_id": wh["id"], "from_wh_name": wh["name"],
+         "items": [{"name": pr["name"], "volume": pr["volume"], "qty": 30,
+                    "box_qty": None, "product_id": 16, "expiry": "06.2028"}],
+         "warnings": []}
+    bot._fill_src_batches(p)
+    bot.commit_transfer(p)
+    ph = db.expiry_phantoms(wh["id"])
+    assert [(r["expiry"], r["qty"]) for r in ph] == [("06.2028", -30)]
+    # Минус «без срока» — не призрак
+    db.commit_operation(ADMIN, "inventory", wh["id"], None, "минус",
+                        [(wh["id"], 20, -5)], [], {})
+    assert db.batch_qty(wh["id"], 20, "") == -5
+    assert [(r["expiry"], r["qty"]) for r in db.expiry_phantoms(wh["id"])] \
+        == [("06.2028", -30)]
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"] = document.input_file_content
+            out["caption"] = caption
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.expiry_cmd(upd, SimpleNamespace(args=[wh["name"]])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+    assert "призраков: 1" in out["caption"]
+    assert "исправь срок" in out["caption"]
+    # После исправления призрак пропадает из /expiry
+    db.fix_batch_expiry(ADMIN, wh["id"], 16, "06.2028", "06.2029", None, "фикс")
+    assert db.expiry_phantoms(wh["id"]) == []
+
+
 def _noop(*a, **k):
     pass
 
