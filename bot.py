@@ -847,6 +847,23 @@ def _build_static_system() -> str:
     parts.append('- Не путай с режимом 11: там ПРОДАЖНАЯ цена прайса, здесь — '
                  'закупочная (слова «закуп», «курс», «расходы»).')
     parts.append("")
+    parts.append("=== РЕЖИМ 18: ИСПРАВЛЕНИЕ СРОКА ПАРТИИ (только админ) ===")
+    parts.append('Если админ исправляет ОШИБОЧНО записанный срок годности партии '
+                 'на складе — товар никуда не движется, меняется только срок '
+                 '(«исправь срок Пенстоп-G 100мл на Кара-Балте: 06.2028 на '
+                 '06.2029», «перенеси партию Дексатоп 50мл 11.2027 в 11.2028 '
+                 'на Караколе»), верни ТОЛЬКО JSON:')
+    parts.append('{"action": "fix_expiry", "warehouse": "имя склада", '
+                 '"name": "точное название из прайса", "volume": "фасовка", '
+                 '"old_expiry": "MM.YYYY или null", "new_expiry": "MM.YYYY", '
+                 '"qty": число_или_null}')
+    parts.append('- old_expiry — неверный срок, который записан сейчас '
+                 '(null = партия «без срока»); new_expiry — правильный срок.')
+    parts.append('- qty — только если явно названо количество; не названо — '
+                 'null (переносится вся партия).')
+    parts.append('- Не путай со списанием (там товар убирают) и перемещением '
+                 '(там другой склад): здесь товар остаётся, правится запись срока.')
+    parts.append("")
     parts.append("=== ВАЖНО: КОРОБКИ ===")
     parts.append('Сотрудники могут писать количество коробками: "1к", "2к", "3к" и т.д.')
     parts.append('В прайсе у каждого товара есть "шт/кор" — количество штук в одной коробке.')
@@ -2922,6 +2939,41 @@ def _norm_expiry(raw) -> str:
     return f"{mm:02d}.{year}"
 
 
+def _wrong_expiry_warnings(p):
+    """Явно названный срок, которого нет среди партий склада-источника, —
+    почти всегда опечатка (инцидент 22.08.2026: «Пенстоп 100 мл 3 к 06/28»
+    списал с Бишкека несуществующую партию 06.2028 в минус, а на Кара-Балту
+    товар лёг с неверным сроком). Не блокируем — предупреждаем в карточке,
+    чтобы подтверждающий увидел ДО кнопки. Срок из ответа на вопрос бота
+    (expiry_asked) не проверяем — товар на источнике лежит без срока,
+    это штатный путь."""
+    out = []
+    src_wh = p.get("from_wh_id")
+    if not src_wh:
+        return out
+    for it in p["items"]:
+        exp = it.get("expiry")
+        if not it.get("product_id") or not exp or it.get("expiry_asked"):
+            continue
+        bq = db.batch_qty(src_wh, it["product_id"], exp)
+        if bq >= it["qty"]:
+            continue
+        batches = db.product_batches_of(src_wh, it["product_id"])
+        listed = ", ".join(f"{b['expiry'] or 'без срока'} — {b['qty']} шт"
+                           for b in batches) or "партий нет"
+        if bq <= 0:
+            out.append(f"{it['name']} {it['volume']}: на складе "
+                       f"«{p['from_wh_name']}» НЕТ партии со сроком {exp}. "
+                       f"Партии сейчас: {listed}. Проверьте срок — похоже "
+                       f"на опечатку!")
+        else:
+            out.append(f"{it['name']} {it['volume']}: в партии {exp} на "
+                       f"складе «{p['from_wh_name']}» только {bq} шт из "
+                       f"{it['qty']} — остальное уйдёт минусом. Партии "
+                       f"сейчас: {listed}.")
+    return out
+
+
 def transfer_summary(p) -> str:
     header = "📦 <b>Приход товара</b>" if not p["from_wh_id"] else "📦 <b>Перемещение товара</b>"
     lines = [header]
@@ -2943,6 +2995,7 @@ def transfer_summary(p) -> str:
                 if have < it["qty"]:
                     warns.append(f"{it['name']} {it['volume']}: на складе «{p['from_wh_name']}» "
                                  f"{have} шт, перемещаете {it['qty']} шт")
+        warns += _wrong_expiry_warnings(p)
     if warns:
         lines.append("")
         for w in warns:
@@ -3525,6 +3578,100 @@ async def start_change_price(update, context, actor, data):
                "chat_id": update.effective_chat.id, "items": items}
     token = new_pending(payload)
     await update.message.reply_text(change_price_summary(payload), parse_mode="HTML",
+                                    reply_markup=confirm_kb(token))
+
+
+def fix_expiry_summary(p) -> str:
+    old = p["old_expiry"] or "без срока"
+    lines = ["📅 <b>Исправление срока партии</b>",
+             f"🏬 Склад: <b>{esc(p['wh_name'])}</b>", "",
+             f"{esc(p['name'])} {esc(p['volume'])}:",
+             f"партия <b>{esc(old)}</b> (сейчас {fmt_num(p['have'])} шт) → "
+             f"срок <b>{esc(p['new_expiry'])}</b>",
+             f"Переносится: {fmt_num(p['qty'])} шт" if p.get("qty") is not None
+             else "Переносится вся партия."]
+    if p["have"] < 0:
+        lines += ["", "⚠️ Партия минусовая — «фантом» от операции с ошибочным "
+                      "сроком; минус переедет в правильную партию, и /expiry "
+                      "встанет на место."]
+    lines += ["", "Остаток склада НЕ меняется — исправляется только запись "
+                  "срока. Провести?"]
+    return "\n".join(lines)
+
+
+async def start_fix_expiry(update, context, actor, data):
+    """«Исправь срок Пенстоп-G 100мл на Кара-Балте: 06.2028 на 06.2029» —
+    перенос партии с ошибочным сроком в правильный (только админ). Товар
+    не движется, деньги не участвуют; остаток склада не меняется."""
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Срок партии исправляет только админ.")
+        return
+    wh_name = str(data.get("warehouse") or "").strip()
+    wh = db.warehouse_by_name(wh_name) if wh_name else None
+    if wh is None:
+        await update.message.reply_text(
+            "Укажите склад — например: «исправь срок Пенстоп-G 100мл на "
+            "Кара-Балте: 06.2028 на 06.2029». Склады: "
+            + ", ".join(f"«{esc(w['name'])}»" for w in db.all_warehouses()),
+            parse_mode="HTML")
+        return
+    name = str(data.get("name") or "")
+    volume = str(data.get("volume") or "")
+    product = prices.match_product(name, volume)
+    if product is None:
+        await update.message.reply_text(
+            f"⚠️ Товар «{esc(name)} {esc(volume)}» не найден в прайсе — "
+            "проверьте название: /pricepdf", parse_mode="HTML")
+        return
+    old_raw = data.get("old_expiry")
+    old_exp = _norm_expiry(old_raw) if old_raw else ""
+    if old_raw and not old_exp:
+        await update.message.reply_text(
+            "Не понял старый срок — напишите в формате 06.2028.")
+        return
+    new_exp = _norm_expiry(data.get("new_expiry"))
+    if not new_exp:
+        await update.message.reply_text(
+            "Не понял новый (правильный) срок — напишите в формате 06.2029.")
+        return
+    if old_exp == new_exp:
+        await update.message.reply_text("Старый и новый срок совпадают — исправлять нечего.")
+        return
+    have = db.batch_qty(wh["id"], product["id"], old_exp)
+    if have == 0:
+        batches = db.product_batches_all(wh["id"], product["id"])
+        listed = "\n".join(
+            f"• {b['expiry'] or 'без срока'} — {fmt_num(b['qty'])} шт"
+            for b in batches) or "• партий нет"
+        await update.message.reply_text(
+            f"На складе «{esc(wh['name'])}» у товара "
+            f"{esc(product['name'])} {esc(product['volume'])} нет партии со "
+            f"сроком {esc(old_exp or 'без срока')}. Партии сейчас:\n{listed}",
+            parse_mode="HTML")
+        return
+    qty = None
+    if data.get("qty") is not None and have > 0:
+        # Минусовую партию-фантом переносим только целиком: частичный
+        # перенос минуса запутает, а нужен он не бывает.
+        try:
+            qty = int(data.get("qty"))
+        except (TypeError, ValueError):
+            qty = None
+        if qty is not None and (qty <= 0 or qty > have):
+            await update.message.reply_text(
+                f"В партии {esc(old_exp or 'без срока')} сейчас "
+                f"{fmt_num(have)} шт — перенести можно от 1 до {fmt_num(have)}.")
+            return
+    payload = {"kind": "fix_expiry", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id,
+               "wh_id": wh["id"], "wh_name": wh["name"],
+               "product_id": product["id"], "name": product["name"],
+               "volume": product["volume"],
+               "old_expiry": old_exp, "new_expiry": new_exp,
+               "qty": qty, "have": have}
+    token = new_pending(payload)
+    await update.message.reply_text(fix_expiry_summary(payload),
+                                    parse_mode="HTML",
                                     reply_markup=confirm_kb(token))
 
 
@@ -4663,6 +4810,15 @@ async def _finish_transfer(q, context, actor, p):
             warn = ("\n\n⚠️ Остаток изменился со времени заявки — "
                     "уйдёт в минус:\n• " + "\n• ".join(minus) +
                     "\nЕсли это неверно — отмените: /undo")
+        # Названный срок против партий источника — заявка могла ждать
+        # сутки, партии изменились; ошибочный срок должен быть виден
+        # и в итоговом сообщении (инцидент 22.08.2026, Пенстоп-G).
+        bad_exp = _wrong_expiry_warnings(p)
+        if bad_exp:
+            warn += ("\n\n⚠️ Срок не совпадает с партиями склада-источника:"
+                     "\n• " + "\n• ".join(bad_exp) +
+                     "\nЕсли срок ошибочный — напишите «исправь срок ...» "
+                     "или отмените: /undo")
     _fill_src_batches(p)
     op_id, summary = commit_transfer(p)
     if not p.get("from_wh_id"):
@@ -5588,6 +5744,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  f"{fmt_num(it['old_price'])} → <b>{fmt_num(it['price'])} сом</b>")
                 lines.append("История: /pricelog")
                 await q.edit_message_text("\n".join(lines), parse_mode="HTML")
+            elif p["kind"] == "fix_expiry":
+                # Перепроверка на кнопке: заявка могла ждать сутки, партию
+                # могли распродать или изменить другой операцией.
+                if not is_admin(actor):
+                    await q.answer("⛔ Только админ", show_alert=True)
+                    return
+                have = db.batch_qty(p["wh_id"], p["product_id"], p["old_expiry"])
+                qty = p["qty"] if p.get("qty") is not None else have
+                if not have or not qty:
+                    await q.edit_message_text(
+                        "⚠️ Партия уже пуста — переносить нечего "
+                        "(остаток менялся, пока заявка ждала).")
+                    return
+                if p.get("qty") is not None and 0 < have < qty:
+                    qty = have  # партию успели частично распродать
+                old_label = p["old_expiry"] or "без срока"
+                short = str(p["name"]).split("(")[0].strip()
+                summary = (f"Исправление срока: {short} {p['volume']} — "
+                           f"партия {old_label} → {p['new_expiry']} "
+                           f"({fmt_num(qty)} шт), склад {p['wh_name']}")
+                op_id, moved = db.fix_batch_expiry(
+                    p["user_id"], p["wh_id"], p["product_id"],
+                    p["old_expiry"], p["new_expiry"], qty, summary)
+                if op_id is None:
+                    await q.edit_message_text(
+                        "⚠️ Партия уже пуста — переносить нечего.")
+                    return
+                await q.edit_message_text(
+                    f"✅ {esc(summary)} — проведено (операция №{op_id}).\n"
+                    f"Остаток склада не менялся.\n"
+                    f"Проверить: /expiry {esc(p['wh_name'])} · "
+                    f"Отменить: /undo {op_id}", parse_mode="HTML")
         except Exception as e:
             log.exception("Ошибка проведения операции")
             # Сообщаем и нажавшему кнопку (иначе админ-подтверждающий не видит
@@ -5830,6 +6018,8 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             await start_set_price(update, context, actor, data)
         elif action == "change_price":
             await start_change_price(update, context, actor, data)
+        elif action == "fix_expiry":
+            await start_fix_expiry(update, context, actor, data)
         elif action == "set_buy_price":
             await start_set_buy_price(update, context, actor, data)
         elif action == "set_usd_rate":
@@ -9266,13 +9456,13 @@ async def weekly_debt_loop(app):
 
 LOG_TYPE_ICONS = {"invoice": "🧾", "payment": "💵", "transfer": "📦",
                   "inventory": "📋", "return": "🔙", "handover": "💰",
-                  "writeoff": "🗑"}
+                  "writeoff": "🗑", "fix_expiry": "📅"}
 
 # Названия типов операций для таблиц PDF (эмодзи в шрифте документа нет)
 LOG_TYPE_NAMES = {"invoice": "Накладная", "payment": "Оплата",
                   "transfer": "Перемещение", "inventory": "Инвентаризация",
                   "return": "Возврат", "handover": "Сдача выручки",
-                  "writeoff": "Списание"}
+                  "writeoff": "Списание", "fix_expiry": "Исправление срока"}
 
 # Слова-фильтры /log по типу операции: /log Азамат накладные 50
 LOG_TYPE_FILTERS = {
