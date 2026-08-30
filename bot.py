@@ -550,6 +550,19 @@ def _feed_muted(user_id, wh_id) -> bool:
     return user_id == ADMIN_ID and wh_id in hidden_debt_wh_ids()
 
 
+def _feed_muted_op(op_type, user_id, wh_id) -> bool:
+    """То же правило, но для СВОДОК в общий чат (просьба владельца
+    30.08.2026: «не хочу, чтобы в общий чат показывалось, сколько денег
+    поступает МНЕ; поступления сотрудников — можно, а мне в личку все
+    данные»). Отдельные операции админа лента и так не показывает
+    (_feed_muted), но вечерние «Итоги дня» и /report в группе считали
+    ОБЩУЮ сумму — деньги владельца были видны сотрудникам.
+    Прячем те же типы, что и лента: накладные и приходы денег;
+    перемещения/возвраты/списания/инкассации остаются."""
+    return (op_type in ("invoice", "payment")
+            and _feed_muted(user_id, wh_id))
+
+
 async def feed_return_pdf(context, wh_id, client_label, p, op_id,
                           actor_name, note="", exclude_chat_id=None):
     """Возврат в ленту чата — PDF БЕЗ цен и БЕЗ долга (просьба владельца
@@ -7538,12 +7551,15 @@ PERIODS = {
 
 
 def report_data(warehouses, days_back: int, last_hours: int = None,
-                start_dt=None, end_dt=None):
+                start_dt=None, end_dt=None, hide_admin=False):
     """Цифры отчёта по складам за период (для текста и PDF).
 
     last_hours — скользящее окно «последние N часов»;
     start_dt/end_dt — явные границы (для «хвоста» вчерашнего вечера
-    в календарной сводке дня, решение владельца 08.08.2026)."""
+    в календарной сводке дня, решение владельца 08.08.2026);
+    hide_admin — отчёт идёт В ОБЩИЙ ЧАТ: накладные и приходы денег самого
+    админа по складу со скрытыми долгами в суммы не входят (просьба
+    владельца 30.08.2026, см. _feed_muted_op). В личке отчёт полный."""
     if start_dt is not None:
         start = start_dt
     elif last_hours:
@@ -7560,10 +7576,14 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
         ret_sum, ret_count = 0.0, 0
         wo_sum, wo_count = 0.0, 0
         hand_sum, hand_by = 0.0, {}
+        hidden_n = 0
         for op in ops:
             try:
                 data = json.loads(op["data"])
             except (ValueError, TypeError):
+                continue
+            if hide_admin and _feed_muted_op(op["type"], op["user_id"], wh["id"]):
+                hidden_n += 1
                 continue
             if op["type"] == "invoice" and op["warehouse_id"] == wh["id"]:
                 inv_data.append(data)
@@ -7598,6 +7618,7 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
             "ret_count": ret_count, "ret_sum": ret_sum, "transfers": transfers,
             "wo_count": wo_count, "wo_sum": wo_sum,
             "hand_sum": hand_sum, "hand_list": hand_list,
+            "hidden_n": hidden_n,
             "top": sorted(top.items(), key=lambda x: -x[1]),
             "empty": (not inv_data and not pay_sum and not transfers
                       and not ret_count and not wo_count and not hand_sum),
@@ -7639,12 +7660,15 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 {"days_back": days_back, "label": label}):
             return
     await _report_render(update, whs, actor,
-                         {"days_back": days_back, "label": label})
+                         {"days_back": days_back, "label": label,
+                          # В группе — без операций админа по скрытому складу
+                          "hide_admin": in_group})
 
 
 async def _report_render(update, whs, actor, params):
     pdf, caption = build_report_pdf(whs, params.get("days_back", 0),
-                                    params.get("label", "за сегодня"))
+                                    params.get("label", "за сегодня"),
+                                    hide_admin=params.get("hide_admin", False))
     if pdf is None:
         await update.message.reply_text(caption)
         return
@@ -7654,9 +7678,14 @@ async def _report_render(update, whs, actor, params):
         caption=caption)
 
 
-def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
-    """PDF-отчёт по складам. Возвращает (pdf, подпись) или (None, текст-пусто)."""
-    data = report_data(whs, days_back, last_hours=last_hours)
+def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None,
+                     hide_admin=False):
+    """PDF-отчёт по складам. Возвращает (pdf, подпись) или (None, текст-пусто).
+
+    hide_admin — версия для общего чата (без операций админа по складу
+    со скрытыми долгами)."""
+    data = report_data(whs, days_back, last_hours=last_hours,
+                       hide_admin=hide_admin)
     if all(d["empty"] for d in data):
         return None, f"📊 Операций {label} не было."
     sections, summary = [], []
@@ -7720,6 +7749,31 @@ def build_report_pdf(whs, days_back: int, label: str, last_hours: int = None):
     return pdf, "\n".join(summary)[:1000]
 
 
+async def _admin_full_summary(bot, whs):
+    """Полные «Итоги дня» админу в личку по складам, где часть операций
+    скрыта от общего чата (просьба владельца 30.08.2026: «в общий чат —
+    без моих денег, а мне в личку все данные»). Прятать было нечего —
+    сообщения нет: в чате и так полная картина."""
+    full = report_data(whs, 0)
+    if not any(d.get("hidden_n") for d in full):
+        return
+    pdf, caption = build_report_pdf(whs, 0, "за день")
+    if pdf is None:
+        return
+    names = ", ".join(f"«{d['wh']['name']}»" for d in full if d.get("hidden_n"))
+    date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
+    try:
+        await bot.send_document(
+            ADMIN_ID,
+            document=InputFile(pdf, filename=f"итоги_дня_полные_{date_str}.pdf"),
+            caption=("🔒 <b>Итоги дня — полные (только вам)</b>\n"
+                     f"{esc(caption)}\n\nВ общий чат по складу {esc(names)} "
+                     "ушла версия без ваших накладных и приходов.")[:1000],
+            parse_mode="HTML")
+    except Exception as e:
+        log.warning("Не удалось отправить полные итоги дня админу: %s", e)
+
+
 async def send_evening_summaries(bot):
     """Вечерняя сводка дня в каждый чат-ленту (если были операции) — PDF."""
     by_chat = {}
@@ -7734,8 +7788,15 @@ async def send_evening_summaries(bot):
         # скользящие сутки показывали вчерашние вечерние деньги как
         # сегодняшние). Операции «вчера после сводки» (20:00–полночь)
         # не теряются — идут отдельной строкой в подписи.
-        pdf, caption = build_report_pdf(whs, 0, "за день")
-        tail = report_data(whs, 0, start_dt=yesterday_cut, end_dt=midnight)
+        # В общий чат — без накладных и приходов самого админа по складу
+        # со скрытыми долгами (просьба владельца 30.08.2026); полную
+        # версию он получает в личку ниже.
+        pdf, caption = build_report_pdf(whs, 0, "за день", hide_admin=True)
+        tail = report_data(whs, 0, start_dt=yesterday_cut, end_dt=midnight,
+                           hide_admin=True)
+        # Полная версия (со своими операциями) — админу в личку, если по
+        # складам чата что-то пряталось.
+        await _admin_full_summary(bot, whs)
         tail_lines = []
         for d in tail:
             if d.get("empty"):
