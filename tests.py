@@ -2369,6 +2369,46 @@ def test_feed_summary_hides_admin_money():
     assert bot.report_data([wh], 0, hide_admin=True)[0]["money"] == 308000
 
 
+def test_draft_never_becomes_transfer():
+    """Инцидент 30.08.2026: «Черновик. Аза Манас шаары (Бека) …» — в имени
+    клиента и склад («Манас»), и сотрудник («Аза»); слово «черновик»
+    отрезается до ИИ, и модель выбрала transfer — сотрудник получил
+    «⛔ Приход товара извне может внести только админ». Два слоя защиты:
+    подсказка модели в динамическом блоке + страховка в коде."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    admin = db.get_user(ADMIN)
+    # 1. Подсказка едет модели только при черновике (и не ломает кэш —
+    #    статичный блок неизменен)
+    plain = bot.system_blocks(admin)
+    drafted = bot.system_blocks(admin, draft=True)
+    assert plain[0]["text"] == drafted[0]["text"]          # кэш цел
+    assert "ЧЕРНОВИК" not in plain[1]["text"]
+    assert "ЧЕРНОВИК" in drafted[1]["text"]
+    assert "transfer" in drafted[1]["text"]
+    # 2. Страховка: черновик не проводится как приход/перемещение
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    data = {"action": "transfer", "from_warehouse": None,
+            "to_warehouse": "Манас", "items": []}
+    asyncio.run(bot.dispatch_data(upd, SimpleNamespace(bot=None), admin,
+                                  data, draft=True))
+    assert replies and "Черновик" in replies[-1] and "имя клиента" in replies[-1]
+    # Без черновика то же действие идёт обычным путём (не перехватывается)
+    replies.clear()
+    asyncio.run(bot.dispatch_data(upd, SimpleNamespace(bot=None), admin,
+                                  dict(data), draft=False))
+    assert not any("это накладная клиенту" in r for r in replies)
+
+
 def _noop(*a, **k):
     pass
 
