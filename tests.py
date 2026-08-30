@@ -2409,6 +2409,60 @@ def test_draft_never_becomes_transfer():
     assert not any("это накладная клиенту" in r for r in replies)
 
 
+def test_money_report():
+    """/money (30.08.2026, просьба владельца объединить /stockprice и
+    /debts): товар по прайсу + долги клиентов + наличные в кассах,
+    только админ, только личка, склад спрашивается кнопками."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {16: 100})                      # товар на складе
+    price = prices.BY_ID[16]["price"]
+    db.clients_add_bulk(wh["id"], [("Должник", 50000, None),
+                                   ("Переплата", -1800, None)])
+    cd = db.client_exact(wh["id"], "Должник")["id"]
+    # приход денег сотруднику — попадает в его кассу
+    db.commit_operation(DANIYAR, "payment", wh["id"], cd, "приход",
+                        [], [(cd, -7000)], {"amount": 7000})
+    d = bot._wh_money(wh, {})
+    assert d["sale"] == 100 * price
+    assert d["debt"] == 43000 and d["debtors"] == 1   # 50000 − 7000
+    assert d["over"] == 1800
+    assert d["cash"] == 7000 and d["cash_list"] == [("Данияр", 7000)]
+    assert d["total"] == d["sale"] + d["debt"] + d["cash"]
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"] = document.input_file_content
+            out["caption"] = caption
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.money_cmd(upd, SimpleNamespace(args=[wh["name"]])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+    assert "товар" in out["caption"] and "долги" in out["caption"]
+    # Сотруднику — отказ; в группе — отказ (деньги в общий чат не идут)
+    out.clear()
+    emp = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.money_cmd(emp, SimpleNamespace(args=[])))
+    assert "pdf" not in out and "админ" in out.get("text", "").lower()
+    out.clear()
+    grp = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=-100, type="group"),
+                          message=Msg())
+    asyncio.run(bot.money_cmd(grp, SimpleNamespace(args=[])))
+    assert "pdf" not in out
+    # Зарегистрирован в панели выбора склада (правило проекта)
+    assert bot.REPORT_PICKS["money"]["admin_only"] is True
+
+
 def _noop(*a, **k):
     pass
 
