@@ -2463,6 +2463,85 @@ def test_money_report():
     assert bot.REPORT_PICKS["money"]["admin_only"] is True
 
 
+def test_buy_som_registry():
+    """Реестр закупок 1С (файл владельца 21.08.2026, выбор 30.08.2026):
+    себестоимость в СОМАХ по последней закупке — приоритетнее долларовой,
+    курс её не меняет; заданную владельцем цену сидирование не затирает."""
+    import buy_registry_data as R
+    wh = _fresh_db()
+    assert len(R.BUY_SOM) == len(prices.PRICE_LIST_DATA) == 104
+    assert sum(len(v) for v in R.BUY_HISTORY.values()) == 361
+    # каждая цена BUY_SOM — цена последней закупки из истории
+    for pid, (som, date, doc) in R.BUY_SOM.items():
+        last = R.BUY_HISTORY[pid][-1]
+        assert (last[0], last[1], last[4]) == (date, doc, som), pid
+    assert db.seed_buy_som(R.BUY_SOM) is True
+    assert db.seed_buy_som(R.BUY_SOM) is False        # флаг: второй раз мимо
+    smap = db.products_buy_som_map()
+    assert len(smap) == 104 and smap[16] == R.BUY_SOM[16][0]
+    # Себестоимость известна у всех 104 позиций и НЕ зависит от курса
+    b1 = bot.buy_som_map()
+    db.set_setting("usd_rate", "200")
+    b2 = bot.buy_som_map()
+    assert len(b1) == len(b2) == 104
+    assert b1[16] == b2[16] == R.BUY_SOM[16][0]
+    db.set_setting("usd_rate", "87.5")
+    # Долларовая цена остаётся запасным путём: товар без сомовой цены
+    db.connect().execute("UPDATE products SET buy_som=NULL WHERE id=16")
+    db.connect().commit()
+    assert bot.buy_som_map()[16] == db.products_buy_map()[16] * 87.5
+    # Ручная правка в сомах фиксируется и сбрасывает долларовую
+    db.product_set_buy(16, som=99.0)
+    assert db.products_buy_som_map()[16] == 99.0
+    assert 16 not in db.products_buy_map()
+    assert bot.buy_som_map()[16] == 99.0
+    # /stockcost и /money считают по ней
+    _load(wh, {16: 10})
+    d = bot._wh_money(wh, bot.buy_som_map())
+    assert d["buy"] == 990.0 and d["no_buy"] == 0
+
+
+def test_buylog_report():
+    """/buylog: сводка по всем товарам и история одного (только админ,
+    только личка); проценты роста считаются от первой закупки."""
+    import asyncio
+    from types import SimpleNamespace
+    import buy_registry_data as R
+    _fresh_db()
+    rows = bot._buylog_rows(16)
+    assert len(rows) == len(R.BUY_HISTORY[16]) and rows[0][5] is None
+    prev = R.BUY_HISTORY[16][0][4]
+    assert abs(rows[1][5] - (R.BUY_HISTORY[16][1][4] - prev) / prev * 100) < 1e-6
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"] = document.input_file_content
+            out["caption"] = caption
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.buylog_cmd(upd, SimpleNamespace(args=[])))
+    assert out.get("pdf", b"")[:4] == b"%PDF" and "104" in out["caption"]
+    out.clear()
+    asyncio.run(bot.buylog_cmd(upd, SimpleNamespace(args=["Дексатоп", "50", "мл"])))
+    assert out.get("pdf", b"")[:4] == b"%PDF" and "закупок" in out["caption"]
+    out.clear()
+    asyncio.run(bot.buylog_cmd(upd, SimpleNamespace(args=["Ерунда"])))
+    assert "pdf" not in out and "не нашёл" in out["text"].lower()
+    # сотруднику — отказ
+    out.clear()
+    emp = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.buylog_cmd(emp, SimpleNamespace(args=[])))
+    assert "pdf" not in out
+
+
 def _noop(*a, **k):
     pass
 
