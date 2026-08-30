@@ -2307,6 +2307,68 @@ def test_expiry_phantoms():
     assert db.expiry_phantoms(wh["id"]) == []
 
 
+def test_client_permuted_typo():
+    """Инцидент 30.08.2026: владелец написал «Фахриддин Дадажанов», в базе
+    «Дадажанов Фахридин» — перестановка слов ВМЕСТЕ с опечаткой. Полная
+    строка даёт 0.49, равенство ключей слов не проходит (лишняя «д») —
+    бот предлагал создать двойника с отдельным долгом."""
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], [("Дадажанов Фахридин", 2743195, None)])
+    got = db.client_exact(wh["id"], "Фахриддин Дадажанов")
+    assert got is not None and got["name"] == "Дадажанов Фахридин"
+    # обычные ступени не сломаны
+    assert db.client_exact(wh["id"], "Дадажанов Фахридин")["name"] == \
+        "Дадажанов Фахридин"
+    assert db.client_exact(wh["id"], "Фахридин")["name"] == "Дадажанов Фахридин"
+    # чужое имя по-прежнему не находится
+    assert db.client_exact(wh["id"], "Сапаркулова Алмагул") is None
+    # лишнее слово далеко (0.86 < порога) — чужого клиента не подставляем
+    db.clients_add_bulk(wh["id"], [("Дадажанов Фахридин уулу", 0, None)])
+    assert db.client_exact(wh["id"], "Фахриддин Дадажанов")["name"] == \
+        "Дадажанов Фахридин"
+    # два одинаково похожих — не гадаем, решают кнопки fuzzy
+    db.clients_add_bulk(wh["id"], [("Дадажанова Фахридин", 0, None)])
+    assert db.client_exact(wh["id"], "Фахриддин Дадажанов") is None
+    assert any(c["name"] == "Дадажанов Фахридин"
+               for c in db.fuzzy_clients(wh["id"], "Фахриддин Дадажанов"))
+
+
+def test_feed_summary_hides_admin_money():
+    """Просьба владельца 30.08.2026: в общий чат не должно попадать,
+    сколько денег поступает ЕМУ (склад со скрытыми долгами). Приходы
+    сотрудников в чат идут, в личку админу — полная картина."""
+    wh = _fresh_db()
+    _load(wh, {16: 1000})
+    db.set_setting("hidden_debt_whs", json.dumps([wh["id"]]))
+    assert wh["id"] in bot.hidden_debt_wh_ids()
+    db.clients_add_bulk(wh["id"], [("Клиент админа", 100000, None),
+                                   ("Клиент Данияра", 50000, None)])
+    ca = db.client_exact(wh["id"], "Клиент админа")["id"]
+    cd = db.client_exact(wh["id"], "Клиент Данияра")["id"]
+    # Приход денег админу и приход сотруднику
+    db.commit_operation(ADMIN, "payment", wh["id"], ca, "приход админа",
+                        [], [(ca, -300000)], {"amount": 300000})
+    db.commit_operation(DANIYAR, "payment", wh["id"], cd, "приход Данияра",
+                        [], [(cd, -8000)], {"amount": 8000})
+    full = bot.report_data([wh], 0)
+    feed = bot.report_data([wh], 0, hide_admin=True)
+    assert full[0]["money"] == 308000            # в личке — всё
+    assert feed[0]["money"] == 8000              # в чат — только сотрудник
+    assert feed[0]["hidden_n"] == 1 and full[0]["hidden_n"] == 0
+    # Накладная админа в сумму чата не идёт, накладная сотрудника — идёт
+    _invoice(wh, ADMIN, "Клиент админа", [_item(16, 10, 200)], client_id=ca)
+    _invoice(wh, DANIYAR, "Клиент Данияра", [_item(16, 2, 200)], client_id=cd)
+    assert bot.report_data([wh], 0, hide_admin=True)[0]["sales"] == 400
+    assert bot.report_data([wh], 0)[0]["sales"] == 2400
+    # Инкассации/перемещения админа лента показывает как раньше
+    db.commit_operation(ADMIN, "handover", wh["id"], None, "сдача",
+                        [], [], {"amount": 5000})
+    assert bot.report_data([wh], 0, hide_admin=True)[0]["hand_sum"] == 5000
+    # Долги склада НЕ скрыты — прятать нечего, чат видит всё
+    db.set_setting("hidden_debt_whs", json.dumps([]))
+    assert bot.report_data([wh], 0, hide_admin=True)[0]["money"] == 308000
+
+
 def _noop(*a, **k):
     pass
 

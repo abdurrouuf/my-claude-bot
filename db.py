@@ -1142,15 +1142,24 @@ def client_exact(wh_id: int, name: str):
     # Почти точное совпадение — опечатка в одну-две буквы («Алмагуль» →
     # «Алмагул»). Авто-совпадение только при ЕДИНСТВЕННОМ кандидате
     # с очень высокой похожестью; двусмысленность решают кнопки fuzzy.
+    # Сравниваем И как есть, И по отсортированным словам: перестановка
+    # ВМЕСТЕ с опечаткой («Фахриддин Дадажанов» → «Дадажанов Фахридин»,
+    # случай владельца 30.08.2026) полную строку роняет до 0.49, а ключ
+    # слов даёт 0.97 — ступень перестановки такое не ловит, там равенство.
+    def _near(cand: str) -> bool:
+        if difflib.SequenceMatcher(None, low, cand).ratio() >= 0.92:
+            return True
+        return difflib.SequenceMatcher(
+            None, _name_key(low), _name_key(cand)).ratio() >= 0.92
     near = {}
     for r in conn.execute("SELECT * FROM clients WHERE warehouse_id=?", (wh_id,)):
-        if difflib.SequenceMatcher(None, low, r["name"].lower()).ratio() >= 0.92:
+        if _near(r["name"].lower()):
             near[r["id"]] = r
     for r in conn.execute(
             "SELECT a.alias, c.* FROM client_aliases a "
             "JOIN clients c ON c.id = a.client_id WHERE c.warehouse_id=?",
             (wh_id,)):
-        if difflib.SequenceMatcher(None, low, r["alias"].lower()).ratio() >= 0.92:
+        if _near(r["alias"].lower()):
             near[r["id"]] = r
     if len(near) == 1:
         return next(iter(near.values()))
