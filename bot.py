@@ -9256,6 +9256,128 @@ async def _stockcost_report(update, whs, actor, params):
         caption="\n".join(summary))
 
 
+async def money_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Сколько всего денег «лежит» в складе (только админ, просьба
+    владельца 30.08.2026: «нужна команда, которая объединяет /stockprice
+    и /debts»). Товар по прайсу + долги клиентов + наличные в кассах."""
+    actor = await _require_admin(update)
+    if actor is None:
+        return
+    if not await _require_private(update):
+        return
+    arg = " ".join(context.args).strip() if context.args else ""
+    if arg and arg.lower() != "all":
+        wh = db.warehouse_by_name(arg)
+        if wh is None:
+            await update.message.reply_text(f"Склад «{esc(arg)}» не найден.",
+                                            parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        # Учебный полигон — не настоящие деньги (как в /stockcost)
+        whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)]
+        if not arg and await _maybe_ask_warehouse(update, actor, "money"):
+            return
+    await _money_report(update, whs, actor, {})
+
+
+def _wh_money(wh, bmap):
+    """Деньги одного склада: товар по прайсу и по закупу, долги клиентов,
+    переплаты, наличные у сотрудников склада."""
+    stock = db.stock_map(wh["id"])
+    sale = buy = 0.0
+    positions = 0
+    no_buy = 0
+    for pid, qty in stock.items():
+        if not qty:
+            continue
+        positions += 1
+        pr = prices.BY_ID.get(pid)
+        if pr is None:
+            row = db.connect().execute(
+                "SELECT price FROM products WHERE id=?", (pid,)).fetchone()
+            price = row["price"] if row else 0
+        else:
+            price = pr["price"]
+        sale += qty * price
+        b = bmap.get(pid)
+        if b is None:
+            no_buy += 1
+        else:
+            buy += qty * b
+    debt = over = 0.0
+    debtors = 0
+    for c in db.clients_of(wh["id"]):
+        if c["debt"] > 0:
+            debt += c["debt"]
+            debtors += 1
+        elif c["debt"] < 0:
+            over += -c["debt"]
+    cash_list = []
+    for u in db.list_users():
+        own = db.warehouse_of(u["id"])
+        if own is None or own["id"] != wh["id"] or u["role"] == "admin":
+            continue
+        c = db.cash_on_hand(u["id"])
+        if c:
+            cash_list.append((u["name"], c))
+    cash = sum(c for _, c in cash_list)
+    return {"sale": sale, "buy": buy, "positions": positions, "no_buy": no_buy,
+            "debt": debt, "debtors": debtors, "over": over,
+            "cash": cash, "cash_list": cash_list,
+            "total": sale + debt + cash}
+
+
+async def _money_report(update, whs, actor, params):
+    bmap = buy_som_map()
+    sections, summary = [], []
+    g = {"sale": 0.0, "buy": 0.0, "debt": 0.0, "cash": 0.0, "total": 0.0}
+    for wh in whs:
+        d = _wh_money(wh, bmap)
+        rows = [["Товар на складе (по прайсу)", money(d["sale"]),
+                 f"{d['positions']} поз."]]
+        if bmap and d["buy"]:
+            note = f"без закупа: {d['no_buy']} поз." if d["no_buy"] else ""
+            rows.append(["  из них себестоимость (закуп)", money(d["buy"]), note])
+        rows.append(["Долги клиентов", money(d["debt"]),
+                     f"{d['debtors']} должн."])
+        if d["over"]:
+            rows.append(["Переплаты клиентов", f"−{money(d['over'])}",
+                         "деньги уже у нас"])
+        rows.append(["Наличные у сотрудников", money(d["cash"]),
+                     ", ".join(f"{n}: {money(c)}" for n, c in d["cash_list"])])
+        sections.append({
+            "title": f"Склад «{wh['name']}»",
+            "headers": ["Где деньги", "Сумма", "Примечание"],
+            "rows": rows, "widths": [62, 40, 65],
+            "footer": f"ВСЕГО В СКЛАДЕ: {money(d['total'])} "
+                      f"(товар {money(d['sale'])} + долги {money(d['debt'])}"
+                      + (f" + касса {money(d['cash'])}" if d["cash"] else "") + ")",
+        })
+        summary.append(f"🏬 «{wh['name']}»: <b>{money(d['total'])}</b>\n"
+                       f"   📦 товар {money(d['sale'])} · "
+                       f"🧾 долги {money(d['debt'])}"
+                       + (f" · 💰 касса {money(d['cash'])}" if d["cash"] else ""))
+        for k in g:
+            g[k] += d[k]
+    if not sections:
+        await update.message.reply_text("Нет доступных складов.")
+        return
+    footer = ""
+    if len(sections) > 1:
+        footer = (f"ИТОГО ПО СКЛАДАМ: {money(g['total'])} · товар "
+                  f"{money(g['sale'])} · долги {money(g['debt'])} · касса "
+                  f"{money(g['cash'])}")
+        summary.append(f"\n💵 <b>Всего: {money(g['total'])}</b>")
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ДЕНЬГИ СКЛАДА", f"ОсОО «ВЕТОП» · на {date_str} · товар по продажным "
+        f"ценам прайса", sections, footer=footer)
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"деньги_{date_str.replace('.', '')}.pdf"),
+        caption="\n".join(summary)[:1000], parse_mode="HTML")
+
+
 async def margin_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Прибыль по проданному (только админ): /margin [день|неделя|месяц|все].
     Выручка по фактическим ценам накладных минус себестоимость по закупу;
@@ -10960,6 +11082,7 @@ STAFF_COMMANDS = [
     ("start", "Что умеет бот"),
 ]
 ADMIN_COMMANDS = STAFF_COMMANDS + [
+    ("money", "Сколько денег в складе: товар + долги + касса"),
     ("margin", "Прибыль по закупочным ценам"),
     ("stockcost", "Остатки в закупочных ценах"),
     ("rate", "Курс доллара и накладные расходы"),
@@ -11021,6 +11144,15 @@ def _register_report_picks():
             "emoji": "💰", "question": "Наличие с ценами какого склада показать?",
             "whs": lambda a: db.visible_warehouses(a),
             "render": _instock_report},
+        "money": {
+            "emoji": "💵",
+            "question": "Сколько денег в каком складе показать?",
+            # Товар + долги + кассы — сводка для владельца (30.08.2026);
+            # роль перепроверяется и на кнопке, как у /stockcost.
+            "admin_only": True,
+            "whs": lambda a: [w for w in db.visible_warehouses(a)
+                              if not is_training_wh(w)],
+            "render": _money_report},
         "stockcost": {
             "emoji": "💼",
             "question": "Остатки в закупочных ценах какого склада показать?",
@@ -11139,6 +11271,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("margin", margin_cmd))
     app.add_handler(CommandHandler("stockcost", stockcost_cmd))
+    app.add_handler(CommandHandler("money", money_cmd))
     app.add_handler(CommandHandler("rate", rate_cmd))
     app.add_handler(CommandHandler("drafts", drafts_cmd))
     app.add_handler(CommandHandler("pricelog", pricelog_cmd))
