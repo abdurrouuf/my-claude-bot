@@ -199,14 +199,21 @@ def buy_markup_pct() -> float:
 
 
 def buy_som_map() -> dict:
-    """{product_id: закупочная цена в СОМАХ с учётом курса и накладных
-    расходов}. Пусто, если курс не задан. Только для отчётов админа —
-    в промпт ИИ закупочные цены не попадают (секрет + лишние токены)."""
+    """{product_id: закупочная цена в СОМАХ}. Только для отчётов админа —
+    в промпт ИИ закупочные цены не попадают (секрет + лишние токены).
+
+    Сомовая цена (из реестра закупок 1С или заданная владельцем) —
+    ГЛАВНАЯ: она зафиксирована приходной накладной, курс её не меняет
+    (решение владельца 30.08.2026). Долларовая — запасной путь для
+    товаров без сомовой цены: пересчитывается по текущему курсу и
+    накладным расходам; без курса такие товары просто без закупа."""
+    out = dict(db.products_buy_som_map())
     rate = usd_rate()
-    if rate <= 0:
-        return {}
-    k = rate * (1 + buy_markup_pct() / 100)
-    return {pid: usd * k for pid, usd in db.products_buy_map().items()}
+    if rate > 0:
+        k = rate * (1 + buy_markup_pct() / 100)
+        for pid, usd in db.products_buy_map().items():
+            out.setdefault(pid, usd * k)
+    return out
 
 
 def is_admin(user_row) -> bool:
@@ -849,7 +856,8 @@ def _build_static_system() -> str:
                  '"items": [{"name": "точное название из прайса", '
                  '"volume": "фасовка", "price": цена_за_штуку}]}')
     parts.append('- currency: "usd" по умолчанию (закупают в долларах); '
-                 'если явно сказано «сом» — "som".')
+                 'если явно сказано «сом» — "som" (сомовая цена запишется '
+                 'как есть, курс её потом не меняет).')
     parts.append('- price — цена за ОДНУ штуку (единицу прайса); количества '
                  'здесь нет, коробки в штуки не переводи.')
     parts.append('Курс доллара («курс 88», «курс доллара 87.5») → '
@@ -3709,7 +3717,8 @@ async def start_fix_expiry(update, context, actor, data):
 
 async def start_set_buy_price(update, context, actor, data):
     """«Закупочная цена Дексатоп 50мл 0.47» (админ) — в долларах за единицу
-    прайса; «... 41 сом» переводится в доллары по текущему курсу."""
+    прайса; «... 41 сом» сохраняется прямо в сомах (с 30.08.2026 — как в
+    приходной накладной, курс её потом не меняет)."""
     if not is_admin(actor):
         await update.message.reply_text("⛔ Закупочные цены задаёт только админ.")
         return
@@ -3722,9 +3731,11 @@ async def start_set_buy_price(update, context, actor, data):
         return
     rate = usd_rate()
     cur = str(data.get("currency") or "usd").lower()
-    if cur == "som" and rate <= 0:
+    if cur != "som" and rate <= 0:
         await update.message.reply_text(
-            "Сначала задайте курс доллара: напишите, например, «курс 87.5».")
+            "Сначала задайте курс доллара: напишите, например, «курс 87.5».\n"
+            "Либо задайте цену прямо в сомах: «закупочная цена Дексатоп 50мл "
+            "41 сом».")
         return
     items, missing = [], []
     for raw in (data.get("items") or []):
@@ -3742,9 +3753,12 @@ async def start_set_buy_price(update, context, actor, data):
         if price <= 0:
             missing.append(f"{name} {volume} (цена должна быть больше нуля)")
             continue
-        usd = round(price / rate, 4) if cur == "som" else price
-        items.append({"product_id": product["id"], "name": product["name"],
-                      "volume": product["volume"], "usd": usd})
+        it = {"product_id": product["id"], "name": product["name"],
+              "volume": product["volume"]}
+        # Сомовая цена хранится как есть (фиксирована накладной), долларовая —
+        # пересчитывается по курсу при каждом отчёте.
+        it["som" if cur == "som" else "usd"] = price
+        items.append(it)
     if missing:
         await update.message.reply_text(
             "⚠️ Не понял позиции: " + "; ".join(missing) +
@@ -3758,9 +3772,12 @@ async def start_set_buy_price(update, context, actor, data):
     token = new_pending(payload)
     lines = ["📥 <b>Закупочные цены</b> (за единицу прайса):", ""]
     for i, it in enumerate(items, 1):
-        som = f" ≈ {money(it['usd'] * rate)}" if rate > 0 else ""
-        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — "
-                     f"<b>${fmt_usd(it['usd'])}</b>{som}")
+        if it.get("som") is not None:
+            val = f"<b>{money(it['som'])}</b> (курс на неё не влияет)"
+        else:
+            som = f" ≈ {money(it['usd'] * rate)}" if rate > 0 else ""
+            val = f"<b>${fmt_usd(it['usd'])}</b>{som}"
+        lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {val}")
     lines += ["", "Сохранить?"]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML",
                                     reply_markup=confirm_kb(token))
@@ -5516,7 +5533,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 saved, failed = 0, []
                 for it in p["items"]:
                     try:
-                        db.product_set_buy(it["product_id"], it["usd"])
+                        db.product_set_buy(it["product_id"],
+                                           usd=it.get("usd"),
+                                           som=it.get("som"))
                         saved += 1
                     except ValueError:
                         # товар исчез, пока карточка ждала — не бросаем
@@ -9136,14 +9155,20 @@ async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not await _require_private(update):
         return
     rate, mk = usd_rate(), buy_markup_pct()
-    n = len(db.products_buy_map())
+    n_som, n_usd = len(db.products_buy_som_map()), len(db.products_buy_map())
+    total = len(prices.PRICE_LIST_DATA)
     lines = [
         f"💱 Курс: <b>{fmt_usd(rate) if rate else 'не задан'}</b> сом/$",
-        f"📦 Накладные расходы на закуп: <b>+{fmt_usd(mk)}%</b>",
-        f"📥 Закупочные цены заданы: <b>{n}</b> из {len(prices.PRICE_LIST_DATA)} товаров",
+        f"📦 Накладные расходы на закуп: <b>+{fmt_usd(mk)}%</b> "
+        f"(только для цен в долларах)",
+        f"📥 Себестоимость известна: <b>{len(buy_som_map())}</b> из {total} товаров",
+        f"   • в сомах (по приходным накладным): {n_som}",
+        f"   • в долларах (по курсу): {n_usd}",
         "",
         "Изменить фразой: «курс 88», «накладные расходы 10%»,",
-        "«закупочная цена Дексатоп 50мл 0.47». Отчёты: /margin, /stockcost",
+        "«закупочная цена Дексатоп 50мл 41 сом» (в сомах — фиксируется)",
+        "или «... 0.47» (в долларах — считается по курсу).",
+        "Отчёты: /margin, /stockcost, /money, история — /buylog",
     ]
     await update.message.reply_text("\n".join(lines), parse_mode="HTML")
 
@@ -9254,6 +9279,118 @@ async def _stockcost_report(update, whs, actor, params):
     await update.message.reply_document(
         document=InputFile(pdf, filename=f"закуп_остатки_{date_str.replace('.', '')}.pdf"),
         caption="\n".join(summary))
+
+
+def _som_kop(v) -> str:
+    """Сомы С КОПЕЙКАМИ: закупочные цены — 73,10, а не «73 сом»
+    (money() округляет до целых, в закупе это заметная потеря)."""
+    return f"{v:,.2f}".replace(",", "'").replace(".", ",")
+
+
+def _buylog_rows(pid):
+    """История закупок товара из реестра 1С: [(дата, документ, поставщик,
+    кол-во, цена, изменение к прошлой закупке в %)]."""
+    import buy_registry_data
+    rows = buy_registry_data.BUY_HISTORY.get(pid) or []
+    out, prev = [], None
+    for date, doc, sup, qty, price in rows:
+        delta = None if prev in (None, 0) else (price - prev) / prev * 100
+        out.append((date, doc, sup, qty, price, delta))
+        prev = price
+    return out
+
+
+async def buylog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """История закупочных цен (только админ): /buylog [Препарат [фасовка]].
+    Данные — реестр приходных накладных 1С за 2021–2026 (файл владельца
+    21.08.2026). Без аргумента — сводка по всем товарам: последняя цена
+    и рост с первой закупки."""
+    if await _require_admin(update) is None:
+        return
+    if not await _require_private(update):
+        return
+    import buy_registry_data
+    arg = " ".join(context.args).strip() if context.args else ""
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    if arg:
+        # Препарат (+ фасовка) — как в /sales: длиннейший префикс слов
+        pid = None
+        words = arg.split()
+        for cut in range(len(words), 0, -1):
+            p = prices.match_product(" ".join(words[:cut]),
+                                     " ".join(words[cut:]))
+            if p is not None:
+                pid = p["id"]
+                break
+        if pid is None:
+            await update.message.reply_text(
+                f"Не нашёл товар «{esc(arg)}» в прайсе. Напишите название и "
+                "фасовку — например: /buylog Дексатоп 50 мл\n"
+                "Или /buylog без аргументов — сводка по всем.",
+                parse_mode="HTML")
+            return
+        rows = _buylog_rows(pid)
+        p = prices.BY_ID[pid]
+        label = f"{p['name'].split('(')[0].strip()} {p['volume']}"
+        if not rows:
+            await update.message.reply_text(
+                f"По «{esc(label)}» закупок в реестре нет.", parse_mode="HTML")
+            return
+        table = [[d, doc, sup, fmt_num(q), _som_kop(pr),
+                  ("—" if dl is None else f"{dl:+.1f}%")]
+                 for d, doc, sup, q, pr, dl in rows]
+        first, last = rows[0][4], rows[-1][4]
+        grow = (last - first) / first * 100 if first else 0
+        pdf = generate_report_pdf(
+            "ИСТОРИЯ ЗАКУПОЧНЫХ ЦЕН", f"ОсОО «ВЕТОП» · {label} · на {date_str}",
+            [{"title": label,
+              "headers": ["Дата", "Накладная", "Поставщик", "Кол-во",
+                          "Цена, сом", "Изм."],
+              "rows": table, "widths": [26, 26, 48, 22, 28, 22],
+              "footer": f"Закупок: {len(rows)} · первая {_som_kop(first)} → "
+                        f"последняя {_som_kop(last)} сом ({grow:+.1f}%)"}],
+            footer="Источник: реестр приходных накладных 1С, цены без НДС")
+        await update.message.reply_document(
+            document=InputFile(pdf, filename=(
+                f"закуп_{safe_filename(label)}.pdf")),
+            caption=(f"📥 <b>{esc(label)}</b>: закупок {len(rows)}, "
+                     f"последняя — {_som_kop(last)} сом ({rows[-1][0]})\n"
+                     f"С первой закупки: {grow:+.1f}%"),
+            parse_mode="HTML")
+        return
+    # Сводка по всем товарам
+    rows, grown = [], 0
+    for p in prices.PRICE_LIST_DATA:
+        h = _buylog_rows(p["id"])
+        if not h:
+            continue
+        first, last = h[0][4], h[-1][4]
+        grow = (last - first) / first * 100 if first else 0
+        if grow > 0:
+            grown += 1
+        rows.append([f"{p['id']}. {p['name'].split('(')[0].strip()}",
+                     p["volume"], str(len(h)), h[-1][0], _som_kop(last),
+                     f"{grow:+.1f}%"])
+    if not rows:
+        await update.message.reply_text("Реестр закупок пуст.")
+        return
+    n_inv = len({(d, doc) for pid in buy_registry_data.BUY_HISTORY
+                 for d, doc, *_ in buy_registry_data.BUY_HISTORY[pid]})
+    pdf = generate_report_pdf(
+        "ЗАКУПОЧНЫЕ ЦЕНЫ — СВОДКА", f"ОсОО «ВЕТОП» · на {date_str}",
+        [{"title": "Последняя цена закупки и рост с первой",
+          "headers": ["Товар", "Фасовка", "Закупок", "Последняя",
+                      "Цена, сом", "Рост"],
+          "rows": rows, "widths": [56, 22, 20, 26, 26, 22],
+          "footer": f"Товаров: {len(rows)} · подорожали с первой закупки: "
+                    f"{grown} · накладных в реестре: {n_inv}"}],
+        footer="Источник: реестр приходных накладных 1С (2021–2026), "
+               "цены без НДС. Подробно по товару: /buylog Дексатоп 50 мл")
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"закуп_история_{date_str.replace('.', '')}.pdf"),
+        caption=(f"📥 История закупок: {len(rows)} товаров, {n_inv} накладных.\n"
+                 f"Подробно по одному: <code>/buylog Дексатоп 50 мл</code>"),
+        parse_mode="HTML")
 
 
 async def money_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11086,6 +11223,7 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("margin", "Прибыль по закупочным ценам"),
     ("stockcost", "Остатки в закупочных ценах"),
     ("rate", "Курс доллара и накладные расходы"),
+    ("buylog", "История закупочных цен: /buylog Дексатоп 50 мл"),
     ("olddebts", "Давно не платили"),
     ("hidedebts", "Скрыть долги склада от сотрудников"),
     ("showdebt", "Открыть сотрудникам долг клиента: /showdebt Имя"),
@@ -11234,6 +11372,12 @@ if __name__ == "__main__":
                           flag="buy_prices_tq20251223"):
         log.info("Закупочные цены контракта TQ20251223C заселены (%d поз.)",
                  len(buy_prices_data.BUY_USD_TQ20251223))
+    # Реестр закупок 1С (файл владельца 21.08.2026): себестоимость в СОМАХ
+    # по последней закупке — все 104 позиции прайса, приоритетнее долларовой.
+    import buy_registry_data
+    if db.seed_buy_som(buy_registry_data.BUY_SOM):
+        log.info("Себестоимость из реестра 1С заселена (%d поз.)",
+                 len(buy_registry_data.BUY_SOM))
     prices.set_data(db.products_active())
     _refresh_price_dependents()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
@@ -11272,6 +11416,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("margin", margin_cmd))
     app.add_handler(CommandHandler("stockcost", stockcost_cmd))
     app.add_handler(CommandHandler("money", money_cmd))
+    app.add_handler(CommandHandler("buylog", buylog_cmd))
     app.add_handler(CommandHandler("rate", rate_cmd))
     app.add_handler(CommandHandler("drafts", drafts_cmd))
     app.add_handler(CommandHandler("pricelog", pricelog_cmd))

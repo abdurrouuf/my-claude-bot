@@ -353,6 +353,11 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
             # Закупочная цена в долларах (видна только админу в /margin и
             # /stockcost); NULL — закуп неизвестен.
             conn.execute("ALTER TABLE products ADD COLUMN buy_usd REAL")
+        if "buy_som" not in _columns(conn, "products"):
+            # Себестоимость в СОМАХ — как в приходной накладной 1С (выбор
+            # владельца 30.08.2026: курс доллара её больше не меняет).
+            # Приоритетнее buy_usd; NULL — считаем по доллару и курсу.
+            conn.execute("ALTER TABLE products ADD COLUMN buy_som REAL")
         if "feed_chat_id" not in _columns(conn, "warehouses") and \
            "owner_id" not in _columns(conn, "warehouses"):
             conn.execute("ALTER TABLE warehouses ADD COLUMN feed_chat_id INTEGER")
@@ -510,14 +515,50 @@ def products_buy_map():
     return {r["id"]: r["buy_usd"] for r in rows}
 
 
-def product_set_buy(product_id: int, usd: float):
+def products_buy_som_map():
+    """{product_id: себестоимость в СОМАХ} — цена приходной накладной.
+    Приоритетнее долларовой: курс на неё не влияет (30.08.2026)."""
+    rows = connect().execute(
+        "SELECT id, buy_som FROM products WHERE buy_som IS NOT NULL").fetchall()
+    return {r["id"]: r["buy_som"] for r in rows}
+
+
+def seed_buy_som(seed: dict, flag: str = "buy_som_registry_2026"):
+    """Одноразовое заселение себестоимости в сомах из реестра закупок 1С.
+    seed: {product_id: (цена_сом, дата, документ)}. Пишет только там, где
+    цены ещё нет — правки владельца («закупочная цена X 48 сом») не
+    затираются. Вызывать ПОСЛЕ seed_products."""
+    conn = connect()
+    with _lock, conn:
+        if conn.execute("SELECT 1 FROM settings WHERE key=?",
+                        (flag,)).fetchone():
+            return False
+        if conn.execute("SELECT 1 FROM products LIMIT 1").fetchone() is None:
+            return False              # прайс ещё не засеян — подождём старта
+        for pid, row in seed.items():
+            som = row[0] if isinstance(row, (list, tuple)) else row
+            conn.execute("UPDATE products SET buy_som=? WHERE id=? "
+                         "AND buy_som IS NULL", (som, pid))
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                     "VALUES(?, '1')", (flag,))
+        return True
+
+
+def product_set_buy(product_id: int, usd: float = None, som: float = None):
+    """Закупочная цена товара: в долларах (пересчитывается по курсу) или
+    в сомах (фиксированная, приоритетнее). Заданная сомовая цена сбрасывает
+    долларовую и наоборот — иначе непонятно, какая из них в силе."""
     conn = connect()
     with _lock, conn:
         if conn.execute("SELECT 1 FROM products WHERE id=?",
                         (product_id,)).fetchone() is None:
             raise ValueError(f"товар №{product_id} не найден")
-        conn.execute("UPDATE products SET buy_usd=? WHERE id=?",
-                     (usd, product_id))
+        if som is not None:
+            conn.execute("UPDATE products SET buy_som=?, buy_usd=NULL "
+                         "WHERE id=?", (som, product_id))
+        else:
+            conn.execute("UPDATE products SET buy_usd=?, buy_som=NULL "
+                         "WHERE id=?", (usd, product_id))
 
 
 def product_set_price(product_id: int, new_price: float, user_id: int):
