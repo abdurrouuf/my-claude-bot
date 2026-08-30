@@ -1016,7 +1016,20 @@ def build_dynamic_system(actor) -> str:
     return "\n".join(lines)
 
 
-def system_blocks(actor) -> list:
+# Слово «Черновик» отрезается ДО отправки модели (DRAFT_RE) — без этой
+# подсказки она видит голый текст и может принять накладную за приход
+# на склад: инцидент 30.08.2026, «Черновик. Аза Манас шаары (Бека) …» —
+# в имени клиента и сотрудник («Аза» ≈ Азамат), и склад («Манас»), бот
+# ответил «приход товара извне может внести только админ».
+DRAFT_HINT = ("\nСОТРУДНИК ВЫПИСЫВАЕТ ЧЕРНОВИК НАКЛАДНОЙ (он начал сообщение "
+              "словом «черновик», оно уже убрано). Это ВСЕГДА РЕЖИМ 2 "
+              "(invoice): первая строка — имя клиента целиком, даже если в "
+              "нём есть название склада или имя сотрудника («Аза Манас шаары "
+              "(Бека)» — это ИМЯ КЛИЕНТА). НИКОГДА не выбирай здесь transfer, "
+              "writeoff, inventory или return.")
+
+
+def system_blocks(actor, draft=False) -> list:
     """Системный промпт с кэшированием статичной части (~90% скидка на чтениях).
 
     TTL 1 час (а не 5 минут по умолчанию): сообщения приходят с перерывами
@@ -1026,7 +1039,8 @@ def system_blocks(actor) -> list:
     return [
         {"type": "text", "text": STATIC_SYSTEM,
          "cache_control": {"type": "ephemeral", "ttl": "1h"}},
-        {"type": "text", "text": build_dynamic_system(actor)},
+        {"type": "text", "text": build_dynamic_system(actor)
+                                 + (DRAFT_HINT if draft else "")},
     ]
 
 
@@ -1089,11 +1103,11 @@ def _response_text(resp) -> str:
 CLAUDE_MAX_TOKENS = 8000
 
 
-async def ask_claude(history: list, actor) -> str:
+async def ask_claude(history: list, actor, draft=False) -> str:
     resp = await anthropic_client.messages.create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
-        system=system_blocks(actor),
+        system=system_blocks(actor, draft=draft),
         messages=history,
     )
     track_usage(resp)
@@ -5905,7 +5919,7 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
     if not quiet:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        reply = await ask_claude(_request_history(chat_id), actor)
+        reply = await ask_claude(_request_history(chat_id), actor, draft=draft)
     except Exception as e:
         log.exception("Claude API error")
         # Убираем добавленное user-сообщение — иначе парность истории
@@ -6017,8 +6031,24 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
     await dispatch_data(update, context, actor, data, reply, draft)
 
 
+# Черновик — это ВСЕГДА накладная клиенту. Если модель всё же выбрала
+# другое действие (в имени клиента бывают и склад, и имя сотрудника —
+# инцидент 30.08.2026), не проводим чужую операцию и не отвечаем
+# непонятным отказом («приход извне может внести только админ»), а честно
+# просим уточнить. «черновик» пишут, когда учёт вести НЕ надо.
+
+
 async def dispatch_data(update, context, actor, data, reply="", draft=False):
     action = data.get("action")
+    if draft and action in ("transfer", "writeoff", "inventory", "return"):
+        log.warning("Черновик распознан как %s — прошу уточнить", action)
+        await update.message.reply_text(
+            "📝 Черновик — это накладная клиенту, но я не понял, кому её "
+            "выписать: похоже, имя клиента я принял за склад или за "
+            "сотрудника.\n\nНапишите ещё раз так, чтобы первой строкой шло "
+            "имя клиента, например:\n<b>Черновик. Клиент: Аза Манас шаары "
+            "(Бека)</b>\nЭнротоп 10 мл — 3 к\n…", parse_mode="HTML")
+        return
     try:
         if action == "invoice":
             await start_invoice(update, context, actor, data, draft=draft)
@@ -6158,7 +6188,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         resp = await anthropic_client.messages.create(
             model=CLAUDE_MODEL, max_tokens=CLAUDE_MAX_TOKENS,
-            system=system_blocks(actor), messages=messages)
+            system=system_blocks(actor, draft=draft), messages=messages)
         track_usage(resp)
         reply = _response_text(resp)
     except Exception as e:
