@@ -2542,6 +2542,68 @@ def test_buylog_report():
     assert "pdf" not in out
 
 
+def test_quality_report():
+    """/quality (31.08.2026): переделки накладных по метке replaces и
+    эвристике, /undo отдельно, оплата на месте, черновики; только админ."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {16: 200})
+    # 1. Накладная Данияра + замена (в новой должна появиться метка replaces)
+    (op1, *_), p1 = _invoice(wh, DANIYAR, "Клиент К", [_item(16, 5, 180)])
+    p2 = {**p1, "client_id": db.client_exact(wh["id"], "Клиент К")["id"],
+          "op_user_id": DANIYAR, "items": [_item(16, 8, 180)]}
+    op2, *_ = bot.commit_invoice(p2, replace_op_id=op1)
+    d2 = json.loads(db.get_operation(op2)["data"])
+    assert d2["replaces"] == op1
+    assert db.get_operation(op1)["status"] == "cancelled"
+    # 2. Старая замена без метки — ловится эвристикой (отмена + новая тому
+    #    же клиенту в течение суток)
+    cid = db.client_exact(wh["id"], "Клиент К")["id"]
+    (op3, *_), _ = _invoice(wh, DANIYAR, "Клиент К", [_item(16, 3, 180)],
+                            client_id=cid)
+    db.cancel_operation(op3)
+    (op4, *_), _ = _invoice(wh, DANIYAR, "Клиент К", [_item(16, 4, 180)],
+                            payment=720.0, client_id=cid)
+    # 3. Настоящий /undo (без замены)
+    (op5, *_), _ = _invoice(wh, DANIYAR, "Клиент Другой", [_item(16, 2, 180)])
+    db.cancel_operation(op5)
+    # 4. Черновик — попадает в секцию черновиков
+    db.log_draft(DANIYAR, "Кто-то", 500.0, items=[{"name": "x", "qty": 1}])
+    per, redos, undone = bot._quality_stats("2000-01-01T00:00:00")
+    assert len(redos) == 2                       # замена по метке + эвристика
+    authors = {r[0] for r in redos}
+    assert authors == {DANIYAR}
+    deltas = sorted(round(r[3] - r[2]) for r in redos)
+    assert deltas == [180, 540]                  # 3→4 шт (+180), 5→8 шт (+540)
+    assert undone.get(DANIYAR) == 1              # /undo — не переделка
+    r = per[DANIYAR]
+    assert r["n_inv"] == 2 and r["inv_pay_now"] == 1   # done: замена + op4
+    # 5. PDF: админу — файл, сотруднику — отказ
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"] = document.input_file_content
+            out["caption"] = caption
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.quality_cmd(upd, SimpleNamespace(args=["все"])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+    assert "переделок 2" in out["caption"]
+    out.clear()
+    emp = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.quality_cmd(emp, SimpleNamespace(args=[])))
+    assert "pdf" not in out
+
+
 def _noop(*a, **k):
     pass
 

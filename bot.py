@@ -1431,6 +1431,10 @@ def commit_invoice(p, replace_op_id=None):
                    "product_id": it.get("product_id")} for it in p["items"]],
         "total": total, "payment": p["payment"], "old_debt": old_debt,
     }
+    if replace_op_id:
+        # Метка «эта накладная заменяет №N» — по ней /quality отличает
+        # переделку (сторно + новая) от настоящей отмены (30.08.2026).
+        extra["replaces"] = replace_op_id
     # Выбор партий продавцом (кнопки «какую партию продать?»): пустой выбор
     # или его отсутствие = «сначала старые» (FEFO внутри _apply_batches).
     batch_plan = {}
@@ -9393,6 +9397,202 @@ async def buylog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode="HTML")
 
 
+def _quality_stats(start_iso: str):
+    """Цифры для /quality по журналу операций с даты.
+
+    Возвращает (per, redos, undone):
+    per: {user_id: счётчики} — только проведённые операции;
+    redos: [(автор, клиент, старая_сумма, новая_сумма, №старой, №новой)] —
+      переделки накладных (сторно + новая). Новые замены находятся по
+      метке data.replaces; старые (до метки) — эвристикой: отменённая
+      накладная + следующая проведённая тому же клиенту в течение суток;
+    undone: {user_id: n} — операции, отменённые БЕЗ замены (/undo)."""
+    ops = db.operations_all_since(start_iso)
+    per, redos, undone = {}, [], {}
+    replaced_ids = set()
+
+    def rec(uid):
+        return per.setdefault(uid, {
+            "ops": 0, "n_inv": 0, "sum_inv": 0.0, "inv_pay_now": 0,
+            "n_pay": 0, "sum_pay": 0.0, "n_hand": 0, "sum_hand": 0.0,
+            "n_other": 0})
+
+    def _client_of(op, data):
+        if op["client_id"]:
+            c = db.client_get(op["client_id"])
+            if c:
+                return c["name"]
+        m = re.match(r"Накладная:\s*(.+?)\s+—", str(op["summary"] or ""))
+        return m.group(1) if m else "?"
+
+    parsed = []
+    for op in ops:
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            data = {}
+        parsed.append((op, data))
+        if op["status"] == "done" and data.get("replaces"):
+            replaced_ids.add(data["replaces"])
+    by_id = {op["id"]: (op, d) for op, d in parsed}
+    # Эвристика для старых замен (до метки replaces): отменённая накладная,
+    # следом — проведённая тому же клиенту в течение суток.
+    for op, data in parsed:
+        if op["type"] != "invoice" or op["status"] != "cancelled" \
+                or op["id"] in replaced_ids:
+            continue
+        for op2, d2 in parsed:
+            if (op2["id"] > op["id"] and op2["type"] == "invoice"
+                    and op2["status"] == "done"
+                    and op2["client_id"] == op["client_id"]
+                    and op["client_id"] is not None
+                    and not d2.get("replaces")):
+                try:
+                    dt = (datetime.fromisoformat(op2["ts"])
+                          - datetime.fromisoformat(op["ts"])).total_seconds()
+                except ValueError:
+                    break
+                if dt <= 86400:
+                    d2["replaces"] = op["id"]      # локально, не в базу
+                    replaced_ids.add(op["id"])
+                break
+    for op, data in parsed:
+        uid = op["user_id"]
+        if op["status"] == "cancelled":
+            if op["id"] not in replaced_ids:
+                undone[uid] = undone.get(uid, 0) + 1
+            continue
+        r = rec(uid)
+        r["ops"] += 1
+        if op["type"] == "invoice":
+            r["n_inv"] += 1
+            r["sum_inv"] += float(data.get("total") or 0)
+            if float(data.get("payment") or 0) > 0:
+                r["inv_pay_now"] += 1
+            old_id = data.get("replaces")
+            if old_id and old_id in by_id:
+                old_op, old_d = by_id[old_id]
+                author = old_op["user_id"]
+                redos.append((author, _client_of(old_op, old_d),
+                              float(old_d.get("total") or 0),
+                              float(data.get("total") or 0),
+                              old_id, op["id"]))
+        elif op["type"] == "payment":
+            r["n_pay"] += 1
+            r["sum_pay"] += float(data.get("amount") or 0)
+        elif op["type"] == "handover":
+            r["n_hand"] += 1
+            r["sum_hand"] += float(data.get("amount") or 0)
+        else:
+            r["n_other"] += 1
+    return per, redos, undone
+
+
+async def quality_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Качество работы сотрудников (только админ): /quality [день|неделя|
+    месяц|все]. Кто сколько провёл, сколько накладных переделал и на
+    сколько ошибался, кто пишет оплату в накладной, черновики за период.
+    Просьба владельца 31.08.2026 («Quality») после ручного разбора
+    /export — теперь то же самое в любой момент без пересылки файлов."""
+    if await _require_admin(update) is None:
+        return
+    if not await _require_private(update):
+        return
+    days_back, label = EXPORT_PERIODS["месяц"]
+    if context.args:
+        key = context.args[0].lower()
+        if key in EXPORT_PERIODS:
+            days_back, label = EXPORT_PERIODS[key]
+        else:
+            await update.message.reply_text(
+                "Использование: /quality [день|неделя|месяц|все]")
+            return
+    start = (datetime.now(BISHKEK) - timedelta(days=days_back)).replace(
+        hour=0, minute=0, second=0, microsecond=0)
+    start_iso = start.isoformat(timespec="seconds")
+    per, redos, undone = _quality_stats(start_iso)
+    if not per:
+        await update.message.reply_text(f"Операций {label} не было.")
+        return
+    redo_by = {}
+    for author, *_ in redos:
+        redo_by[author] = redo_by.get(author, 0) + 1
+    names = {u["id"]: u["name"] for u in db.list_users()}
+
+    rows = []
+    order = sorted(per, key=lambda u: -per[u]["ops"])
+    for uid in order:
+        r = per[uid]
+        nm = names.get(uid, str(uid))
+        n_redo = redo_by.get(uid, 0)
+        pct = f" ({n_redo / r['n_inv'] * 100:.0f}%)" if r["n_inv"] and n_redo else ""
+        rows.append([
+            nm, str(r["ops"]),
+            f"{r['n_inv']} / {money(r['sum_inv'])}" if r["n_inv"] else "—",
+            f"{r['inv_pay_now']} из {r['n_inv']}" if r["n_inv"] else "—",
+            f"{r['n_pay']} / {money(r['sum_pay'])}" if r["n_pay"] else "—",
+            (f"{n_redo}{pct}" if n_redo else "0")
+            + (f" · /undo: {undone[uid]}" if undone.get(uid) else ""),
+        ])
+    sections = [{
+        "title": "Сводка по сотрудникам",
+        "headers": ["Сотрудник", "Операций", "Накладных / сумма",
+                    "С оплатой на месте", "Оплат / сумма", "Переделок"],
+        "rows": rows, "widths": [30, 20, 40, 30, 38, 30],
+        "footer": "«Переделка» — накладная, отменённая и выписанная заново "
+                  "(замена); процент — доля от накладных сотрудника. "
+                  "/undo — отмены без замены.",
+    }]
+    if redos:
+        rrows = []
+        for author, client, old_s, new_s, old_id, new_id in redos:
+            d = new_s - old_s
+            note = ("добавил оплату" if abs(d) < 0.5 else
+                    f"{'+' if d > 0 else ''}{fmt_num(d)}")
+            rrows.append([names.get(author, str(author)), client,
+                          money(old_s), money(new_s), note,
+                          f"№{old_id}→№{new_id}"])
+        sections.append({
+            "title": "Переделки накладных — что исправляли",
+            "headers": ["Сотрудник", "Клиент", "Было", "Стало",
+                        "Разница", "Операции"],
+            "rows": rrows, "widths": [24, 46, 26, 26, 30, 33],
+            "numbered": True,
+            "footer": "Плюс — недосчитали товар при выписке, минус — лишний; "
+                      "«добавил оплату» — та же сумма, дописана оплата на месте",
+        })
+    drafts = db.drafts_since(start_iso)
+    if drafts:
+        sections.append({
+            "title": "Черновики за период (не учёт)",
+            "headers": ["Сотрудник", "Черновиков", "На сумму"],
+            "rows": [[d["name"], str(d["n"]), money(d["total"])]
+                     for d in drafts],
+            "widths": [60, 40, 50],
+        })
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "КАЧЕСТВО РАБОТЫ СОТРУДНИКОВ",
+        f"ОсОО «ВЕТОП» · {label} · на {date_str}", sections,
+        footer="Переделка — штатная замена накладной: продажа не теряется, "
+               "но видно, где ошибаются.")
+    top = max(per, key=lambda u: redo_by.get(u, 0), default=None)
+    cap = [f"📋 Качество {label}: операций "
+           f"{sum(r['ops'] for r in per.values())}, переделок {len(redos)}"]
+    if redos and top is not None and redo_by.get(top, 0) >= 2:
+        cap.append(f"Чаще всех переделывает: {names.get(top, top)} "
+                   f"({redo_by[top]})")
+    clean = [names[u] for u in per
+             if not redo_by.get(u) and not undone.get(u) and u in names
+             and per[u]["n_inv"]]
+    if clean:
+        cap.append("Без единой переделки: " + ", ".join(clean))
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=(
+            f"качество_{date_str.replace('.', '')}.pdf")),
+        caption="\n".join(cap)[:1000])
+
+
 async def money_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Сколько всего денег «лежит» в складе (только админ, просьба
     владельца 30.08.2026: «нужна команда, которая объединяет /stockprice
@@ -11220,6 +11420,7 @@ STAFF_COMMANDS = [
 ]
 ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("money", "Сколько денег в складе: товар + долги + касса"),
+    ("quality", "Качество работы сотрудников: переделки, ошибки"),
     ("margin", "Прибыль по закупочным ценам"),
     ("stockcost", "Остатки в закупочных ценах"),
     ("rate", "Курс доллара и накладные расходы"),
@@ -11417,6 +11618,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("stockcost", stockcost_cmd))
     app.add_handler(CommandHandler("money", money_cmd))
     app.add_handler(CommandHandler("buylog", buylog_cmd))
+    app.add_handler(CommandHandler("quality", quality_cmd))
     app.add_handler(CommandHandler("rate", rate_cmd))
     app.add_handler(CommandHandler("drafts", drafts_cmd))
     app.add_handler(CommandHandler("pricelog", pricelog_cmd))
