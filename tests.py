@@ -2604,6 +2604,38 @@ def test_quality_report():
     assert "pdf" not in out
 
 
+def test_client_cmd_single_fuzzy_pick():
+    """/client с неполным именем (01.09.2026): единственный похожий клиент
+    показывается сразу («Дадажанов Ф» → карточка Дадажанова Фахридина);
+    несколько похожих — по-прежнему подсказка без карточки."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], [("Дадажанов Фахридин", 1000, None)])
+    out = {"texts": []}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["texts"].append(text)
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"] = document.input_file_content
+
+    def upd():
+        return SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                               effective_chat=SimpleNamespace(id=1, type="private"),
+                               message=Msg())
+    asyncio.run(bot.client_cmd(upd(), SimpleNamespace(args=["Дадажанов", "Ф"])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+    assert any("Показываю" in t and "Фахридин" in t for t in out["texts"])
+    # Два похожих — не гадаем
+    db.clients_add_bulk(wh["id"], [("Дадажанова Фарида", 0, None)])
+    out.clear(); out["texts"] = []
+    asyncio.run(bot.client_cmd(upd(), SimpleNamespace(args=["Дадажанов", "Ф"])))
+    assert "pdf" not in out
+    assert any("не найден" in t and "Возможно" in t for t in out["texts"])
+
+
 def _noop(*a, **k):
     pass
 
