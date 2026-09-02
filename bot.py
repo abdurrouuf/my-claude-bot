@@ -8160,9 +8160,24 @@ async def resolve_client_arg(update, actor, args, usage: str):
         await update.message.reply_text(HIDDEN_DEBT_MSG)
         return None, None
     if c is None:
-        hints = []
+        cands = []
         for w in debt_whs_for(actor, db.visible_warehouses(actor)):
-            hints += [f"{x['name']} ({w['name']})" for x in db.fuzzy_clients(w["id"], name)]
+            cands += [(x, w) for x in db.fuzzy_clients(w["id"], name)]
+        # Единственный похожий клиент — показываем его сразу, а не просим
+        # перепечатать имя («/client Дадажанов Ф» → «Возможно: Дадажанов
+        # Фахридин» — владелец с телефона, 01.09.2026). Несколько похожих —
+        # по-прежнему подсказка: карточка с долгом не место для догадок.
+        if len({x["id"] for x, _ in cands}) == 1:
+            c, wh = cands[0]
+            if (_debts_hidden_from(actor, wh["id"])
+                    and c["id"] not in open_debt_client_ids()):
+                await update.message.reply_text(HIDDEN_DEBT_MSG)
+                return None, None
+            await update.message.reply_text(
+                f"🔎 Показываю: <b>{esc(c['name'])}</b> ({esc(wh['name'])})",
+                parse_mode="HTML")
+            return c, wh
+        hints = [f"{x['name']} ({w['name']})" for x, w in cands]
         msg = f"❌ Клиент «{esc(name)}» не найден."
         if hints:
             msg += "\nВозможно: " + ", ".join(esc(h) for h in hints[:5])
