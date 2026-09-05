@@ -8548,61 +8548,104 @@ FORECAST_WINDOW = 14   # скорость продаж считаем за 2 н�
 # 14.08.2026 попросил «побольше препаратов»; закупки едут долго).
 # Свой горизонт — числом в команде: /forecast 60, /forecast Манас 60.
 FORECAST_HORIZON = 30
+# Секция «нет в наличии»: нулевой товар показываем, только если он
+# продавался за это окно (05.09.2026) — иначе список нулей бесконечен.
+FORECAST_EMPTY_WINDOW = 60
 
 
 def build_forecast_report(warehouses, horizon=None):
     """Прогноз «скоро закончится» PDF-файлом в фирменном стиле (14.08.2026,
     «что за беспорядок?» владельца про текстовую простыню): секция на склад,
     отсортировано по срочности. None — ничего не заканчивается.
+    С 05.09.2026 («доработай» владельца: «показывает ли нулевые остатки?»)
+    у каждого склада вторая секция «НЕТ В НАЛИЧИИ»: товары прайса с остатком
+    0 или в минусе и продажами за FORECAST_EMPTY_WINDOW дней — раньше товар,
+    закончившийся больше двух недель назад, из прогноза пропадал вовсе
+    (продаж нет — нечего прогнозировать). Нулевой товар без продаж за окно
+    не показывается (залежавшиеся нули засоряли бы список), минусовой —
+    показывается всегда (это ошибка учёта, её надо видеть).
     Возвращает (pdf, подпись-итог)."""
     horizon = horizon or FORECAST_HORIZON
     sold_all = sales_by_warehouse(FORECAST_WINDOW)
+    sold_long = sales_by_warehouse(FORECAST_EMPTY_WINDOW)
     sections, summary = [], []
     for wh in warehouses:
         sold = sold_all.get(wh["id"], {})
-        if not sold:
-            continue
+        sold60 = sold_long.get(wh["id"], {})
         smap = db.stock_map(wh["id"])
         rows = []
         for pid, sold_qty in sold.items():
             qty = smap.get(pid, 0)
             p = prices.BY_ID.get(pid)
-            if p is None or qty < 0:
-                continue
+            if p is None or qty <= 0:
+                continue          # нули и минусы — в секции «нет в наличии»
             days_left = qty / (sold_qty / FORECAST_WINDOW)
             if days_left <= horizon:
                 rows.append((days_left, p, qty, sold_qty))
-        if not rows:
+        empties = []
+        for p in prices.PRICE_LIST_DATA:
+            qty = smap.get(p["id"], 0)
+            if qty > 0:
+                continue
+            s_long = sold60.get(p["id"], 0)
+            if qty == 0 and s_long <= 0:
+                continue          # давно по нулям и не продавался — не шумим
+            empties.append((s_long, p, qty))
+        if not rows and not empties:
             continue
-        out, n_empty = [], 0
-        for days_left, p, qty, sold_qty in sorted(rows, key=lambda r: r[0]):
-            label = p["name"].split("(")[0].strip()
-            if qty <= 0:
-                when = "ЗАКОНЧИЛСЯ"
-                n_empty += 1
-            else:
-                when = f"≈{max(int(days_left), 0)} дн."
-            out.append([label, p["volume"], f"{qty} шт",
-                        f"{fmt_num(sold_qty)} шт", when])
-        sections.append(
-            {"title": f"Склад «{wh['name']}»",
-             "headers": ["Товар", "Фасовка", "Остаток",
-                         f"Продано за {FORECAST_WINDOW} дн.", "Хватит на"],
-             "rows": out, "widths": [55, 24, 20, 34, 26], "numbered": True,
-             "footer": f"Позиций на исходе: {len(out)}"
-                       + (f" · уже закончилось: {n_empty}" if n_empty else "")})
-        summary.append(f"🏬 «{wh['name']}»: {len(out)} поз."
-                       + (f" · ‼️ закончилось: {n_empty}" if n_empty else ""))
+        parts = []
+        if rows:
+            out = []
+            for days_left, p, qty, sold_qty in sorted(rows, key=lambda r: r[0]):
+                label = p["name"].split("(")[0].strip()
+                out.append([label, p["volume"], f"{qty} шт",
+                            f"{fmt_num(sold_qty)} шт",
+                            f"≈{max(int(days_left), 0)} дн."])
+            sections.append(
+                {"title": f"Склад «{wh['name']}» — на исходе",
+                 "headers": ["Товар", "Фасовка", "Остаток",
+                             f"Продано за {FORECAST_WINDOW} дн.", "Хватит на"],
+                 "rows": out, "widths": [55, 24, 20, 34, 26], "numbered": True,
+                 "footer": f"Позиций на исходе: {len(out)}"})
+            parts.append(f"{len(out)} поз. на исходе")
+        if empties:
+            out, n_minus = [], 0
+            # Самые ходовые — первыми; минусовые — в самом верху (ошибка учёта)
+            for s_long, p, qty in sorted(empties, key=lambda r: (r[2] >= 0, -r[0])):
+                label = p["name"].split("(")[0].strip()
+                if qty < 0:
+                    n_minus += 1
+                    left = f"{qty} шт (МИНУС!)"
+                else:
+                    left = "0 шт"
+                out.append([label, p["volume"], left,
+                            f"{fmt_num(s_long)} шт" if s_long > 0 else "—"])
+            footer = (f"Нет в наличии: {len(out)} · показаны товары, которые "
+                      f"продавались за последние {FORECAST_EMPTY_WINDOW} дн.")
+            if n_minus:
+                footer += (f" · в минусе: {n_minus} — проверьте учёт "
+                           f"(/stock, /expiry)")
+            sections.append(
+                {"title": f"Склад «{wh['name']}» — НЕТ В НАЛИЧИИ",
+                 "headers": ["Товар", "Фасовка", "Остаток",
+                             f"Продано за {FORECAST_EMPTY_WINDOW} дн."],
+                 "rows": out, "widths": [62, 28, 30, 39], "numbered": True,
+                 "footer": footer})
+            parts.append(f"‼️ закончилось: {len(out)}"
+                         + (f" (в минусе: {n_minus})" if n_minus else ""))
+        summary.append(f"🏬 «{wh['name']}»: " + " · ".join(parts))
     if not sections:
         return None
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
     pdf = generate_report_pdf(
         "СКОРО ЗАКОНЧИТСЯ",
         f"ОсОО «ВЕТОП» · чего хватит менее чем на {horizon} дн. "
-        f"(по продажам последних {FORECAST_WINDOW} дней) · на {date_str}",
+        f"(по продажам последних {FORECAST_WINDOW} дней) и чего уже нет "
+        f"· на {date_str}",
         sections)
     return pdf, (f"⏳ Скоро закончится (≤{horizon} дн., по продажам последних "
-                 f"{FORECAST_WINDOW} дн.):\n" + "\n".join(summary)
+                 f"{FORECAST_WINDOW} дн.) и что уже закончилось:\n"
+                 + "\n".join(summary)
                  + "\nДругой горизонт: /forecast 60. Пополнить: перемещение "
                  "или приход товара.")
 
