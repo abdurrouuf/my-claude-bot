@@ -1439,10 +1439,9 @@ def commit_invoice(p, replace_op_id=None):
     # или его отсутствие = «сначала старые» (FEFO внутри _apply_batches).
     batch_plan = {}
     for i, it in enumerate(p["items"]):
-        exp = _choice_batch((p.get("batch_choices") or {}).get(str(i)))
-        if exp is not None and it.get("product_id"):
-            batch_plan.setdefault((p["wh_id"], it["product_id"]), []).append(
-                (exp, it["qty"]))
+        rows = _choice_rows((p.get("batch_choices") or {}).get(str(i)), it["qty"])
+        if rows and it.get("product_id"):
+            batch_plan.setdefault((p["wh_id"], it["product_id"]), []).extend(rows)
     if replace_op_id:
         op_id, _ = db.replace_operation(
             replace_op_id, p.get("op_user_id") or p["user_id"], "invoice",
@@ -4313,10 +4312,55 @@ BATCH_NO_EXPIRY = "~"
 
 def _choice_batch(choice):
     """Выбор кнопкой -> срок партии для плана списания.
-    None — выбора нет («сначала старые», FEFO)."""
+    None — выбора нет («сначала старые», FEFO). Список [[срок, шт], ...] —
+    разделение одной позиции по нескольким партиям (кнопка «Разделить»,
+    просьба владельца 01.09.2026) — возвращается как есть."""
     if not choice:
         return None
+    if isinstance(choice, list):
+        return choice
     return "" if choice == BATCH_NO_EXPIRY else choice
+
+
+def _choice_rows(choice, qty):
+    """Выбор партии -> строки плана [(срок, шт), ...]; None — FEFO."""
+    picked = _choice_batch(choice)
+    if picked is None:
+        return None
+    if isinstance(picked, list):
+        return [("" if e == BATCH_NO_EXPIRY else e, int(q)) for e, q in picked]
+    return [(picked, qty)]
+
+
+# Кто отвечает текстом на вопрос «сколько из какой партии?»:
+# (chat_id, user_id) -> токен заявки
+AWAIT_SPLIT = {}
+
+
+def _parse_split(text: str):
+    """«150 до 01.2028, 100 до 04.2028» / «100 04.28; 50 без срока» ->
+    [(срок, шт), ...]; непонятно — None. Порядок «срок шт» тоже годится."""
+    out = []
+    for part in re.split(r"[,;\n]+", text or ""):
+        part = part.strip()
+        if not part:
+            continue
+        if re.search(r"без\s*срока", part, re.IGNORECASE):
+            exp = ""
+            rest = re.sub(r"без\s*срока", " ", part, flags=re.IGNORECASE)
+        else:
+            m = re.search(r"\d{1,2}\s*[./-]\s*\d{2,4}", part)
+            if not m:
+                return None
+            exp = _norm_expiry(m.group(0))
+            if not exp:
+                return None
+            rest = part[:m.start()] + " " + part[m.end():]
+        nums = re.findall(r"\d+", rest)
+        if len(nums) != 1:
+            return None
+        out.append((exp, int(nums[0])))
+    return out or None
 
 
 def _batch_options(p, pid, qty):
@@ -4502,6 +4546,11 @@ async def _ask_batch(q, p, question):
     fefo = ("🔀 Сначала старые"
             + (f" (до {batches[0]['expiry']})" if batches[0]["expiry"] else ""))
     kb.append([InlineKeyboardButton(fefo, callback_data=f"pbat:{token}:{i}:fefo")])
+    # Часть из одной партии, часть из другой — количество по партиям
+    # пишется текстом (просьба владельца 01.09.2026: «150 из старой,
+    # 100 из новой» кнопками не выбрать).
+    kb.append([InlineKeyboardButton("✏️ Разделить по партиям",
+                                    callback_data=f"pbs:{token}:{i}")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
     verb = {"transfer": "Какую партию перемещаете?",
             "writeoff": "Какую партию списываете?"}.get(
@@ -4722,9 +4771,9 @@ def _fill_src_batches(p):
             continue
         exp = "" if it.get("expiry_asked") else (it.get("expiry") or "")
         if not exp:
-            picked = _choice_batch(choices.get(str(i)))
-            if picked is not None:
-                it["src_batches"] = [take_from(pid, picked, it["qty"])]
+            rows_ = _choice_rows(choices.get(str(i)), it["qty"])
+            if rows_ is not None:
+                it["src_batches"] = [take_from(pid, e, q_) for e, q_ in rows_]
                 continue
         if exp:
             it["src_batches"] = [take_from(pid, exp, it["qty"])]
@@ -4968,6 +5017,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # «Отмена» на другой карточке не глушит (ревизия 01.08.2026).
         for k in [k for k, v in AWAIT_EXPIRY.items() if v == token]:
             AWAIT_EXPIRY.pop(k, None)
+        for k in [k for k, v in AWAIT_SPLIT.items() if v == token]:
+            AWAIT_SPLIT.pop(k, None)
         await q.answer()
         # Отменённое восстановление базы: подчистить временный файл
         if p.get("kind") in ("restore_db", "restore_db2") and p.get("path"):
@@ -5371,6 +5422,41 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                        token=token, editor=q.edit_message_text)
             return
         await q.edit_message_text(invoice_summary(p), parse_mode="HTML", reply_markup=confirm_kb(token))
+        return
+
+    if kind == "pbs":  # «Разделить по партиям» — количество по партиям текстом
+        if p.get("kind") not in ("invoice", "amend_invoice", "transfer",
+                                 "writeoff"):
+            await q.answer()
+            return
+        PENDING.pop(token, None)
+        await q.answer()
+        try:
+            idx = parts[2]
+            item = p["items"][int(idx)]
+        except (ValueError, IndexError):
+            await q.edit_message_text("⌛ Заявка устарела — отправьте операцию заново.")
+            return
+        batches = db.product_batches_of(_batch_src_wh(p), item.get("product_id") or 0)
+        p["awaiting_split"] = idx
+        token2 = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
+        AWAIT_SPLIT[(q.message.chat.id, q.from_user.id)] = token2
+        listed = "\n".join(
+            f"• {('до ' + b['expiry']) if b['expiry'] else 'без срока'} — {b['qty']} шт"
+            for b in batches)
+        example = ", ".join(
+            f"{n} {('до ' + b['expiry']) if b['expiry'] else 'без срока'}"
+            for n, b in zip((item["qty"] - item["qty"] // 2, item["qty"] // 2),
+                            batches[:2]))
+        await q.edit_message_text(
+            f"✏️ <b>{esc(item['name'])} {esc(item['volume'])} — {item['qty']} шт</b>\n"
+            f"Партии на складе:\n{listed}\n\n"
+            f"Напишите ответным сообщением, сколько штук из какой партии — "
+            f"например:\n<b>{esc(example)}</b>\n"
+            f"Сумма должна быть ровно {item['qty']} шт.",
+            parse_mode="HTML",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token2}")]]))
         return
 
     if kind == "pbat":  # выбор партии (срока годности) для позиции накладной
@@ -5859,6 +5945,78 @@ EXPIRY_REPLY_RE = re.compile(
     r"^(?:срок(?:\s+годности)?|до|годен\s+до)?[:\s]*"
     r"(\d{1,2}\s*[./-]\s*\d{2,4})\s*(?:г(?:\.|ода)?)?\.?$",
     re.IGNORECASE)
+
+
+async def split_reply(update, context, text: str) -> bool:
+    """Ответ на вопрос «сколько из какой партии?» (кнопка «Разделить»).
+    True — сообщение обработано. Проверяем: сроки — из партий склада,
+    сумма — ровно количество позиции; иначе просим написать ещё раз."""
+    key = (update.effective_chat.id, update.effective_user.id)
+    token = AWAIT_SPLIT.get(key)
+    if not token:
+        return False
+    private = update.effective_chat.type == "private"
+    p = get_pending(token)
+    if p is None:
+        AWAIT_SPLIT.pop(key, None)
+        if private:
+            await update.message.reply_text(
+                "⌛ Вопрос о партиях устарел — ту операцию нужно отправить "
+                "заново. Это сообщение обрабатываю как обычно.")
+        return False
+    idx = p.get("awaiting_split")
+    try:
+        it = p["items"][int(idx)]
+    except (TypeError, ValueError, IndexError, KeyError):
+        AWAIT_SPLIT.pop(key, None)
+        PENDING.pop(token, None)
+        await update.message.reply_text("⌛ Заявка устарела — отправьте операцию заново.")
+        return True
+    rows = _parse_split(text)
+    batches = {b["expiry"]: b["qty"] for b in db.product_batches_of(
+        _batch_src_wh(p), it.get("product_id") or 0)}
+    problem = None
+    if not rows:
+        problem = "не понял"
+    elif any(q_ <= 0 for _, q_ in rows):
+        problem = "количество должно быть больше нуля"
+    elif any(e not in batches for e, _ in rows):
+        bad = [e or "без срока" for e, _ in rows if e not in batches]
+        problem = f"на складе нет партии {', '.join(bad)}"
+    elif sum(q_ for _, q_ in rows) != it["qty"]:
+        problem = (f"в сумме {sum(q_ for _, q_ in rows)} шт, а нужно "
+                   f"{it['qty']} шт")
+    if problem:
+        if private:
+            listed = ", ".join(f"{('до ' + e) if e else 'без срока'} — {q_} шт"
+                               for e, q_ in batches.items())
+            await update.message.reply_text(
+                f"Не получилось: {problem}. Партии: {listed}.\n"
+                f"Напишите, например: <b>150 до 01.2028, 100 до 04.2028</b> "
+                f"(всего {it['qty']} шт) — или нажмите «Отмена» выше.",
+                parse_mode="HTML")
+        return private
+    actor = db.get_user(update.effective_user.id)
+    if actor is None or not actor["active"]:
+        AWAIT_SPLIT.pop(key, None)
+        PENDING.pop(token, None)
+        return private
+    AWAIT_SPLIT.pop(key, None)
+    PENDING.pop(token, None)
+    p.pop("awaiting_split", None)
+    p.setdefault("batch_choices", {})[str(idx)] = [
+        [e or BATCH_NO_EXPIRY, q_] for e, q_ in rows]
+    await update.message.reply_text(
+        "📅 Записал: " + ", ".join(
+            f"{q_} шт {('до ' + e) if e else 'без срока'}" for e, q_ in rows)
+        + f" — {esc(it['name'])} {esc(it['volume'])}.", parse_mode="HTML")
+    responder = _MsgResponder(update.message)
+    try:
+        await _continue_op(responder, context, actor, p, key[0], key[1])
+    except Exception as e:
+        log.exception("Ошибка проведения после разделения по партиям")
+        await update.message.reply_text(f"⚠️ Операция НЕ проведена: {e}")
+    return True
 
 
 async def expiry_reply(update, context, text: str) -> bool:
@@ -6451,6 +6609,8 @@ async def handle_voice(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"🎤 Распознал: «{text}»")
     # Срок годности можно и продиктовать: «одиннадцать двадцать восемь»
     # распознаётся как «11.28» — этого достаточно.
+    if await split_reply(update, context, text):
+        return
     if await expiry_reply(update, context, text):
         return
     draft = False
@@ -6554,6 +6714,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # Ответ на вопрос о сроке годности ловим до всех фильтров: голое
     # «11.2028» в чате склада на операцию не похоже и иначе потерялось бы.
+    if await split_reply(update, context, update.message.text.strip()):
+        return
     if await expiry_reply(update, context, update.message.text.strip()):
         return
     quiet = False
