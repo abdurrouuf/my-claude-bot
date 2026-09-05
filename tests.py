@@ -2636,6 +2636,67 @@ def test_client_cmd_single_fuzzy_pick():
     assert any("не найден" in t and "Возможно" in t for t in out["texts"])
 
 
+def test_batch_split():
+    """Кнопка «Разделить по партиям» (01.09.2026): количество позиции
+    делится между партиями текстом («150 до 01.2028, 100 до 04.2028»),
+    списание идёт ровно так; ошибки суммы/срока — просьба повторить."""
+    import asyncio
+    from types import SimpleNamespace
+    assert bot._parse_split("150 до 01.2028, 100 до 04.2028") == \
+        [("01.2028", 150), ("04.2028", 100)]
+    assert bot._parse_split("01.28 150; без срока 7") == [("01.2028", 150), ("", 7)]
+    assert bot._parse_split("150 и 100") is None
+    wh = _fresh_db()
+    _load(wh, {16: 300}, {(wh["id"], 16): [("01.2028", 162), ("04.2028", 138)]})
+    # 1. Прямой путь: выбор-список -> партии списаны по плану
+    (op_id, *_), p = _invoice(wh, DANIYAR, "Клиент С", [_item(16, 250, 180)])
+    db.cancel_operation(op_id)
+    p["batch_choices"] = {"0": [["01.2028", 150], ["04.2028", 100]]}
+    p["client_id"] = db.client_exact(wh["id"], "Клиент С")["id"]
+    op2, *_ = bot.commit_invoice(p)
+    assert db.batch_qty(wh["id"], 16, "01.2028") == 12
+    assert db.batch_qty(wh["id"], 16, "04.2028") == 38
+    db.cancel_operation(op2)
+    assert db.batch_qty(wh["id"], 16, "01.2028") == 162
+    # 2. Ответ текстом: ожидание -> проверка -> проведение
+    p2 = {"kind": "invoice", "user_id": ADMIN, "chat_id": 1, "wh_id": wh["id"],
+          "wh_name": wh["name"], "client_name": "Клиент С",
+          "client_id": p["client_id"], "items": [_item(16, 250, 180)],
+          "payment": 0.0, "parsed_debt": 0.0, "phone": None,
+          "awaiting_split": "0"}
+    token = bot.new_pending(p2)
+    bot.AWAIT_SPLIT[(1, ADMIN)] = token
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd():
+        return SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                               effective_chat=SimpleNamespace(id=1, type="private"),
+                               message=Msg())
+    ctx = SimpleNamespace(bot=SimpleNamespace(
+        send_message=_anoop, send_document=_anoop))
+    # сумма не сходится — ждём дальше
+    assert asyncio.run(bot.split_reply(upd(), ctx, "100 до 01.2028, 100 до 04.2028"))
+    assert "нужно 250" in replies[-1] and (1, ADMIN) in bot.AWAIT_SPLIT
+    # чужой срок — ждём дальше
+    assert asyncio.run(bot.split_reply(upd(), ctx, "150 до 12.2030, 100 до 04.2028"))
+    assert "нет партии" in replies[-1]
+    # верный ответ — проведено по двум партиям
+    assert asyncio.run(bot.split_reply(upd(), ctx, "150 до 01.2028, 100 до 04.2028"))
+    assert (1, ADMIN) not in bot.AWAIT_SPLIT
+    assert any("Записал" in r for r in replies)
+    assert db.batch_qty(wh["id"], 16, "01.2028") == 12
+    assert db.batch_qty(wh["id"], 16, "04.2028") == 38
+    assert _batch_sum(wh, 16) == _stock(wh, 16) == 50
+
+
+async def _anoop(*a, **k):
+    return None
+
+
 def _noop(*a, **k):
     pass
 
