@@ -2,3 +2,9 @@ python-telegram-bot==20.3
 anthropic==0.40.0
 reportlab==4.1.0
 openpyxl==3.1.5
+# Сетевой стек закреплён (инцидент 05.09.2026): anyio 4.15.0 сломала
+# httpcore 0.17 («module 'anyio' has no attribute 'abc'») — бот падал
+# на старте после любой пересборки. Не поднимать без проверки запуска.
+anyio==4.14.2
+httpx==0.24.1
+httpcore==0.17.3
