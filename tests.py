@@ -1885,7 +1885,8 @@ def test_forecast_pdf():
     assert report is not None
     pdf, cap = report
     assert pdf.getvalue()[:4] == b"%PDF"
-    assert "закончилось: 1" in cap and "2 поз." in cap
+    # 05.09.2026: нули — в отдельной секции «нет в наличии», не в «на исходе»
+    assert "закончилось: 1" in cap and "1 поз. на исходе" in cap
     # ничего не заканчивается — отчёта нет
     wh2 = db.warehouse_by_name("Манас")
     assert bot.build_forecast_report([wh2]) is None
@@ -1894,9 +1895,42 @@ def test_forecast_pdf():
     _invoice(wh, ADMIN, "Тест", [_item(30, 4, 300)],
              client_id=db.client_exact(wh["id"], "Тест")["id"])
     pdf30, cap30 = bot.build_forecast_report([wh])   # осталось на ~294 дн.
-    assert "2 поз." in cap30 and "≤30" in cap30      # медленный не попал
+    assert "1 поз. на исходе" in cap30 and "≤30" in cap30   # медленный не попал
     pdf365, cap365 = bot.build_forecast_report([wh], 365)
-    assert "3 поз." in cap365 and "≤365" in cap365
+    assert "2 поз. на исходе" in cap365 and "≤365" in cap365
+    # Товар, закончившийся БОЛЬШЕ двух недель назад, раньше пропадал из
+    # прогноза (продаж за 14 дн. нет — нечего считать). Теперь виден в
+    # «нет в наличии», если продавался за 60 дн.
+    from datetime import datetime, timedelta
+    _load(wh, {40: 10})
+    (op_id, *_), _ = _invoice(wh, ADMIN, "Тест", [_item(40, 10, 100)],
+                        client_id=db.client_exact(wh["id"], "Тест")["id"])
+    conn = db.connect()
+    old_ts = (datetime.now(bot.BISHKEK) - timedelta(days=20)).isoformat()
+    conn.execute("UPDATE operations SET ts=? WHERE id=?", (old_ts, op_id))
+    conn.commit()
+    pdf3, cap3 = bot.build_forecast_report([wh])
+    assert "закончилось: 2" in cap3
+    # Минусовой остаток показывается всегда, даже без продаж
+    conn.execute("INSERT INTO stock(warehouse_id, product_id, qty) VALUES(?,?,?)",
+                 (wh["id"], 50, -3))
+    conn.commit()
+    pdf4, cap4 = bot.build_forecast_report([wh])
+    assert "закончилось: 3 (в минусе: 1)" in cap4
+    # Нулевой товар без продаж за 60 дней не показывается (не шумим)
+    conn.execute("UPDATE operations SET ts=? WHERE id=?",
+                 ((datetime.now(bot.BISHKEK) - timedelta(days=90)).isoformat(),
+                  op_id))
+    conn.commit()
+    pdf5, cap5 = bot.build_forecast_report([wh])
+    assert "закончилось: 2 (в минусе: 1)" in cap5
+    # Склад, где только «нет в наличии» (ничего на исходе) — отчёт всё равно есть
+    wh3 = db.warehouse_by_name("Манас")
+    conn.execute("INSERT INTO stock(warehouse_id, product_id, qty) VALUES(?,?,?)",
+                 (wh3["id"], 50, -1))
+    conn.commit()
+    pdf6, cap6 = bot.build_forecast_report([wh3])
+    assert "на исходе" not in cap6.split("\n")[1] and "в минусе: 1" in cap6
 
 
 def test_f260403_arrival_data_and_lots():
