@@ -3,6 +3,7 @@
 # ПРАВИЛО ПРОЕКТА: прогонять перед каждым пушем; новые функции — добавлять
 # сюда сценарий. Каждый тест — отдельная функция test_*, падение assert
 # показывает имя теста.
+import asyncio
 import json
 import os
 import sys
@@ -1931,6 +1932,54 @@ def test_forecast_pdf():
     conn.commit()
     pdf6, cap6 = bot.build_forecast_report([wh3])
     assert "на исходе" not in cap6.split("\n")[1] and "в минусе: 1" in cap6
+    # «Есть на складах» (05.09.2026, «1-2» владельца): где ещё лежит товар.
+    # Каракол: №40 по нулям, №28 на исходе; на Манасе 3000 шт №40, на
+    # Бишкеке 90 шт №28. Учебный склад в колонку не попадает.
+    conn.execute("UPDATE operations SET ts=? WHERE id=?",
+                 ((datetime.now(bot.BISHKEK) - timedelta(days=20)).isoformat(),
+                  op_id))
+    conn.commit()
+    b = db.warehouse_by_name("Бишкек")
+    _load(wh3, {40: 3000})
+    _load(b, {28: 90})
+    db.create_warehouse("Учебный")
+    uch = db.warehouse_by_name("Учебный")
+    _load(uch, {40: 55, 28: 55})
+    captured = {}
+    orig = bot.generate_report_pdf
+    def spy(title, subtitle, sections, *a, **k):
+        captured["sections"] = sections
+        return orig(title, subtitle, sections, *a, **k)
+    bot.generate_report_pdf = spy
+    try:
+        bot.build_forecast_report([wh])
+        secs = captured["sections"]
+        low = [s for s in secs if "на исходе" in s["title"]][0]
+        empty = [s for s in secs if "НЕТ В НАЛИЧИИ" in s["title"]][0]
+        assert low["headers"][-1] == "Есть на складах"
+        r28 = [r for r in low["rows"] if r[0] == "ПЕНСТОП-G"][0]
+        assert r28[-1] == "Бишкек 90"
+        r40 = [r for r in empty["rows"] if r[0] == "ТОПЗАНТЕЛ" and r[2] == "0 шт"]
+        assert r40 and r40[0][-1] == "Манас 3'000"       # учебный не показан
+        # Сотрудник Каракола видит только свои склады — чужие остатки не светим
+        captured.clear()
+        bot.build_forecast_report([wh], other_whs=[wh])
+        empty2 = [s for s in captured["sections"] if "НЕТ В НАЛИЧИИ" in s["title"]][0]
+        assert all(r[-1] == "—" for r in empty2["rows"])
+        d = db.get_user(DANIYAR)
+        assert [w["name"] for w in bot._forecast_other_whs(d)] == ["Каракол"]
+        assert bot._forecast_other_whs(db.get_user(ADMIN)) is None
+    finally:
+        bot.generate_report_pdf = orig
+    # Понедельничная рассылка админу: PDF всех настоящих складов, claim
+    sent = []
+    class FakeBot:
+        async def send_document(self, chat_id, document=None, caption=None, **k):
+            sent.append((chat_id, caption))
+    asyncio.run(bot.send_forecast_alert(FakeBot()))
+    assert len(sent) == 1 and sent[0][0] == ADMIN
+    assert "Еженедельный прогноз" in sent[0][1] and "«Каракол»" in sent[0][1]
+    assert "Учебный" not in sent[0][1]
 
 
 def test_f260403_arrival_data_and_lots():

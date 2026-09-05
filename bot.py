@@ -5221,7 +5221,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         shim = SimpleNamespace(message=q.message,
                                effective_chat=q.message.chat,
                                effective_user=q.from_user)
-        await _forecast_report(shim, whs, p.get("horizon"))
+        await _forecast_report(shim, whs, p.get("horizon"), owner_row)
         return
 
     if kind == "pdbt":  # выбран склад для отчёта о долгах
@@ -6816,7 +6816,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/debts — долги клиентов",
         "/report — отчёт (можно: /report неделя, /report Бишкек месяц)",
         "/olddebts — кто давно не платил (можно: /olddebts 45)",
-        "/deadstock — залежавшийся товар · /forecast — что скоро закончится",
+        "/deadstock — залежавшийся товар · /forecast — что скоро закончится "
+        "(и чего уже нет; админу — каждый понедельник автоматически)",
         "/client Имя — карточка клиента (долг, история)",
         "/sales Препарат — история продаж препарата (можно: /sales Дексатоп 50мл Мустанг)",
         "/act Имя — акт сверки в PDF",
@@ -8553,7 +8554,21 @@ FORECAST_HORIZON = 30
 FORECAST_EMPTY_WINDOW = 60
 
 
-def build_forecast_report(warehouses, horizon=None):
+def _others_stock_text(wh_id, pid, other_whs, other_maps) -> str:
+    """«Манас 120 · Бишкек 3'000» — где ещё лежит товар (05.09.2026, «1-2»
+    владельца: кончается на Караколе, а на Манасе лежит — перемещать, а не
+    закупать). Пустая строка — нигде нет."""
+    parts = []
+    for w in other_whs:
+        if w["id"] == wh_id:
+            continue
+        q = other_maps.get(w["id"], {}).get(pid, 0)
+        if q > 0:
+            parts.append(f"{w['name']} {fmt_num(q)}")
+    return " · ".join(parts)
+
+
+def build_forecast_report(warehouses, horizon=None, other_whs=None):
     """Прогноз «скоро закончится» PDF-файлом в фирменном стиле (14.08.2026,
     «что за беспорядок?» владельца про текстовую простыню): секция на склад,
     отсортировано по срочности. None — ничего не заканчивается.
@@ -8564,10 +8579,16 @@ def build_forecast_report(warehouses, horizon=None):
     (продаж нет — нечего прогнозировать). Нулевой товар без продаж за окно
     не показывается (залежавшиеся нули засоряли бы список), минусовой —
     показывается всегда (это ошибка учёта, её надо видеть).
+    other_whs — на каких складах смотреть «есть ли ещё» (колонка «Есть на
+    складах»); None — все настоящие склады (учебные не в счёт). Сотруднику
+    передаются его видимые склады — чужие остатки ему не светим.
     Возвращает (pdf, подпись-итог)."""
     horizon = horizon or FORECAST_HORIZON
     sold_all = sales_by_warehouse(FORECAST_WINDOW)
     sold_long = sales_by_warehouse(FORECAST_EMPTY_WINDOW)
+    if other_whs is None:
+        other_whs = [w for w in db.all_warehouses() if not is_training_wh(w)]
+    other_maps = {w["id"]: db.stock_map(w["id"]) for w in other_whs}
     sections, summary = [], []
     for wh in warehouses:
         sold = sold_all.get(wh["id"], {})
@@ -8600,13 +8621,18 @@ def build_forecast_report(warehouses, horizon=None):
                 label = p["name"].split("(")[0].strip()
                 out.append([label, p["volume"], f"{qty} шт",
                             f"{fmt_num(sold_qty)} шт",
-                            f"≈{max(int(days_left), 0)} дн."])
+                            f"≈{max(int(days_left), 0)} дн.",
+                            _others_stock_text(wh["id"], p["id"],
+                                               other_whs, other_maps) or "—"])
             sections.append(
                 {"title": f"Склад «{wh['name']}» — на исходе",
                  "headers": ["Товар", "Фасовка", "Остаток",
-                             f"Продано за {FORECAST_WINDOW} дн.", "Хватит на"],
-                 "rows": out, "widths": [55, 24, 20, 34, 26], "numbered": True,
-                 "footer": f"Позиций на исходе: {len(out)}"})
+                             f"Продано за {FORECAST_WINDOW} дн.", "Хватит на",
+                             "Есть на складах"],
+                 "rows": out, "widths": [43, 20, 19, 24, 18, 35],
+                 "numbered": True,
+                 "footer": f"Позиций на исходе: {len(out)} · «Есть на складах» "
+                           f"— перемещайте, не закупайте"})
             parts.append(f"{len(out)} поз. на исходе")
         if empties:
             out, n_minus = [], 0
@@ -8619,7 +8645,9 @@ def build_forecast_report(warehouses, horizon=None):
                 else:
                     left = "0 шт"
                 out.append([label, p["volume"], left,
-                            f"{fmt_num(s_long)} шт" if s_long > 0 else "—"])
+                            f"{fmt_num(s_long)} шт" if s_long > 0 else "—",
+                            _others_stock_text(wh["id"], p["id"],
+                                               other_whs, other_maps) or "—"])
             footer = (f"Нет в наличии: {len(out)} · показаны товары, которые "
                       f"продавались за последние {FORECAST_EMPTY_WINDOW} дн.")
             if n_minus:
@@ -8628,8 +8656,9 @@ def build_forecast_report(warehouses, horizon=None):
             sections.append(
                 {"title": f"Склад «{wh['name']}» — НЕТ В НАЛИЧИИ",
                  "headers": ["Товар", "Фасовка", "Остаток",
-                             f"Продано за {FORECAST_EMPTY_WINDOW} дн."],
-                 "rows": out, "widths": [62, 28, 30, 39], "numbered": True,
+                             f"Продано за {FORECAST_EMPTY_WINDOW} дн.",
+                             "Есть на складах"],
+                 "rows": out, "widths": [47, 20, 31, 24, 37], "numbered": True,
                  "footer": footer})
             parts.append(f"‼️ закончилось: {len(out)}"
                          + (f" (в минусе: {n_minus})" if n_minus else ""))
@@ -8734,11 +8763,20 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text("Прогноз какого склада показать?",
                                             reply_markup=InlineKeyboardMarkup(kb))
             return
-    await _forecast_report(update, whs, horizon)
+    await _forecast_report(update, whs, horizon, actor)
 
 
-async def _forecast_report(update, whs, horizon=None):
-    report = build_forecast_report(whs, horizon)
+def _forecast_other_whs(actor):
+    """Чьи остатки показывать в колонке «Есть на складах»: админу — все
+    настоящие, сотруднику — только видимые ему (просмотр /watch включён)."""
+    if is_admin(actor):
+        return None
+    return [w for w in db.visible_warehouses(actor) if not is_training_wh(w)]
+
+
+async def _forecast_report(update, whs, horizon=None, actor=None):
+    report = build_forecast_report(
+        whs, horizon, None if actor is None else _forecast_other_whs(actor))
     if report is None:
         await update.message.reply_text(
             f"✅ Ничего не заканчивается: всех продаваемых товаров хватит более чем на "
@@ -9302,6 +9340,24 @@ async def send_expiry_alerts(bot):
             caption=caption)
     except Exception as e:
         log.warning("Не удалось отправить тревогу о сроках: %s", e)
+
+
+async def send_forecast_alert(bot):
+    """Понедельник, админу: сводный /forecast по всем настоящим складам
+    (05.09.2026, «1-2» владельца — прогноз как еженедельный инструмент
+    снабжения). Нечего показывать — тишина."""
+    whs = [w for w in db.all_warehouses() if not is_training_wh(w)]
+    report = build_forecast_report(whs)
+    if not report:
+        return
+    pdf, caption = report
+    date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
+    try:
+        await bot.send_document(
+            ADMIN_ID, document=InputFile(pdf, filename=f"прогноз_{date_str}.pdf"),
+            caption=("📦 Еженедельный прогноз снабжения\n" + caption)[:1000])
+    except Exception as e:
+        log.warning("Не удалось отправить еженедельный прогноз: %s", e)
 
 
 async def send_backup(bot):
@@ -10227,6 +10283,12 @@ async def weekly_debt_loop(app):
                 await send_expiry_alerts(app.bot)
         except Exception:
             log.exception("Ошибка тревоги о сроках годности")
+        try:
+            # Понедельничный прогноз снабжения (05.09.2026, «1-2» владельца).
+            if db.claim_daily_job(f"forecast_alert:{today}"):
+                await send_forecast_alert(app.bot)
+        except Exception:
+            log.exception("Ошибка еженедельного прогноза")
 
 
 LOG_TYPE_ICONS = {"invoice": "🧾", "payment": "💵", "transfer": "📦",
