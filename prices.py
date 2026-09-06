@@ -174,9 +174,20 @@ def _base_name(name: str) -> str:
     return str(name or "").split("(")[0].strip().lower()
 
 
+def _name_words(s: str) -> list:
+    """Слова короткого имени, дефис — тоже разделитель: «альтопен-форте» =
+    «альтопен форте», «тривитоп» — начало «тривитоп-ad3e»."""
+    return [w for w in re.split(r"[\s\-]+", s) if w]
+
+
 def _vol_key(volume: str) -> str:
-    """Фасовка без пробелов: «100 мл» и «100мл» — одно и то же."""
-    return re.sub(r"\s+", "", str(volume or "").strip().lower())
+    """Фасовка без пробелов и пояснений: «100 мл», «100мл», «100 мл.» —
+    одно и то же; «10 мл (10 фл)» = «10 мл» (ревизия 06.09.2026: пачка
+    Окситопа/Энротопа не находилась по «10 мл», накладная проводилась без
+    списания остатка)."""
+    v = re.sub(r"\([^)]*\)", "", str(volume or ""))
+    v = re.sub(r"\s+", "", v.strip().lower()).rstrip(".")
+    return v.replace("ml", "мл")
 
 
 def match_product(name: str, volume: str):
@@ -210,17 +221,44 @@ def match_product(name: str, volume: str):
     # СУРФАГОНОМ 50 мкг (другая дозировка!). Такой фасовки просто нет.
     if base and any(_base_name(p["name"]) == base for p in PRICE_LIST_DATA):
         return None
-    m = difflib.get_close_matches(f"{name_l} | {vol_l}", list(_KEYS), n=1, cutoff=0.85)
-    if m:
-        return _KEYS[m[0]]
-    if not base or not vkey:
-        return None
-    scored = sorted(
-        ((difflib.SequenceMatcher(None, base, _base_name(p["name"])).ratio(), p)
-         for p in same_vol), key=lambda x: -x[0])
+    # Короткое имя — НАЧАЛО имени товара по словам («Докцилин» ⊂ «ДОКЦИЛИН
+    # 200», «Цефти» ⊂ «ЦЕФТИ DC») при точной фасовке — единственный
+    # кандидат принимается, несколько — не гадаем (ревизия 06.09.2026).
+    if base and vkey:
+        bw = _name_words(base)
+        eq = [p for p in same_vol if _name_words(_base_name(p["name"])) == bw]
+        if len(eq) == 1:
+            return eq[0]                 # «Альтопен форте» = АЛЬТОПЕН-ФОРТЕ
+        pref = [p for p in same_vol
+                if _name_words(_base_name(p["name"]))[:len(bw)] == bw]
+        if len(pref) == 1:
+            return pref[0]
+        if pref:
+            return None
+    # Опечатка в коротком имени при точной фасовке — РАНЬШЕ нечёткого
+    # поиска по полной строке (ревизия 06.09.2026: «Альтопён 100 мл» по
+    # полной строке уезжал в КАЛЬФОТОН — хвост « | 100 мл» тянул сходство).
+    scored = []
+    if base and vkey:
+        scored = sorted(
+            ((difflib.SequenceMatcher(None, base, _base_name(p["name"])).ratio(), p)
+             for p in same_vol), key=lambda x: -x[0])
     # Берём только уверенного и явного лидера: «Клозатоп» не должен
     # превратиться в «Клозатоп-Форте», а «Топмектин» — в «Топмектин гель».
     if scored and scored[0][0] >= 0.86 and (
             len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
         return scored[0][1]
+    m = difflib.get_close_matches(f"{name_l} | {vol_l}", list(_KEYS), n=1, cutoff=0.85)
+    if m:
+        cand = _KEYS[m[0]]
+        # Полная строка совпала, но по короткому имени этот товар — не
+        # ближайший среди товаров той же фасовки (или совсем не похож):
+        # это хвост фасовки тянет сходство к чужому товару. Не подставляем.
+        if base:
+            r_cand = difflib.SequenceMatcher(
+                None, base, _base_name(cand["name"])).ratio()
+            best = max((s for s, _p in scored), default=0.0)
+            if r_cand < 0.7 or r_cand < best:
+                return None
+        return cand
     return None

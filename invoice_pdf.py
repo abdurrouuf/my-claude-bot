@@ -36,7 +36,7 @@ def fmt_num(n) -> str:
 def safe_filename(name: str) -> str:
     """Оставляет в имени файла только буквы, цифры, дефис и подчёркивание."""
     cleaned = re.sub(r"[^\w\-]+", "_", name, flags=re.UNICODE).strip("_")
-    return cleaned or "клиент"
+    return cleaned[:60] or "клиент"
 
 
 def _register_fonts():
@@ -193,7 +193,7 @@ def generate_report_pdf(title: str, subtitle: str, sections: list,
                     # Список в ячейке = многострочный текст (позиции накладной)
                     text = "<br/>".join(xml_escape(str(x)) for x in c)
                 else:
-                    text = xml_escape(str(c))
+                    text = xml_escape("" if c is None else str(c))
                 cells.append(Paragraph(text, cell_style))
             data.append(cells)
         col_widths = [w * mm for w in widths] if widths else None
@@ -538,7 +538,7 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
             Paragraph(fmt_num(subtotal), cell_style),
         ])
 
-    col_widths = [8*mm, 48*mm, 18*mm, 18*mm, 16*mm, 18*mm]
+    col_widths = [8*mm, 46*mm, 20*mm, 18*mm, 16*mm, 18*mm]
     table = Table(table_data, colWidths=col_widths, repeatRows=1)
     style = [
         ("BACKGROUND", (0, 0), (-1, 0), HEADER_GREEN),

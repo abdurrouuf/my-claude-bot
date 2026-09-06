@@ -1540,7 +1540,7 @@ def client_set_phone(cid: int, phone):
         conn.execute("UPDATE clients SET phone=? WHERE id=?", (phone or None, cid))
 
 
-def fuzzy_clients(wh_id: int, name: str, n: int = 3):
+def fuzzy_clients(wh_id: int, name: str, n: int = 6):
     """Похожие клиенты внутри склада (региона), включая псевдонимы."""
     rows = clients_of(wh_id)
     mapping = {}
@@ -1570,8 +1570,18 @@ def fuzzy_clients(wh_id: int, name: str, n: int = 3):
     containing = [k for k in mapping
                   if k not in matches and k not in perm
                   and k not in contained and qwords and qwords <= set(k.split())]
+    # Одно слово с опечаткой («Алмагуль» → «Сапаркулова Алмагул»,
+    # «Фахриддин» → «Дадажанов Фахридин»): сравниваем с КАЖДЫМ словом имени
+    # (ревизия 06.09.2026 — иначе кнопок не было и предлагался двойник).
+    wordish = []
+    if len(qwords) == 1 and len(query) >= 4:
+        wordish = [k for k in mapping
+                   if k not in matches and k not in perm and k not in contained
+                   and k not in containing
+                   and any(difflib.SequenceMatcher(None, query, w).ratio() >= 0.85
+                           for w in k.split() if len(w) >= 4)]
     out, seen = [], set()
-    for m in contained + containing + perm + matches:
+    for m in contained + containing + wordish + perm + matches:
         r = mapping[m]
         if r["id"] not in seen:
             seen.add(r["id"])

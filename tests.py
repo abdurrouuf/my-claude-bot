@@ -2784,6 +2784,197 @@ def _noop(*a, **k):
     pass
 
 
+
+def test_revision_060926():
+    """Ревизия 06.09.2026 (четыре параллельных аудита): находки закреплены."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()                       # Каракол, полный режим
+    daniyar = db.get_user(DANIYAR)
+    admin = db.get_user(ADMIN)
+
+    # --- прайс: опечатка в коротком имени больше не уезжает в чужой товар
+    assert prices.match_product("Альтопён", "100 мл")["id"] == 6
+    assert prices.match_product("Альтопан", "100 мл")["id"] == 6
+    assert prices.match_product("Альтопне", "100 мл") is None       # не гадаем
+    assert prices.match_product("Окситоп", "10 мл")["volume"] == "10 мл (10 фл)"
+    assert prices.match_product("Энротоп", "10мл")["volume"] == "10 мл (10 фл)"
+    assert prices.match_product("Докцилин", "100 мл")["name"].startswith("ДОКЦИЛИН")
+    assert prices.match_product("Тривитоп", "100 мл")["name"].startswith("ТРИВИТОП")
+    assert prices.match_product("Альтопен форте", "1 л")["id"] == 2
+    assert prices.match_product("Альтопен", "200 мл") is None
+    assert prices.match_product("Клозатоп", "100 таб") is None
+
+    # --- клиенты: одно слово с опечаткой даёт кнопку, а не «создать нового»
+    db.clients_add_bulk(wh["id"], [("Сапаркулова Алмагул", 100), ("Дадажанов Фахридин", 200),
+                                   ("Асан Токмок", 0), ("Асан Кант", 0), ("Асан Ош", 0),
+                                   ("Асан Сокулук", 0), ("Асан Беловодское", 0)])
+    names = [c["name"] for c in db.fuzzy_clients(wh["id"], "Алмагуль")]
+    assert names == ["Сапаркулова Алмагул"], names
+    assert [c["name"] for c in db.fuzzy_clients(wh["id"], "Фахриддин")] == ["Дадажанов Фахридин"]
+    assert len(db.fuzzy_clients(wh["id"], "Асан")) == 5      # было 3 — двойники
+    # прослеживаемость имени: общее слово (город) не считается
+    assert not bot._name_traceable("Асан Токмок 3000", "Динислам Токмок")
+    assert bot._name_traceable("Ден Каракол 41500", "Ден Каракол")
+    assert bot._name_traceable("Осон Токмон 3000", "Асан Токмок")
+    assert not bot._name_traceable("Каракол 5000", "Ден Каракол")  # один город — не имя
+    assert bot._name_traceable("Токмок 5000", "Токмок")   # имя целиком из общих слов — как раньше
+
+    # --- кнопки-кандидаты не светят долг скрытого склада
+    c_alm = db.client_exact(wh["id"], "Сапаркулова Алмагул")
+    assert "долг" in bot._client_btn(daniyar, wh["id"], c_alm)
+    db.set_setting("hidden_debt_whs", json.dumps([wh["id"]]))
+    assert bot._client_btn(daniyar, wh["id"], c_alm) == "👤 Сапаркулова Алмагул"
+    assert "долг" in bot._client_btn(admin, wh["id"], c_alm)
+
+    # --- черновик сотрудника по скрытому складу — без «старого долга»
+    captured = {}
+
+    async def fake_pdf(context, chat_id, client_label, p, old_debt, total, **kw):
+        captured["old_debt"] = old_debt
+    orig_pdf = bot.send_invoice_pdf
+    bot.send_invoice_pdf = fake_pdf
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                          effective_chat=SimpleNamespace(id=DANIYAR, type="private"),
+                          message=SimpleNamespace(reply_text=_areply([])))
+    data = {"warehouse": wh["name"], "client": "Сапаркулова Алмагул",
+            "items": [{"name": prices.BY_ID[16]["name"], "volume": prices.BY_ID[16]["volume"],
+                       "qty": 1, "price": 180}], "payment": 0, "debt": 0}
+    try:
+        asyncio.run(bot.start_invoice(upd, SimpleNamespace(bot=None), daniyar,
+                                      dict(data), draft=True))
+        assert captured["old_debt"] == 0
+        db.set_setting("hidden_debt_whs", json.dumps([]))
+        asyncio.run(bot.start_invoice(upd, SimpleNamespace(bot=None), daniyar,
+                                      dict(data), draft=True))
+        assert captured["old_debt"] == 100
+    finally:
+        bot.send_invoice_pdf = orig_pdf
+
+    # --- приход извне старшим — только на свой склад
+    conn = db.connect()
+    conn.execute("UPDATE users SET role='senior' WHERE id=?", (DANIYAR,))
+    conn.commit()
+    senior = db.get_user(DANIYAR)
+    replies = []
+    upd2 = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                           effective_chat=SimpleNamespace(id=DANIYAR, type="private"),
+                           message=SimpleNamespace(reply_text=_areply(replies)))
+    manas = db.warehouse_by_name("Манас")
+    conn.execute("UPDATE warehouses SET full_mode=1 WHERE id=?", (manas["id"],))
+    conn.commit()
+    asyncio.run(bot.start_transfer(upd2, SimpleNamespace(bot=None), senior,
+                                   {"to_warehouse": "Манас", "from_warehouse": "",
+                                    "items": [{"name": prices.BY_ID[16]["name"],
+                                               "volume": prices.BY_ID[16]["volume"],
+                                               "qty": 5, "expiry": "06.2029"}]}))
+    assert replies and "недоступен" in replies[-1], replies
+    conn.execute("UPDATE users SET role='employee' WHERE id=?", (DANIYAR,))
+    conn.commit()
+
+    # --- полные итоги дня админу: hidden_n считается с hide_admin=True
+    _load(wh, {16: 50})
+    db.set_setting("hidden_debt_whs", json.dumps([wh["id"]]))
+    _invoice(wh, ADMIN, "Сапаркулова Алмагул", [_item(16, 2, 180)],
+             client_id=c_alm["id"])
+    sent = []
+
+    class FakeBot:
+        async def send_document(self, chat_id, document=None, caption=None, **k):
+            sent.append((chat_id, caption))
+    asyncio.run(bot._admin_full_summary(FakeBot(), [wh]))
+    assert len(sent) == 1 and sent[0][0] == ADMIN and "полные" in sent[0][1]
+    db.set_setting("hidden_debt_whs", json.dumps([]))
+
+    # --- продажи для прогноза: возврат вычитается
+    sold = bot.sales_by_warehouse(14).get(wh["id"], {})
+    assert sold.get(16) == 2
+    db.commit_operation(ADMIN, "return", wh["id"], c_alm["id"], "возврат",
+                        [(wh["id"], 16, 2)], [(c_alm["id"], -360)], {},
+                        batch_plan={(wh["id"], 16): [("06.2029", 2)]})
+    assert 16 not in bot.sales_by_warehouse(14).get(wh["id"], {})
+
+    # --- разделение по партиям: союз «и», коробки — отказ
+    assert bot._parse_split("150 до 01.2028 и 100 до 04.2028") == [("01.2028", 150), ("04.2028", 100)]
+    assert bot._parse_split("2 кор до 01.2028, 100 до 04.2028") is None
+    # ответ о сроке не съедается ожиданием разделения
+    key = (DANIYAR, DANIYAR)
+    tok = bot.new_pending({"kind": "writeoff", "user_id": DANIYAR, "wh_id": wh["id"],
+                           "items": [{"name": "x", "volume": "y", "qty": 1, "product_id": 16}],
+                           "awaiting_split": "0"})
+    bot.AWAIT_SPLIT[key] = tok
+    bot.AWAIT_EXPIRY[key] = "whatever"
+    upd3 = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                           effective_chat=SimpleNamespace(id=DANIYAR, type="private"),
+                           message=SimpleNamespace(reply_text=_areply([])))
+    assert asyncio.run(bot.split_reply(upd3, None, "11.2028")) is False
+    bot.AWAIT_SPLIT.pop(key, None); bot.AWAIT_EXPIRY.pop(key, None); bot.PENDING.pop(tok, None)
+
+    # --- списание с ошибочным сроком — предупреждение в карточке
+    p = {"kind": "writeoff", "wh_id": wh["id"], "wh_name": wh["name"], "reason": "бой",
+         "user_id": ADMIN, "items": [{"name": prices.BY_ID[16]["name"],
+                                      "volume": prices.BY_ID[16]["volume"], "qty": 3,
+                                      "price": 180, "product_id": 16, "expiry": "06.2028"}]}
+    warns = bot._wrong_expiry_warnings(p)
+    assert warns and "НЕТ партии со сроком 06.2028" in warns[0]
+    assert "НЕТ партии" in bot.writeoff_summary(p)
+
+    # --- копеечный хвост долга — «погашен»
+    assert bot._debt_suffix(0.3) == ", долг погашен"
+    assert bot._debt_suffix(-0.2) == ", долг погашен"
+    assert "долг: 5" in bot._debt_suffix(5)
+
+    # --- /forecast в группе: колонка «Есть на складах» только по складу чата
+    db.set_feed_chat(wh["id"], -777, "чат")
+    seen = {}
+    orig_build = bot.build_forecast_report
+
+    def spy_build(whs, horizon=None, other_whs=None):
+        seen["others"] = other_whs
+        return None
+    bot.build_forecast_report = spy_build
+    upd4 = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                           effective_chat=SimpleNamespace(id=-777, type="supergroup"),
+                           message=SimpleNamespace(reply_text=_areply([])))
+    try:
+        asyncio.run(bot.forecast_cmd(upd4, SimpleNamespace(args=[])))
+        assert [w["id"] for w in seen["others"]] == [wh["id"]]
+    finally:
+        bot.build_forecast_report = orig_build
+    # /deadstock и /minstock в группе — только склад чата
+    seen.clear()
+    orig_ds = bot._deadstock_report
+
+    async def spy_ds(update, whs, actor, params):
+        seen["whs"] = [w["id"] for w in whs]
+    bot._deadstock_report = spy_ds
+    try:
+        asyncio.run(bot.deadstock_cmd(upd4, SimpleNamespace(args=["Манас"])))
+        assert seen["whs"] == [wh["id"]]          # аргумент в группе игнорируется
+    finally:
+        bot._deadstock_report = orig_ds
+    # /payment идёт через общий диспетчер (склад чата, вопрос о складе)
+    seen.clear()
+    orig_da = bot.dispatch_action
+
+    async def spy_da(update, context, actor, reply, **kw):
+        seen["reply"] = reply
+        seen["src"] = kw.get("src_text")
+    bot.dispatch_action = spy_da
+    try:
+        asyncio.run(bot.payment_cmd(upd4, SimpleNamespace(args=["Асан", "Токмок", "5000"])))
+        assert '"payment"' in seen["reply"] and seen["src"] == "Асан Токмок"
+    finally:
+        bot.dispatch_action = orig_da
+    db.set_feed_chat(wh["id"], None)
+
+
+def _areply(sink):
+    async def reply_text(text, **kw):
+        sink.append(text)
+    return reply_text
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
@@ -2801,3 +2992,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
