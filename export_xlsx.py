@@ -29,7 +29,7 @@ def _txt(v):
     """Строка, начинающаяся с «=», стала бы в Excel живой формулой —
     экранируем апострофом (имя клиента может задать сотрудник)."""
     if isinstance(v, str) and v.startswith("="):
-        return "'" + v
+        return " " + v   # пробел вместо апострофа: апостроф был бы виден
     return v
 
 
@@ -120,7 +120,7 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
             if qty:
                 amount = qty * p["price"]
                 grand += amount
-                ws.append([wh["name"], p["name"], p["volume"], qty, p["price"], amount])
+                ws.append([wh["name"], _txt(p["name"]), p["volume"], qty, p["price"], amount])
         # Товар, выведенный из прайса, но с остатком: раньше молча выпадал
         # из экспорта, и остатки «не бились» с /stock.
         known = {p["id"] for p in prices.PRICE_LIST_DATA}
@@ -133,7 +133,7 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
                 price = row["price"] if row else 0
                 amount = qty * price
                 grand += amount
-                ws.append([wh["name"], name, row["volume"] if row else "",
+                ws.append([wh["name"], _txt(name), row["volume"] if row else "",
                            qty, price, amount])
     ws.append([])
     ws.append(["", "ИТОГО по прайсу", "", "", "", grand])

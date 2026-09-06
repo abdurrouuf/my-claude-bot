@@ -112,7 +112,11 @@ STAFF = {
     6525019701: {"name": "Азамат",     "warehouse": "Манас",   "access": []},
 }
 
-anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY)
+# Таймаут явный (ревизия 06.09.2026): по умолчанию у клиента 600 с и два
+# повтора — зависший запрос держал бы ВСЕХ (обновления обрабатываются
+# последовательно). Фото/длинные списки укладываются в 120 с.
+anthropic_client = AsyncAnthropic(api_key=ANTHROPIC_API_KEY,
+                                  timeout=120.0, max_retries=1)
 
 chat_histories = {}
 HISTORY_LIMIT = 10  # история пересылается с каждым запросом — короче = дешевле
@@ -327,7 +331,7 @@ def _persist_pending(token: str):
     try:
         db.pending_save(token, blob, time.time() + left)
     except Exception as e:
-        log.warning("Не удалось сохранить заявку %s: %s", token, e)
+        log.warning("Не удалось сохранить заявку (kind=%s): %s", p.get("kind"), e)
 
 
 def _restore_pending(token: str):
@@ -484,6 +488,23 @@ async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Список команд — в /start.")
     try:
         await msg.reply_text(text)
+    except Exception:
+        pass
+
+
+async def on_error(update, context):
+    """Необработанная ошибка хендлера (ревизия 06.09.2026): раньше PTB
+    только писал в лог, а пользователь видел молчание — «бот сломался».
+    В личке — короткий ответ, в группе — тишина."""
+    log.error("Ошибка в обработчике: %s", context.error, exc_info=context.error)
+    try:
+        chat = getattr(update, "effective_chat", None)
+        msg = getattr(update, "effective_message", None)
+        if chat is not None and chat.type == "private" and msg is not None:
+            await msg.reply_text(
+                "⚠️ Что-то пошло не так, команда не выполнена. Повторите "
+                "через минуту; если повторится — покажите Джарвису: "
+                f"{type(context.error).__name__}")
     except Exception:
         pass
 
@@ -1070,7 +1091,7 @@ def extract_action(reply: str):
 # Цены Anthropic, $ за миллион токенов: (вход, выход).
 # Кэш: чтение = 10% от входа, запись часового кэша = 200% от входа.
 MODEL_PRICES_USD = {
-    "claude-sonnet-5": (2.0, 10.0),    # акция до 31.08.2026, потом (3.0, 15.0)
+    "claude-sonnet-5": (2.0, 10.0),    # сверено со справочником 06.09.2026
     "claude-sonnet-4-5": (3.0, 15.0),
     "claude-haiku-4-5": (1.0, 5.0),
     "claude-opus-4-5": (5.0, 25.0),
@@ -1357,11 +1378,11 @@ def invoice_summary(p) -> str:
 def _debt_suffix(new_debt: float) -> str:
     """Хвост сводки операции: долг клиента после неё — виден сразу в ленте,
     уведомлении админу и /log (просьба владельца 08.08.2026)."""
-    if new_debt > 0:
+    if new_debt >= 0.5:
         return f", долг: {fmt_num(new_debt)} сом"
-    if new_debt < 0:
+    if new_debt <= -0.5:
         return f", переплата: {fmt_num(-new_debt)} сом"
-    return ", долг погашен"
+    return ", долг погашен"   # копеечный хвост от дробной цены — погашен
 
 
 def commit_invoice(p, replace_op_id=None):
@@ -1519,6 +1540,15 @@ async def _route_invoice_admin(message, context, p, requester,
         await message.reply_text(note, parse_mode="HTML")
 
 
+def _client_btn(actor, wh_id, c) -> str:
+    """Подпись кнопки «Возможно, вы имели в виду». Долг показываем только
+    тем, кому долги этого склада видны (/hidedebts, /showdebt) — ревизия
+    06.09.2026: по частям имён кнопки выдавали долги чужих клиентов."""
+    if _debts_hidden_from(actor, wh_id) and c["id"] not in open_debt_client_ids():
+        return f"👤 {c['name']}"
+    return f"👤 {c['name']} (долг {fmt_num(c['debt'])})"
+
+
 async def start_invoice(update, context, actor, data, draft=False):
     wh, err = resolve_warehouse(actor, str(data.get("warehouse") or "").strip())
     if err:
@@ -1572,7 +1602,14 @@ async def start_invoice(update, context, actor, data, draft=False):
     if draft:
         c = db.client_exact(wh["id"], client_name)
         old_debt = c["debt"] if c else parsed_debt
-        if c:
+        if c and _debts_hidden_from(actor, wh["id"]) \
+                and c["id"] not in open_debt_client_ids():
+            # Ревизия 06.09.2026: черновик сотрудника по скрытому складу
+            # показывал «Старый долг» клиента (обход /hidedebts).
+            old_debt = 0
+        if c and not (not is_admin(actor) and c["id"] in admin_only_client_ids()):
+            # Спеццены клиентов админа (/myclients — индивидуальные скидки)
+            # сотруднику в черновик не подставляем.
             apply_client_prices({"client_id": c["id"], "items": items})
         total = sum(it["qty"] * it["price"] for it in items)
         p = {"items": items, "payment": payment, "wh_name": wh["name"]}
@@ -1635,7 +1672,7 @@ async def start_invoice(update, context, actor, data, draft=False):
     rows = []
     for c in candidates:
         rows.append([InlineKeyboardButton(
-            f"👤 {c['name']} (долг {fmt_num(c['debt'])})",
+            _client_btn(actor, wh["id"], c),
             callback_data=f"pk:{token}:{c['id']}")])
     rows.append([InlineKeyboardButton(f"➕ Новый клиент: {client_name[:30]}",
                                       callback_data=f"nw:{token}")])
@@ -2599,8 +2636,11 @@ async def send_return_pdf(context, chat_id, client_label, p, old_debt, total):
     pdf = generate_pdf_invoice(
         client_label, p["items"], total, warehouse_name=p["wh_name"],
         doc_title="ВОЗВРАТ ТОВАРА", total_label="Сумма возврата",
-        extra_totals=[("Долг до возврата", old_debt),
-                      ("Долг после возврата", max(old_debt - total, 0))])
+        extra_totals=[("Долг до возврата", old_debt)]
+        + ([("Долг после возврата", old_debt - total)]
+           if old_debt - total >= 0 else
+           [("Долг после возврата", 0),
+            ("Переплата клиента", total - old_debt)]))
     date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
     filename = f"возврат_{safe_filename(client_label)}_{date_str}.pdf"
     await context.bot.send_document(
@@ -2679,7 +2719,7 @@ async def start_return(update, context, actor, data):
             f"Возврат возможен только от существующего клиента.", parse_mode="HTML")
         return
     token = new_pending(payload)
-    rows = [[InlineKeyboardButton(f"👤 {c['name']} (долг {fmt_num(c['debt'])})",
+    rows = [[InlineKeyboardButton(_client_btn(actor, wh["id"], c),
                                   callback_data=f"pk:{token}:{c['id']}")]
             for c in candidates]
     rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
@@ -2787,7 +2827,23 @@ def _name_traceable(src_text: str, name: str) -> bool:
     parts = [w for w in re.findall(r"[^\W\d_]+", str(name).lower()) if len(w) >= 3]
     if not parts or not words:
         return True                       # сверять нечего — не мешаем работать
-    return any(_word_alike(w, part) for part in parts for w in words)
+    # Совпадение только по «общему» слову (город, байке, уулу, ит базар)
+    # именем не считается: «Асан Токмок» не прослеживает «Динислам Токмок»
+    # (ревизия 06.09.2026). Если имя целиком из общих слов — как раньше.
+    own = [pt for pt in parts if pt not in GENERIC_NAME_WORDS] or parts
+    return any(_word_alike(w, part) for part in own for w in words)
+
+
+# Слова, которые встречаются в именах многих клиентов и сами по себе
+# клиента не определяют (города, обращения): по ним имя не «прослеживается».
+GENERIC_NAME_WORDS = {
+    "бишкек", "каракол", "карабалта", "кара", "балта", "манас", "токмок",
+    "ош", "талас", "нарын", "джалал", "абад", "кант", "сокулук", "беловодское",
+    "беловодск", "ананьево", "чолпон", "ата", "балыкчы", "кочкор", "тюп",
+    "кемин", "иссык", "куль", "кербен", "баткен", "узген", "кара-балта",
+    "байке", "уулу", "кызы", "эже", "апа", "агай", "эжей", "ит", "базар",
+    "магазин", "аптека", "ветаптека", "ферма", "ип", "осоо",
+}
 
 
 def _word_alike(w: str, part: str) -> bool:
@@ -2950,7 +3006,7 @@ async def start_payment(update, context, actor, data):
             parse_mode="HTML")
         return
     token = new_pending(payload)
-    rows = [[InlineKeyboardButton(f"👤 {c['name']} (долг {fmt_num(c['debt'])})",
+    rows = [[InlineKeyboardButton(_client_btn(actor, wh["id"], c),
                                   callback_data=f"pk:{token}:{c['id']}")]
             for c in candidates]
     rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
@@ -2986,7 +3042,12 @@ def _wrong_expiry_warnings(p):
     (expiry_asked) не проверяем — товар на источнике лежит без срока,
     это штатный путь."""
     out = []
-    src_wh = p.get("from_wh_id")
+    # Списание (06.09.2026): тот же класс ошибки — явный срок, которого нет
+    # на складе, создавал партию-призрак молча.
+    if p.get("kind") == "writeoff":
+        src_wh, src_name = p.get("wh_id"), p.get("wh_name")
+    else:
+        src_wh, src_name = p.get("from_wh_id"), p.get("from_wh_name")
     if not src_wh:
         return out
     for it in p["items"]:
@@ -3001,12 +3062,12 @@ def _wrong_expiry_warnings(p):
                            for b in batches) or "партий нет"
         if bq <= 0:
             out.append(f"{it['name']} {it['volume']}: на складе "
-                       f"«{p['from_wh_name']}» НЕТ партии со сроком {exp}. "
+                       f"«{src_name}» НЕТ партии со сроком {exp}. "
                        f"Партии сейчас: {listed}. Проверьте срок — похоже "
                        f"на опечатку!")
         else:
             out.append(f"{it['name']} {it['volume']}: в партии {exp} на "
-                       f"складе «{p['from_wh_name']}» только {bq} шт из "
+                       f"складе «{src_name}» только {bq} шт из "
                        f"{it['qty']} — остальное уйдёт минусом. Партии "
                        f"сейчас: {listed}.")
     return out
@@ -3154,6 +3215,14 @@ async def start_transfer(update, context, actor, data):
             "⛔ Приход товара извне может внести только админ или старший.\n"
             "Если вам нужен товар с другого склада — напишите перемещение: "
             "«с Бишкека на Каракол: ...» — заявка уйдёт админу на подтверждение.")
+        return
+    # Ревизия 06.09.2026: старший вносил приход на ЛЮБОЙ склад, даже без
+    # доступа к нему. Приход извне — только на свой операбельный склад.
+    if from_wh is None and not is_admin(actor) \
+            and not db.can_use_warehouse(actor, to_wh["id"]):
+        await update.message.reply_text(
+            f"⛔ Приход извне на склад «{esc(to_wh['name'])}» вам недоступен — "
+            f"только на свой склад.", parse_mode="HTML")
         return
     try:
         items, warnings = parse_items(data.get("items") or [])
@@ -3677,6 +3746,10 @@ async def start_fix_expiry(update, context, actor, data):
         await update.message.reply_text(
             "Не понял новый (правильный) срок — напишите в формате 06.2029.")
         return
+    if isinstance(data.get("qty"), str):
+        # «5 шт» строкой — иначе int() падал и молча переносилась ВСЯ партия
+        digits = re.sub(r"[^\d]", "", data["qty"])
+        data["qty"] = int(digits) if digits else None
     if old_exp == new_exp:
         await update.message.reply_text("Старый и новый срок совпадают — исправлять нечего.")
         return
@@ -4062,6 +4135,8 @@ def writeoff_summary(p) -> str:
                          f"{smap.get(pid, 0)} шт — остаток уйдёт в минус")
     for w in p.get("warnings", []):
         lines.append(f"⚠️ {esc(w)}")
+    for w in _wrong_expiry_warnings(p):
+        lines.append(f"⚠️ {esc(w)}")
     lines += box_lines(p["items"])
     lines.append("")
     lines.append("Списать этот товар со склада?")
@@ -4251,6 +4326,11 @@ async def minstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group:
+        if whs_group:
+            await _minstock_report(update, whs_group, actor, {})
+        return
     arg = " ".join(context.args).strip() if context.args else ""
     if arg and arg.lower() not in ("all", "все", "всё"):
         # Отчёт, а не операция: хватает права просмотра (/watch у снабженца)
@@ -4341,7 +4421,9 @@ def _parse_split(text: str):
     """«150 до 01.2028, 100 до 04.2028» / «100 04.28; 50 без срока» ->
     [(срок, шт), ...]; непонятно — None. Порядок «срок шт» тоже годится."""
     out = []
-    for part in re.split(r"[,;\n]+", text or ""):
+    if re.search(r"\bкор", text or "", re.IGNORECASE):
+        return None   # коробки — только штуками, иначе сумма не сойдётся
+    for part in re.split(r"[,;\n]+|\s+и\s+", text or ""):
         part = part.strip()
         if not part:
             continue
@@ -4463,7 +4545,7 @@ async def _ask_expiry(q, context, p, question, chat_id, user_id):
     # Один вопрос о сроке за раз: второй вопрос затирал бы первый, и ответ
     # молча уходил бы не в ту операцию (находка ревизии 01.08.2026).
     for k in keys:
-        old = AWAIT_EXPIRY.get(k)
+        old = AWAIT_EXPIRY.get(k) or AWAIT_SPLIT.get(k)
         if old and get_pending(old) is not None:
             token = new_pending(p, ttl=p.get("ttl", PENDING_TTL))
             await q.edit_message_text(
@@ -4707,6 +4789,7 @@ async def _finish_invoice(q, context, actor, p):
         existing = db.client_exact(p["wh_id"], p.get("client_name") or "")
         if existing is not None:
             p["client_id"] = existing["id"]
+            apply_client_prices(p)   # спеццены появившегося клиента (06.09.2026)
     op_id, client_label, old_debt, total, summary = commit_invoice(p)
     # Операция УЖЕ в базе — любые сбои дальше (Telegram, PDF) не должны
     # выглядеть как «не проведено», иначе сотрудник повторит накладную
@@ -4837,6 +4920,11 @@ async def _finish_writeoff(q, context, actor, p):
     if minus:
         warn = ("\n\n⚠️ Остаток изменился со времени заявки — уйдёт в минус:\n• "
                 + "\n• ".join(minus) + "\nЕсли это неверно — отмените: /undo")
+    bad_exp = _wrong_expiry_warnings(p)
+    if bad_exp:
+        warn += ("\n\n⚠️ Срок не совпадает с партиями склада:\n• "
+                 + "\n• ".join(bad_exp)
+                 + "\nЕсли срок ошибочный — «исправь срок ...» или /undo")
     _fill_src_batches(p)
     op_id, summary, total = commit_writeoff(p)
     # Операция уже в базе — сбои уведомлений не должны выглядеть как
@@ -5429,6 +5517,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                                  "writeoff"):
             await q.answer()
             return
+        key0 = (q.message.chat.id, q.from_user.id)
+        for store, what in ((AWAIT_EXPIRY, "сроке годности"),
+                            (AWAIT_SPLIT, "разделении по партиям")):
+            old = store.get(key0)
+            if old and old != token and get_pending(old) is not None:
+                # Один текстовый вопрос за раз (ревизия 06.09.2026): иначе
+                # ответ о сроке съедался бы ожиданием разделения.
+                await q.answer(f"Сначала ответьте на вопрос о {what} выше "
+                               f"(или нажмите там «Отмена»).", show_alert=True)
+                return
         PENDING.pop(token, None)
         await q.answer()
         try:
@@ -5448,15 +5546,20 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"{n} {('до ' + b['expiry']) if b['expiry'] else 'без срока'}"
             for n, b in zip((item["qty"] - item["qty"] // 2, item["qty"] // 2),
                             batches[:2]))
-        await q.edit_message_text(
-            f"✏️ <b>{esc(item['name'])} {esc(item['volume'])} — {item['qty']} шт</b>\n"
-            f"Партии на складе:\n{listed}\n\n"
-            f"Напишите ответным сообщением, сколько штук из какой партии — "
-            f"например:\n<b>{esc(example)}</b>\n"
-            f"Сумма должна быть ровно {item['qty']} шт.",
-            parse_mode="HTML",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token2}")]]))
+        try:
+            await q.edit_message_text(
+                f"✏️ <b>{esc(item['name'])} {esc(item['volume'])} — {item['qty']} шт</b>\n"
+                f"Партии на складе:\n{listed}\n\n"
+                f"Напишите ответным сообщением, сколько штук из какой партии — "
+                f"например:\n<b>{esc(example)}</b>\n"
+                f"Сумма должна быть ровно {item['qty']} шт.",
+                parse_mode="HTML",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token2}")]]))
+        except Exception:
+            log.exception("Не удалось показать вопрос о разделении партий")
+            AWAIT_SPLIT.pop((q.message.chat.id, q.from_user.id), None)
+            PENDING.pop(token2, None)
         return
 
     if kind == "pbat":  # выбор партии (срока годности) для позиции накладной
@@ -5868,7 +5971,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     await notify_admin(context, actor,
                                        f"отменил операцию №{p['op_id']}: {msg}")
                     cancelled = db.get_operation(p["op_id"])
-                    if cancelled:
+                    # Ревизия 06.09.2026: сторно накладной/прихода АДМИНА по
+                    # складу со скрытыми долгами тоже не идёт в ленту — сводка
+                    # содержит сумму и долг клиента (_debt_suffix), а сама
+                    # операция в чат не попадала (_feed_muted).
+                    if cancelled and not _feed_muted_op(
+                            cancelled["type"], cancelled["user_id"],
+                            cancelled["warehouse_id"]):
                         await post_feed(
                             context, db.operation_warehouses(cancelled),
                             f"↩️ <b>{esc(actor['name'])}</b> отменил операцию "
@@ -5898,8 +6007,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         "⚠️ Партия уже пуста — переносить нечего "
                         "(остаток менялся, пока заявка ждала).")
                     return
-                if p.get("qty") is not None and 0 < have < qty:
-                    qty = have  # партию успели частично распродать
+                if p.get("qty") is not None and (have < 0 or 0 < have < qty):
+                    # Партию успели распродать (или увести в минус) — минус
+                    # переносится только целиком, частичный перенос
+                    # углублял бы призрак (ревизия 06.09.2026).
+                    qty = have
                 old_label = p["old_expiry"] or "без срока"
                 short = str(p["name"]).split("(")[0].strip()
                 summary = (f"Исправление срока: {short} {p['volume']} — "
@@ -5973,6 +6085,8 @@ async def split_reply(update, context, text: str) -> bool:
         await update.message.reply_text("⌛ Заявка устарела — отправьте операцию заново.")
         return True
     rows = _parse_split(text)
+    if not rows and AWAIT_EXPIRY.get(key) and EXPIRY_REPLY_RE.match(text or ""):
+        return False   # это ответ о сроке годности — его ждёт expiry_reply
     batches = {b["expiry"]: b["qty"] for b in db.product_batches_of(
         _batch_src_wh(p), it.get("product_id") or 0)}
     problem = None
@@ -6134,7 +6248,7 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
 WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory", "writeoff",
                      "amend_invoice", "replace_invoice", "set_min", "set_phone",
-                     "set_price", "client_alias"}
+                     "set_price", "client_alias", "fix_expiry"}
 
 
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False,
@@ -6700,6 +6814,8 @@ def _looks_like_operation(text: str) -> bool:
     words = set(re.findall(r"[а-яёa-z]+", t))
     for p in prices.PRICE_LIST_DATA:
         w = p["name"].split()[0].split("-")[0].lower()
+        if w == "топ":
+            continue   # «топ 5 клиентов» — не ТОП-СУПЕРВИТ (ревизия 06.09.2026)
         if (w in t if len(w) >= 5 else w in words):
             return True
     for name in known_clients_cached(300):
@@ -7756,7 +7872,13 @@ async def payment_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Неверная сумма. Пример: /payment Асан 5000")
         return
     name = " ".join(args[:-1])
-    await start_payment(update, context, actor, {"client": name, "amount": amount})
+    # Через общий диспетчер (ревизия 06.09.2026): подстановка склада чата и
+    # вопрос «на каком складе?» многоскладовому сотруднику — как у фразы.
+    await dispatch_action(
+        update, context, actor,
+        json.dumps({"action": "payment", "client": name, "amount": amount,
+                    "warehouse": None}, ensure_ascii=False),
+        src_text=name)
 
 
 PERIODS = {
@@ -7970,7 +8092,9 @@ async def _admin_full_summary(bot, whs):
     скрыта от общего чата (просьба владельца 30.08.2026: «в общий чат —
     без моих денег, а мне в личку все данные»). Прятать было нечего —
     сообщения нет: в чате и так полная картина."""
-    full = report_data(whs, 0)
+    # hidden_n считается только при hide_admin=True (ревизия 06.09.2026:
+    # полная версия сравнивалась сама с собой и никогда не отправлялась).
+    full = report_data(whs, 0, hide_admin=True)
     if not any(d.get("hidden_n") for d in full):
         return
     pdf, caption = build_report_pdf(whs, 0, "за день")
@@ -8007,12 +8131,16 @@ async def send_evening_summaries(bot):
         # В общий чат — без накладных и приходов самого админа по складу
         # со скрытыми долгами (просьба владельца 30.08.2026); полную
         # версию он получает в личку ниже.
-        pdf, caption = build_report_pdf(whs, 0, "за день", hide_admin=True)
-        tail = report_data(whs, 0, start_dt=yesterday_cut, end_dt=midnight,
-                           hide_admin=True)
-        # Полная версия (со своими операциями) — админу в личку, если по
-        # складам чата что-то пряталось.
-        await _admin_full_summary(bot, whs)
+        try:
+            pdf, caption = build_report_pdf(whs, 0, "за день", hide_admin=True)
+            tail = report_data(whs, 0, start_dt=yesterday_cut, end_dt=midnight,
+                               hide_admin=True)
+            # Полная версия (со своими операциями) — админу в личку, если по
+            # складам чата что-то пряталось.
+            await _admin_full_summary(bot, whs)
+        except Exception:
+            log.exception("Сводка для чата %s не собралась", chat_id)
+            continue
         tail_lines = []
         for d in tail:
             if d.get("empty"):
@@ -8470,15 +8598,23 @@ def sales_by_warehouse(days: int) -> dict:
     """Продажи за период по журналу: {wh_id: {product_id: продано_шт}}."""
     sold = {}
     for op in db.operations_since(_cutoff_iso(days)):
-        if op["type"] != "invoice":
+        if op["type"] not in ("invoice", "return") or op["status"] != "done":
             continue
         try:
             data = json.loads(op["data"])
         except (ValueError, TypeError):
             continue
         for wh_id, pid, delta in data.get("stock_deltas", []):
-            if delta < 0:
+            # Продажа — минус на складе; возврат (плюс) вычитается из продаж
+            # (ревизия 06.09.2026: продано 10 и возвращено 10 = 0 продаж).
+            if op["type"] == "invoice" and delta < 0:
                 sold.setdefault(wh_id, {})[pid] = sold.get(wh_id, {}).get(pid, 0) - delta
+            elif op["type"] == "return" and delta > 0:
+                sold.setdefault(wh_id, {})[pid] = sold.get(wh_id, {}).get(pid, 0) - delta
+    for wh_id in list(sold):
+        sold[wh_id] = {pid: q for pid, q in sold[wh_id].items() if q > 0}
+        if not sold[wh_id]:
+            del sold[wh_id]
     return sold
 
 
@@ -8691,6 +8827,11 @@ async def deadstock_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         else:
             wh_words.append(word)
     arg = " ".join(wh_words)
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group:
+        if whs_group:
+            await _deadstock_report(update, whs_group, actor, {"days": days})
+        return
     if arg and arg.lower() not in ("all", "все", "всё"):
         # Отчёт, а не операция: хватает права просмотра (/watch у снабженца)
         wh = db.warehouse_by_name(arg)
@@ -8734,7 +8875,10 @@ async def forecast_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             wh_words.append(w)
     arg = " ".join(wh_words).strip()
     if in_group:
-        whs = whs_group
+        # В чате склада — остатки других складов не светим
+        # (ревизия 06.09.2026): колонка «Есть на складах» только по чату.
+        await _forecast_report(update, whs_group, horizon, actor, whs_group)
+        return
     elif arg and arg.lower() != "all":
         wh = db.warehouse_by_name(arg)
         if wh is None or not db.can_view_warehouse(actor, wh["id"]):
@@ -8774,9 +8918,10 @@ def _forecast_other_whs(actor):
     return [w for w in db.visible_warehouses(actor) if not is_training_wh(w)]
 
 
-async def _forecast_report(update, whs, horizon=None, actor=None):
-    report = build_forecast_report(
-        whs, horizon, None if actor is None else _forecast_other_whs(actor))
+async def _forecast_report(update, whs, horizon=None, actor=None, others=None):
+    if others is None and actor is not None:
+        others = _forecast_other_whs(actor)
+    report = build_forecast_report(whs, horizon, others)
     if report is None:
         await update.message.reply_text(
             f"✅ Ничего не заканчивается: всех продаваемых товаров хватит более чем на "
@@ -9392,6 +9537,7 @@ async def daily_backup_loop(app):
                     f"backup:{datetime.now(BISHKEK).date().isoformat()}"):
                 continue
             await send_backup(app.bot)
+            db.pending_cleanup(time.time())   # протухшие снимки заявок
         except Exception:
             log.exception("Ошибка ежедневного бэкапа")
 
@@ -9603,9 +9749,13 @@ async def buylog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pid = p["id"]
                 break
         if pid is None:
+            first = arg.split()[0].lower()
+            vols = [p2["volume"] for p2 in prices.PRICE_LIST_DATA
+                    if p2["name"].split()[0].lower() == first]
+            hint = (f" Фасовки этого товара: {', '.join(vols)}." if vols else "")
             await update.message.reply_text(
-                f"Не нашёл товар «{esc(arg)}» в прайсе. Напишите название и "
-                "фасовку — например: /buylog Дексатоп 50 мл\n"
+                f"Не нашёл товар «{esc(arg)}» в прайсе.{esc(hint)} Напишите "
+                "название и фасовку — например: /buylog Дексатоп 50 мл\n"
                 "Или /buylog без аргументов — сводка по всем.",
                 parse_mode="HTML")
             return
@@ -10672,6 +10822,16 @@ async def undo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if len(minus) > 8:
             shown += f"\n… и ещё {len(minus) - 8} поз."
         warn = f"\n\n⚠️ <b>После отмены остатки уйдут в минус:</b>\n{shown}"
+    try:
+        replaced = json.loads(op["data"]).get("replaces")
+    except (ValueError, TypeError):
+        replaced = None
+    if replaced:
+        # Ревизия 06.09.2026: отмена ЗАМЕНЫ не воскрешает старую накладную
+        warn += (f"\n\n⚠️ Это замена накладной №{replaced}. Отмена снимет "
+                 f"новую накладную ЦЕЛИКОМ, старая №{replaced} НЕ вернётся "
+                 f"(она остаётся отменённой). Если нужно вернуть прежний "
+                 f"состав — напишите «замени накладную №{op['id']}: …».")
     payload = {"kind": "undo_op", "user_id": actor["id"],
                "chat_id": update.effective_chat.id, "op_id": op["id"]}
     token = new_pending(payload)
@@ -11949,5 +12109,6 @@ if __name__ == "__main__":
     app.add_handler(MessageHandler(
         filters.Document.ALL & filters.UpdateType.MESSAGE, handle_db_file))
     app.add_handler(MessageHandler(filters.StatusUpdate.MIGRATE, on_chat_migrated))
+    app.add_error_handler(on_error)
     print("Бот запущен...")
     app.run_polling(stop_signals=None)
