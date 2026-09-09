@@ -3,6 +3,7 @@ import asyncio
 import difflib
 import html
 import json
+import math
 import logging
 import os
 import re
@@ -6995,6 +6996,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Спеццены: «цена для Асана: Альтопен 100мл 85» (убрать: цена 0)",
             "Общий прайс: «новая цена Альтопен 100мл 95» · /pricelog — история",
             "/abc — АВС-анализ: топ товаров и клиентов (можно: /abc неделя)",
+            "/order — заявка поставщику: что и сколько заказать на 90 дней "
+            "(можно: /order 120, /order Бишкек 60)",
             "Справочник клиентов: «добавь клиентов на Каракол: Асан, Болот...» "
             "(можно голосом или фото списка; с долгами: «Асан — 31470»)",
             "/fullmode — какие склады в полном учёте (включить: /fullmode Каракол)",
@@ -8688,6 +8691,12 @@ FORECAST_HORIZON = 30
 # Секция «нет в наличии»: нулевой товар показываем, только если он
 # продавался за это окно (05.09.2026) — иначе список нулей бесконечен.
 FORECAST_EMPTY_WINDOW = 60
+# Заявка поставщику (/order, 09.09.2026 — «1» владельца из предложенного):
+# скорость продаж считаем за 60 дней (закупка едет месяцами — двухнедельное
+# окно прогноза для заказа слишком дёрганое), заказываем на ORDER_HORIZON
+# дней вперёд; своё число — в команде: /order 120, /order Бишкек 60.
+ORDER_WINDOW = 60
+ORDER_HORIZON = 90
 
 
 def _others_stock_text(wh_id, pid, other_whs, other_maps) -> str:
@@ -9503,6 +9512,127 @@ async def send_forecast_alert(bot):
             caption=("📦 Еженедельный прогноз снабжения\n" + caption)[:1000])
     except Exception as e:
         log.warning("Не удалось отправить еженедельный прогноз: %s", e)
+
+
+def build_order_report(warehouses, horizon=None):
+    """Заявка поставщику PDF-файлом: чего и сколько заказать, чтобы
+    хватило на horizon дней по скорости продаж последних ORDER_WINDOW дней.
+    Остатки и продажи выбранных складов СКЛАДЫВАЮТСЯ (завод один на всех):
+    заказ = скорость × горизонт − остаток, округлённый вверх до целых
+    коробок (box из прайса), сумма — по закупу в сомах (buy_som_map,
+    секрет владельца). Товар с нулевым остатком без продаж за окно не
+    показывается. None — заказывать нечего.
+    Возвращает (pdf, подпись-итог)."""
+    horizon = horizon or ORDER_HORIZON
+    sold_all = sales_by_warehouse(ORDER_WINDOW)
+    stock_total, sold_total = {}, {}
+    for wh in warehouses:
+        for pid, q in db.stock_map(wh["id"]).items():
+            stock_total[pid] = stock_total.get(pid, 0) + q
+        for pid, q in sold_all.get(wh["id"], {}).items():
+            sold_total[pid] = sold_total.get(pid, 0) + q
+    bmap = buy_som_map()
+    rows = []
+    for p in prices.PRICE_LIST_DATA:
+        sold = sold_total.get(p["id"], 0)
+        if sold <= 0:
+            continue
+        have = max(stock_total.get(p["id"], 0), 0)   # минус — ошибка учёта, не запас
+        per_day = sold / ORDER_WINDOW
+        need = per_day * horizon - have
+        if need <= 0:
+            continue
+        box = p.get("box") or 0
+        if box:
+            boxes = int(math.ceil(need / box))
+            order_qty = boxes * box
+        else:
+            boxes, order_qty = None, int(math.ceil(need))
+        days_left = have / per_day if per_day else 0
+        cost = bmap.get(p["id"])
+        rows.append((days_left, p, have, sold, order_qty, boxes, cost))
+    if not rows:
+        return None
+    out, n_boxes, total_cost, no_buy = [], 0, 0.0, 0
+    for days_left, p, have, sold, order_qty, boxes, cost in sorted(rows, key=lambda r: r[0]):
+        label = p["name"].split("(")[0].strip()
+        if cost is None:
+            no_buy += 1
+            cost_txt = "—"
+        else:
+            total_cost += cost * order_qty
+            cost_txt = fmt_num(cost * order_qty)
+        n_boxes += boxes or 0
+        out.append([label, p["volume"], f"{fmt_num(have)} шт",
+                    f"{fmt_num(sold)} шт", f"≈{int(days_left)} дн.",
+                    f"{fmt_num(order_qty)} шт" + (f" ({boxes} кор)" if boxes else ""),
+                    cost_txt])
+    names = ", ".join(f"«{w['name']}»" for w in warehouses)
+    footer = (f"Позиций: {len(out)} · коробок: {n_boxes} · закуп ≈ "
+              f"{money(total_cost)}")
+    if no_buy:
+        footer += f" (без закупочной цены: {no_buy} поз.)"
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ЗАЯВКА ПОСТАВЩИКУ",
+        f"ОсОО «ВЕТОП» · чтобы хватило на {horizon} дн. (по продажам "
+        f"последних {ORDER_WINDOW} дн., округлено до целых коробок) · "
+        f"на {date_str}",
+        [{"title": f"Склады: {names}",
+          "headers": ["Товар", "Фасовка", "Остаток", f"Продано за {ORDER_WINDOW} дн.",
+                      "Хватит на", "Заказать", "Закуп, сом"],
+          "rows": out, "widths": [36, 20, 19, 22, 17, 28, 17],
+          "numbered": True, "footer": footer}])
+    return pdf, (f"📦 Заявка поставщику на {horizon} дн. ({names}): "
+                 f"{len(out)} поз., {n_boxes} кор., закуп ≈ {money(total_cost)}"
+                 + (f"; без закупочной цены: {no_buy} поз." if no_buy else "")
+                 + f"\nДругой горизонт: /order {horizon * 2}. "
+                 "Что и где лежит: /forecast.")
+
+
+async def order_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/order [Склад|all] [дней] — заявка поставщику (только админ, личка:
+    в ней закупочные цены)."""
+    actor = await _require_admin(update)
+    if actor is None:
+        return
+    if not await _require_private(update):
+        return
+    horizon, wh_words = None, []
+    for w in (context.args or []):
+        if w.isdigit():
+            horizon = max(7, min(365, int(w)))
+        else:
+            wh_words.append(w)
+    arg = " ".join(wh_words).strip()
+    params = {"horizon": horizon}
+    if arg and arg.lower() != "all":
+        wh = db.warehouse_by_name(arg)
+        if wh is None:
+            await update.message.reply_text(f"Склад «{esc(arg)}» не найден.",
+                                            parse_mode="HTML")
+            return
+        whs = [wh]
+    else:
+        whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)]
+        if not arg and await _maybe_ask_warehouse(update, actor, "order", params):
+            return
+    await _order_report(update, whs, actor, params)
+
+
+async def _order_report(update, whs, actor, params):
+    horizon = params.get("horizon") or ORDER_HORIZON
+    report = build_order_report(whs, horizon)
+    if report is None:
+        await update.message.reply_text(
+            f"✅ Заказывать нечего: по продажам последних {ORDER_WINDOW} дн. "
+            f"всего хватит более чем на {horizon} дней.")
+        return
+    pdf, caption = report
+    date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=f"заявка_поставщику_{date_str}.pdf"),
+        caption=caption[:1000])
 
 
 async def send_backup(bot):
@@ -11925,6 +12055,14 @@ def _register_report_picks():
             "emoji": "💰", "question": "Наличие с ценами какого склада показать?",
             "whs": lambda a: db.visible_warehouses(a),
             "render": _instock_report},
+        "order": {
+            "emoji": "📦",
+            "question": "Заявку поставщику по какому складу собрать? "
+                        "(«Все сразу» — остатки и продажи складываются)",
+            "admin_only": True,
+            "whs": lambda a: [w for w in db.visible_warehouses(a)
+                              if not is_training_wh(w)],
+            "render": _order_report},
         "money": {
             "emoji": "💵",
             "question": "Сколько денег в каком складе показать?",
@@ -12048,6 +12186,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("sales", sales_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))
     app.add_handler(CommandHandler("forecast", forecast_cmd))
+    app.add_handler(CommandHandler("order", order_cmd))
     app.add_handler(CommandHandler("client", client_cmd))
     app.add_handler(CommandHandler("act", act_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
