@@ -7751,6 +7751,9 @@ async def invoices_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 for j, it in enumerate(data.get("items", []), 1)]
             amount = data.get("total") or 0
             paid = data.get("payment") or 0
+            if paid and not is_admin(actor) and _feed_muted_op(
+                    "invoice", op["user_id"], wh["id"]):
+                paid = 0   # деньги, принятые админом по скрытому складу (09.09.2026)
             total_sum += amount
             total_paid += paid
             try:
@@ -7898,6 +7901,8 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
     last_hours — скользящее окно «последние N часов»;
     start_dt/end_dt — явные границы (для «хвоста» вчерашнего вечера
     в календарной сводке дня, решение владельца 08.08.2026);
+    hide_admin="money" — личный отчёт сотрудника: накладные админа видны,
+    спрятаны только принятые им деньги (решение владельца 09.09.2026).
     hide_admin — отчёт идёт В ОБЩИЙ ЧАТ: накладные и приходы денег самого
     админа по складу со скрытыми долгами в суммы не входят (просьба
     владельца 30.08.2026, см. _feed_muted_op). В личке отчёт полный."""
@@ -7923,9 +7928,21 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
                 data = json.loads(op["data"])
             except (ValueError, TypeError):
                 continue
-            if hide_admin and _feed_muted_op(op["type"], op["user_id"], wh["id"]):
+            muted = hide_admin and _feed_muted_op(op["type"], op["user_id"], wh["id"])
+            if muted and hide_admin != "money":
                 hidden_n += 1
                 continue
+            if muted:
+                # Режим «только деньги» (решение владельца 09.09.2026 для
+                # личных отчётов сотрудников): накладные админа видны,
+                # прячутся лишь принятые им деньги — отдельные приходы и
+                # оплата при накладной.
+                if op["type"] == "payment":
+                    hidden_n += 1
+                    continue
+                if data.get("payment"):
+                    hidden_n += 1
+                    data = dict(data, _hide_pay=True)
             if op["type"] == "invoice" and op["warehouse_id"] == wh["id"]:
                 inv_data.append(data)
             elif op["type"] == "payment" and op["warehouse_id"] == wh["id"]:
@@ -7944,6 +7961,9 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
                 transfers += 1
         sales = sum(d.get("total", 0) for d in inv_data)
         inv_payments = sum(d.get("payment", 0) for d in inv_data)
+        # Деньги к показу — без спрятанных оплат админа (режим «money»)
+        shown_payments = sum(d.get("payment", 0) for d in inv_data
+                             if not d.get("_hide_pay"))
         top = {}
         for d in inv_data:
             for it in d.get("items", []):
@@ -7955,7 +7975,7 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
             hand_list.append((u["name"] if u else str(uid), amt))
         out.append({
             "wh": wh, "n_inv": len(inv_data), "sales": sales,
-            "money": inv_payments + pay_sum, "debt_added": sales - inv_payments,
+            "money": shown_payments + pay_sum, "debt_added": sales - inv_payments,
             "ret_count": ret_count, "ret_sum": ret_sum, "transfers": transfers,
             "wo_count": wo_count, "wo_sum": wo_sum,
             "hand_sum": hand_sum, "hand_list": hand_list,
@@ -7998,12 +8018,22 @@ async def report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         whs = db.visible_warehouses(actor)
         if not in_group and await _maybe_ask_warehouse(
                 update, actor, "report",
-                {"days_back": days_back, "label": label}):
+                {"days_back": days_back, "label": label,
+                 "hide_admin": _report_hide_mode(actor, in_group)}):
             return
     await _report_render(update, whs, actor,
                          {"days_back": days_back, "label": label,
-                          # В группе — без операций админа по скрытому складу
-                          "hide_admin": in_group})
+                          "hide_admin": _report_hide_mode(actor, in_group)})
+
+
+def _report_hide_mode(actor, in_group: bool):
+    """Что прятать в /report: в группе — операции админа по скрытому складу
+    целиком (30.08.2026); сотруднику в личке — только принятые админом
+    деньги (решение владельца 09.09.2026: «скрыть деньги только»);
+    админу — ничего."""
+    if in_group:
+        return True
+    return False if is_admin(actor) else "money"
 
 
 async def _report_render(update, whs, actor, params):

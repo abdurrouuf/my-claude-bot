@@ -2447,9 +2447,24 @@ def test_feed_summary_hides_admin_money():
     db.commit_operation(ADMIN, "handover", wh["id"], None, "сдача",
                         [], [], {"amount": 5000})
     assert bot.report_data([wh], 0, hide_admin=True)[0]["hand_sum"] == 5000
+    # Режим «только деньги» (решение владельца 09.09.2026 для личных
+    # отчётов сотрудников): накладные админа видны, его деньги — нет.
+    _invoice(wh, ADMIN, "Клиент админа", [_item(16, 5, 200)], payment=700,
+             client_id=ca)
+    money_only = bot.report_data([wh], 0, hide_admin="money")[0]
+    assert money_only["sales"] == 3400            # все накладные, и админа
+    assert money_only["money"] == 8000            # без 300'000 и без 700
+    assert money_only["debt_added"] == 3400 - 700  # долг считается честно
+    assert money_only["hidden_n"] == 2            # приход + оплата при накладной
+    assert bot.report_data([wh], 0)[0]["money"] == 308700
+    # /report: сотруднику в личке — «money», админу — ничего, в группе — всё
+    assert bot._report_hide_mode(db.get_user(DANIYAR), False) == "money"
+    assert bot._report_hide_mode(db.get_user(ADMIN), False) is False
+    assert bot._report_hide_mode(db.get_user(DANIYAR), True) is True
     # Долги склада НЕ скрыты — прятать нечего, чат видит всё
     db.set_setting("hidden_debt_whs", json.dumps([]))
-    assert bot.report_data([wh], 0, hide_admin=True)[0]["money"] == 308000
+    assert bot.report_data([wh], 0, hide_admin=True)[0]["money"] == 308700
+    assert bot.report_data([wh], 0, hide_admin="money")[0]["money"] == 308700
 
 
 def test_draft_never_becomes_transfer():
