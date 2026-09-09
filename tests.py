@@ -2969,6 +2969,77 @@ def test_revision_060926():
     db.set_feed_chat(wh["id"], None)
 
 
+def test_order_report():
+    """/order — заявка поставщику (09.09.2026, «1» владельца): остатки и
+    продажи выбранных складов складываются, заказ = скорость × горизонт −
+    остаток, округлён вверх до целых коробок, сумма по закупу в сомах."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    m = db.warehouse_by_name("Манас")
+    assert bot.build_order_report([wh, m]) is None          # продаж нет
+    _load(wh, {16: 60, 5: 200})
+    _invoice(wh, ADMIN, "Тест", [_item(16, 55, 180), _item(5, 180, 100)])
+    _load(m, {16: 120})
+    _invoice(m, ADMIN, "Тест2", [_item(16, 20, 180)])
+    # №16: остаток 5+100=105, продано 75 за 60 дн. → 1.25/дн × 90 = 112.5 −
+    # 105 = 7.5 → одна коробка (box из прайса); №5: 20 шт, продано 180 →
+    # 270 − 20 = 250 → вверх до целых коробок
+    captured = {}
+    orig = bot.generate_report_pdf
+
+    def spy(title, subtitle, sections, *a, **k):
+        captured["rows"] = sections[0]["rows"]
+        captured["title"] = title
+        return orig(title, subtitle, sections, *a, **k)
+    bot.generate_report_pdf = spy
+    try:
+        pdf, cap = bot.build_order_report([wh, m])
+    finally:
+        bot.generate_report_pdf = orig
+    assert pdf.getvalue()[:4] == b"%PDF" and captured["title"] == "ЗАЯВКА ПОСТАВЩИКУ"
+    rows = {r[0]: r for r in captured["rows"]}
+    box16 = prices.BY_ID[16]["box"]
+    r16 = rows[prices.BY_ID[16]["name"].split("(")[0].strip()]
+    assert r16[2] == "105 шт" and r16[3] == "75 шт"
+    assert r16[5] == f"{box16} шт (1 кор)", r16
+    box5 = prices.BY_ID[5]["box"]
+    import math
+    want5 = math.ceil(250 / box5) * box5
+    r5 = rows[prices.BY_ID[5]["name"].split("(")[0].strip()]
+    assert r5[5].startswith(f"{bot.fmt_num(want5)} шт"), r5
+    assert "2 поз." in cap and "закуп" in cap
+    # Самый срочный — первым (меньше дней остатка)
+    assert captured["rows"][0][0] == r5[0]
+    # Горизонт числом: на 7 дней №16 хватает (105 шт при 1.25/дн) — не в заявке
+    pdf7, cap7 = bot.build_order_report([wh, m], 7)
+    assert "1 поз." in cap7 and "на 7 дн." in cap7
+    # Команда: только админ, только личка; число в аргументах — горизонт
+    replies = []
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                          effective_chat=SimpleNamespace(id=DANIYAR, type="private"),
+                          message=SimpleNamespace(reply_text=_areply(replies)))
+    asyncio.run(bot.order_cmd(upd, SimpleNamespace(args=[])))
+    assert replies and "админ" in replies[-1].lower()
+    seen = {}
+    orig_r = bot._order_report
+
+    async def spy_r(update, whs, actor, params):
+        seen["whs"] = [w["name"] for w in whs]; seen["params"] = params
+    bot._order_report = spy_r
+    upd_a = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                            effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                            message=SimpleNamespace(reply_text=_areply(replies)))
+    try:
+        asyncio.run(bot.order_cmd(upd_a, SimpleNamespace(args=["Манас", "120"])))
+        assert seen["whs"] == ["Манас"] and seen["params"]["horizon"] == 120
+        asyncio.run(bot.order_cmd(upd_a, SimpleNamespace(args=["all"])))
+        assert len(seen["whs"]) >= 4 and seen["params"]["horizon"] is None
+    finally:
+        bot._order_report = orig_r
+    assert "order" in bot.REPORT_PICKS and bot.REPORT_PICKS["order"]["admin_only"]
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)
