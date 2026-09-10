@@ -5638,9 +5638,16 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                         parse_mode="HTML")
                     await notify_admin(context, actor, summary)
                     if not _feed_muted(p["user_id"], p["wh_id"]):
-                        await feed_operation(context, op_id,
-                                             db.get_user(p["user_id"])["name"], "💵",
-                                             exclude_chat_id=p["chat_id"])
+                        # В ленту — полная квитанция, как при оплате прямо
+                        # в чате склада (просьба владельца 10.09.2026:
+                        # «хочу приход, как у Виктории»), а не одна строка.
+                        who = db.get_user(p["user_id"])["name"]
+                        await post_feed(
+                            context, [p["wh_id"]],
+                            f"💵 <b>{esc(who)}</b> — оплата проведена "
+                            f"(операция №{op_id}).\n\n"
+                            + payment_receipt(client_label, old_debt, p["amount"]),
+                            exclude_chat_id=p["chat_id"])
                 except Exception:
                     log.exception("Оплата №%s проведена, уведомления не дошли", op_id)
                     try:

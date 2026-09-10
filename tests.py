@@ -3075,6 +3075,36 @@ def test_double_tap_keeps_result():
     assert edits and "устарела" in edits[-1]
 
 
+def test_payment_feed_full_receipt():
+    """10.09.2026 («хочу приход, как у Виктории»): оплата, проведённая в
+    личке, уходит в ленту склада ПОЛНОЙ квитанцией (ПРИХОД — ВЕТОП, долг,
+    оплата, остаток), а не одной строкой."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], [("Вика Уманец", 6420)])
+    c = db.client_exact(wh["id"], "Вика Уманец")
+    db.set_feed_chat(wh["id"], -555, "чат Каракола")
+    p = {"kind": "payment", "user_id": DANIYAR, "chat_id": DANIYAR,
+         "wh_id": wh["id"], "wh_name": wh["name"], "client_name": "Вика Уманец",
+         "client_id": c["id"], "amount": 6420}
+    token = bot.new_pending(p)
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+    answers, edits = [], []
+    upd = _cb_update(DANIYAR, f"ok:{token}", answers, edits)
+    upd.callback_query.message.reply_markup = SimpleNamespace(inline_keyboard=[[1]])
+    asyncio.run(bot.on_callback(upd, SimpleNamespace(bot=FakeBot())))
+    assert edits and "Оплата проведена" in edits[-1]
+    feed = [t for cid, t in sent if cid == -555]
+    assert feed and "ПРИХОД — ВЕТОП" in feed[0] and "Данияр" in feed[0]
+    assert "Долг полностью погашен" in feed[0]
+    assert db.client_get(c["id"])["debt"] == 0
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)
