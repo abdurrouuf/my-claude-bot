@@ -5084,6 +5084,15 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     p = get_pending(token)
     if p is None:
+        # Двойное касание «Провести» (10.09.2026, приход за Беку): первое
+        # нажатие провело операцию и заменило карточку на «✅ проведено»,
+        # второе перезаписывало результат на «устарела» — владелец решил бы,
+        # что операция не прошла, и повторил бы её. Если кнопок у сообщения
+        # уже нет — результат на месте, только всплывашка без правки текста.
+        msg = q.message
+        if msg is not None and not getattr(msg, "reply_markup", None):
+            await q.answer("Уже обработано — смотрите текст выше.", show_alert=True)
+            return
         await q.answer("Заявка устарела")
         try:
             await q.edit_message_text("⌛ Заявка устарела или уже обработана. Отправьте сообщение заново.")
