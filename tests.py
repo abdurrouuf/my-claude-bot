@@ -3055,6 +3055,26 @@ def test_order_report():
     assert "order" in bot.REPORT_PICKS and bot.REPORT_PICKS["order"]["admin_only"]
 
 
+def test_double_tap_keeps_result():
+    """10.09.2026: второе касание «Провести» по уже проведённой заявке не
+    должно перезаписывать «✅ проведено» на «устарела» (владелец решил бы,
+    что приход не прошёл, и повторил бы его). Кнопок нет — только
+    всплывашка; кнопки ещё есть (заявка реально протухла) — как раньше."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    answers, edits = [], []
+    upd = _cb_update(ADMIN, "ok:deadbeef0001", answers, edits)
+    upd.callback_query.message.reply_markup = None          # результат уже на месте
+    asyncio.run(bot.on_callback(upd, SimpleNamespace(bot=None)))
+    assert edits == [] and answers and "Уже обработано" in answers[-1]
+    answers.clear(); edits.clear()
+    upd2 = _cb_update(ADMIN, "ok:deadbeef0002", answers, edits)
+    upd2.callback_query.message.reply_markup = SimpleNamespace(inline_keyboard=[[1]])
+    asyncio.run(bot.on_callback(upd2, SimpleNamespace(bot=None)))
+    assert edits and "устарела" in edits[-1]
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)
