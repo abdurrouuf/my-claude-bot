@@ -3194,6 +3194,69 @@ def test_unit_question_boxes_or_pieces():
     bot.PENDING.clear()
 
 
+def test_transfer_with_client_name_becomes_invoice():
+    """11.09.2026: «Дадажанов / Фахриддин / Празимектоп 500 мл - 6 к …» (имя
+    в две строки) модель отдала как ПРИХОД товара на Бишкек. Страховка:
+    приход извне с именем клиента в шапке проводится как накладная; явные
+    слова прихода или имя сотрудника в начале — верим модели."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {78: 500})
+    db.clients_add_bulk(wh["id"], [("Дадажанов Фахридин", 1000)])
+    admin = db.get_user(ADMIN)
+    items = [{"name": "АЛБЕНИВЕР (альбен, ивермек суспензия)", "volume": "500 мл",
+              "qty": 120, "box_qty": 6, "price": 580, "expiry": "01.2029"}]
+    text = "Дадажанов\n\nФахриддин\n\nАлбенивер 500 мл - 6 к (01/29)"
+    data = {"action": "transfer", "from_warehouse": None, "to_warehouse": "Каракол",
+            "items": items, "_src_text": text, "_last_text": text}
+    c, cwh = bot._transfer_client_guard(admin, data)
+    assert c is not None and c["name"] == "Дадажанов Фахридин" and cwh["id"] == wh["id"]
+    # явные слова прихода / имя сотрудника — приход остаётся приходом
+    for t in ("Приход товара: Албенивер 500 мл - 6 к (01/29)",
+              "на склад Каракол: Албенивер 500 мл 6 к",
+              "Данияру: Албенивер 500 мл 6 к",
+              "с Бишкека на Каракол: Албенивер 500 мл 6 к"):
+        d = dict(data, _src_text=t, _last_text=t)
+        assert bot._transfer_client_guard(admin, d) == (None, None), t
+    # незнакомое имя в шапке — тоже не трогаем
+    t = "Поставщик Иванов\nАлбенивер 500 мл 6 к"
+    assert bot._transfer_client_guard(admin, dict(data, _src_text=t, _last_text=t)) == (None, None)
+    # Полный путь: dispatch_data → предупреждение + карточка НАКЛАДНОЙ
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append(t)
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=Msg())
+    bot.PENDING.clear()
+    asyncio.run(bot.dispatch_data(upd, SimpleNamespace(bot=None), admin, dict(data)))
+    assert any("НАКЛАДНУЮ" in r for r in replies), replies
+    kinds = [v.get("kind") for v in bot.PENDING.values()]
+    assert kinds == ["invoice"], kinds
+    p = list(bot.PENDING.values())[0]
+    assert p["client_name"] == "Дадажанов Фахридин" and p["items"][0]["qty"] == 120
+    bot.PENDING.clear()
+
+
+def test_extract_action_lenient():
+    """11.09.2026: заказ из шести строк получал «список слишком длинный» —
+    JSON модели не разбирался. Огрехи (комментарии //, запятая перед },
+    None/True по-питоньи, ```-ограды) теперь прощаются."""
+    good = bot.extract_action('{"action": "invoice", "client": "Асан", "items": []}')
+    assert good and good["client"] == "Асан"
+    r = ('```json\n{"action": "invoice", "client": "Асан", "payment": None, '
+         '"items": [{"name": "АЛБЕНИВЕР", "qty": 120, // 6 к\n "box_qty": 6,},],}\n```')
+    d = bot.extract_action(r)
+    assert d and d["action"] == "invoice" and d["items"][0]["qty"] == 120 \
+        and d["payment"] is None, d
+    assert bot.extract_action("просто текст без json") is None
+    assert bot.extract_action('{"action": "invoice", "items": [') is None   # обрыв
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)
