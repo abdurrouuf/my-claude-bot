@@ -1074,8 +1074,7 @@ def system_blocks(actor, draft=False) -> list:
     ]
 
 
-def extract_action(reply: str):
-    """Достаёт из ответа модели первый JSON-объект с полем action."""
+def _extract_action_strict(reply: str):
     decoder = json.JSONDecoder()
     i = reply.find("{")
     while i != -1:
@@ -1087,6 +1086,28 @@ def extract_action(reply: str):
             pass
         i = reply.find("{", i + 1)
     return None
+
+
+def _json_lenient(reply: str) -> str:
+    """Типичные огрехи модели, из-за которых JSON не разбирался и заказ
+    из шести строк получал ответ «список слишком длинный» (11.09.2026):
+    комментарии // после значений, запятая перед } или ], None/True/False
+    по-питоньи, ```-ограды."""
+    t = reply.replace("```json", " ").replace("```", " ")
+    t = re.sub(r"//[^\n\"]*", "", t)
+    t = re.sub(r",\s*([}\]])", r"\1", t)
+    t = re.sub(r"\bNone\b", "null", t)
+    t = re.sub(r"\bTrue\b", "true", t)
+    t = re.sub(r"\bFalse\b", "false", t)
+    return t
+
+
+def extract_action(reply: str):
+    """Достаёт из ответа модели первый JSON-объект с полем action."""
+    obj = _extract_action_strict(reply)
+    if obj is None and "{" in reply:
+        obj = _extract_action_strict(_json_lenient(reply))
+    return obj
 
 
 # Цены Anthropic, $ за миллион токенов: (вход, выход).
@@ -6520,11 +6541,18 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
             # Модель начала выдавать JSON операции, но он не разобрался —
             # обычно ответ обрезан по лимиту токенов (очень длинный список).
             # Сырой JSON пользователю не показываем.
-            log.warning("JSON операции не разобрался (обрезан?): %.500s", reply)
-            await update.message.reply_text(
-                "⚠️ Список получился слишком длинным — ответ оборвался, и я "
-                "не смог его разобрать. Разбейте список на 2–3 части и "
-                "отправьте по очереди, пожалуйста.")
+            log.warning("JSON операции не разобрался: %.800s", reply)
+            if reply.rstrip().endswith("}"):
+                # Ответ целый, но кривой — это не длина, повтор обычно помогает
+                await update.message.reply_text(
+                    "⚠️ Не смог разобрать ответ по этому сообщению. Отправьте "
+                    "его ещё раз, пожалуйста (если повторится — разбейте "
+                    "список на части).")
+            else:
+                await update.message.reply_text(
+                    "⚠️ Список получился слишком длинным — ответ оборвался, и я "
+                    "не смог его разобрать. Разбейте список на 2–3 части и "
+                    "отправьте по очереди, пожалуйста.")
             return
         # Отвечаем и в чате склада: сюда доходят только сообщения, похожие
         # на операцию (бесплатный фильтр), и ответ модели — обычно уточняющий
@@ -6577,6 +6605,51 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
 # просим уточнить. «черновик» пишут, когда учёт вести НЕ надо.
 
 
+# Приход товара извне, в шапке которого стоит имя КЛИЕНТА, — почти
+# наверняка накладная, которую модель перепутала (11.09.2026: «Дадажанов
+# / Фахриддин / Празимектоп 500 мл - 6 к …» — имя в две строки — стало
+# «Приход товара на склад Бишкек»; нажми владелец «Провести», товар
+# прибавился бы вместо списания). Явные слова прихода/перемещения или
+# имя сотрудника в начале — верим модели.
+_TRANSFER_WORDS_RE = re.compile(
+    r"приход|привез|пополн|поставк|завод|контейнер|перемест|перемещ|"
+    r"на\s+склад|со\s+склада|с\s+склада|со\s+склад|отправ|досла|дошл",
+    re.IGNORECASE)
+
+
+def _transfer_client_guard(actor, data: dict):
+    """(клиент, склад), если «приход извне» на самом деле накладная
+    клиенту, иначе (None, None)."""
+    if data.get("action") != "transfer" or data.get("from_warehouse"):
+        return None, None
+    text = str(data.get("_last_text") or data.get("_src_text") or "").strip()
+    if not text or _TRANSFER_WORDS_RE.search(text):
+        return None, None
+    head_words = [w for w in re.findall(r"[^\W\d_]+", text.lower())][:3]
+    try:
+        staff = [str(u["name"]).lower() for u in db.list_users()]
+    except Exception:
+        staff = []
+    if any(_word_alike(w, s) for w in head_words for s in staff if len(w) >= 3):
+        return None, None
+    # Шапка — строки до первой строки с цифрой (там начинаются товары)
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+    header = []
+    for ln in lines:
+        if re.search(r"\d", ln):
+            break
+        header.append(ln)
+    if not header and lines:
+        header = [re.split(r"[,:;—–-]", lines[0])[0]]
+    hint = _text_name_hint(" ".join(header))
+    if len(hint) < 3:
+        return None, None
+    client, wh = _client_by_text(actor, hint)
+    if client is None or not _name_covered(hint, client["name"]):
+        return None, None
+    return client, wh
+
+
 async def dispatch_data(update, context, actor, data, reply="", draft=False):
     action = data.get("action")
     if draft and action in ("transfer", "writeoff", "inventory", "return"):
@@ -6588,6 +6661,21 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             "имя клиента, например:\n<b>Черновик. Клиент: Аза Манас шаары "
             "(Бека)</b>\nЭнротоп 10 мл — 3 к\n…", parse_mode="HTML")
         return
+    if action == "transfer":
+        client, cwh = _transfer_client_guard(actor, data)
+        if client is not None:
+            log.warning("Приход извне с именем клиента «%s» — провожу как накладную",
+                        client["name"])
+            data = dict(data, action="invoice", client=client["name"],
+                        warehouse=cwh["name"], debt=0, payment=0, phone=None)
+            data.pop("from_warehouse", None)
+            data.pop("to_warehouse", None)
+            action = "invoice"
+            await update.message.reply_text(
+                f"⚠️ В начале сообщения — имя клиента «{esc(client['name'])}» "
+                f"(склад «{esc(cwh['name'])}»), поэтому понимаю это как "
+                f"НАКЛАДНУЮ, а не приход товара. Если это всё же приход — "
+                f"напишите «приход товара: …».", parse_mode="HTML")
     # Количество без единицы у «коробочного» товара («Албенивер 500 мл - 6»)
     # — спрашиваем кнопками, коробок это или штук (11.09.2026). После
     # ответа заявка возвращается сюда с флагом _units_ok.
