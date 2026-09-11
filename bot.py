@@ -1188,6 +1188,171 @@ def parse_items(raw_items: list):
     return items, warnings
 
 
+# ---------- «6 — это коробок или штук?» (11.09.2026, просьба владельца) ----------
+# Инцидент: «Албенивер 500 мл - 6 (01/29)» — единица не написана, модель
+# приняла 6 ШТУК, а сотрудник имел в виду 6 коробок (120 шт). Для товара,
+# который ходит коробками, бот теперь переспрашивает кнопками ДО карточки
+# подтверждения. Проверка бесплатная: числа-количества ищутся в тексте
+# самого сообщения, не через ИИ.
+
+UNIT_CHECK_ACTIONS = ("invoice", "amend_invoice", "replace_invoice",
+                      "transfer", "return", "writeoff")
+
+# Число и слово сразу за ним («6 к», «35 шт», «500 мл», «6 (01/29)» → «6», «»).
+# Числа, приклеенные к точке/дроби/апострофу/двоеточию — сроки (06/29,
+# 12.2027), суммы (13'550), время — не количества.
+_QTY_TOKEN_RE = re.compile(
+    r"(?<!\d)(?<!\d[.,/:'’])(?<![+])(\d+)(?!\d)(?![.,/:'’]\d)\s*([a-zа-яё%]*)",
+    re.IGNORECASE)
+_VOL_UNITS = ("мл", "л", "г", "гр", "кг", "мг", "мкг", "таб", "табл", "%",
+              "ml", "l", "g", "kg", "mg", "мл.", "литр", "литра", "литров",
+              "грамм", "грам", "кило")
+_PIECE_UNIT_PREFIXES = ("шт", "фл", "уп", "бут", "пач", "амп", "банк", "пак",
+                        "шприц", "доз", "ед", "pc", "пуз")
+_BOX_UNIT_PREFIXES = ("кор", "короб", "кароб", "box", "ящ")
+_MONEY_WORDS = ("приход", "оплата", "оплатил", "оплатила", "заплатил",
+                "заплатила", "долг", "сдал", "сдала", "сом", "сомов", "по",
+                "цена", "скидка", "аванс", "наличными", "нал", "тел",
+                "телефон", "курс", "за", "минус", "плюс", "№", "n")
+
+
+def _qty_tokens(text: str):
+    """Числа-количества в тексте по группам: голые (без единицы), штуки,
+    коробки. Возвращает три словаря число → сколько раз встретилось."""
+    bare, pieces, boxes = {}, {}, {}
+    low = str(text or "").lower()
+    for m in _QTY_TOKEN_RE.finditer(low):
+        num, unit = m.group(1), m.group(2)
+        if len(num) >= 5:
+            continue                      # телефон, сумма — не количество
+        n = int(num)
+        before = low[:m.start()].rstrip()
+        prev = re.split(r"[\s,;:()\-—–]+", before)[-1] if before else ""
+        if prev in _MONEY_WORDS or unit in ("сом", "с", "сома", "сомов"):
+            continue
+        if unit in _VOL_UNITS or unit == "%":
+            continue
+        if unit == "к" or unit.startswith(_BOX_UNIT_PREFIXES):
+            boxes[n] = boxes.get(n, 0) + 1
+        elif unit and unit.startswith(_PIECE_UNIT_PREFIXES):
+            pieces[n] = pieces.get(n, 0) + 1
+        else:
+            bare[n] = bare.get(n, 0) + 1
+    return bare, pieces, boxes
+
+
+def _unit_questions(data: dict) -> list:
+    """Позиции, у которых количество написано БЕЗ единицы («6»), а товар
+    ходит коробками (box > 1 в прайсе) — по ним надо переспросить.
+
+    Смотрим только на последнее сообщение человека (в личке _src_text —
+    склейка трёх реплик, там числа из прошлых операций); если в нём
+    количеств нет вовсе (позиции были в предыдущей реплике) — по склейке.
+    Каждое число текста «расходуется» одной позицией: «Празимектоп 500 мл
+    6 к, Албенивер 500 мл 6» — первая забирает «6 к», вторая — голую «6».
+    Возвращает [{"i": индекс, "n": число из текста, "box": шт в коробке,
+    "name", "volume"}].
+    """
+    items = data.get("items") or []
+    texts = [str(data.get("_last_text") or "")]
+    src = str(data.get("_src_text") or "")
+    if src and src != texts[0]:
+        texts.append(src)
+    for text in texts:
+        if not text.strip():
+            continue
+        bare, pieces, boxes = _qty_tokens(text)
+        out, found = [], False
+        for i, it in enumerate(items):
+            if not isinstance(it, dict):
+                continue
+            try:
+                qty = int(float(it.get("qty")))
+            except (TypeError, ValueError):
+                continue
+            try:
+                bq = int(it.get("box_qty") or 0)
+            except (TypeError, ValueError):
+                bq = 0
+            product = prices.match_product(str(it.get("name") or ""),
+                                           str(it.get("volume") or ""))
+            try:
+                box = int(product["box"]) if product else 0
+            except (TypeError, ValueError, KeyError):
+                box = 0
+            n = bq if bq > 0 else qty
+            ask = False
+            if bq > 0 and boxes.get(n, 0) > 0:
+                boxes[n] -= 1
+                found = True                  # «6 к» → коробки, всё честно
+            elif bq == 0 and pieces.get(n, 0) > 0:
+                pieces[n] -= 1
+                found = True                  # «6 шт» — штуки, вопросов нет
+            elif bare.get(n, 0) > 0:
+                bare[n] -= 1
+                found, ask = True, True       # голое число
+            elif bq == 0 and boxes.get(n, 0) > 0:
+                boxes[n] -= 1                 # в тексте «6 к», модель дала 6 шт
+                found, ask = True, True
+            if ask and box > 1:
+                out.append({"i": i, "n": n, "box": box,
+                            "name": str(it.get("name") or ""),
+                            "volume": str(it.get("volume") or "")})
+        if found:
+            return out
+    return []
+
+
+def _unit_question(p: dict):
+    """Текст и кнопки вопроса «коробок или штук?» по текущей позиции заявки."""
+    qs, pos = p["qs"], int(p.get("pos", 0))
+    qi = qs[pos]
+    product = prices.match_product(qi["name"], qi["volume"])
+    title = (f"{prices._base_name(product['name']).upper()} {product['volume']}"
+             if product else f"{qi['name']} {qi['volume']}")
+    n, box = qi["n"], qi["box"]
+    head = "❓ Уточните количество"
+    if len(qs) > 1:
+        head += f" ({pos + 1} из {len(qs)})"
+    text = (f"{head}:\n<b>{esc(title)} — {n}</b>\n"
+            f"Это коробок или штук? В коробке {box} шт: "
+            f"{n} кор = {n * box} шт.")
+    token = p["_token"]
+    kb = [[InlineKeyboardButton(f"📦 {n} коробок ({n * box} шт)",
+                                callback_data=f"pu:{token}:b"),
+           InlineKeyboardButton(f"🔢 {n} штук", callback_data=f"pu:{token}:p")]]
+    left = len(qs) - pos
+    if left > 1:
+        kb.append([InlineKeyboardButton(f"📦 Все {left} — коробками",
+                                        callback_data=f"pu:{token}:B"),
+                   InlineKeyboardButton("🔢 Все — штуками",
+                                        callback_data=f"pu:{token}:P")])
+    kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
+    return text, InlineKeyboardMarkup(kb)
+
+
+async def _ask_units(update, actor, data: dict, qs: list, draft: bool):
+    payload = {"kind": "pick_unit", "user_id": actor["id"],
+               "chat_id": update.effective_chat.id,
+               "action_data": data, "draft": draft, "qs": qs, "pos": 0}
+    token = new_pending(payload)
+    payload["_token"] = token
+    _persist_pending(token)
+    text, kb = _unit_question(payload)
+    await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
+
+
+def _apply_unit_choice(items: list, qi: dict, as_box: bool):
+    it = items[qi["i"]]
+    if as_box:
+        it["qty"] = qi["n"] * qi["box"]
+        it["box_qty"] = qi["n"]
+    else:
+        it["qty"] = qi["n"]
+        it["box_qty"] = None
+    qi["as_box"] = as_box
+
+
 def box_prefix(it) -> str:
     """«N кор / » перед количеством позиции — только для целых коробок."""
     boxes = prices.whole_boxes(it.get("product_id"), it.get("qty"))
@@ -5183,6 +5348,65 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             draft=p.get("draft", False))
         return
 
+    if kind == "pu":  # «коробок или штук?» — ответ по позиции (11.09.2026)
+        if p.get("kind") != "pick_unit":
+            await q.answer()
+            return
+        choice = parts[2] if len(parts) > 2 else ""
+        qs, pos = p["qs"], int(p.get("pos", 0))
+        data = p["action_data"]
+        items = data.get("items") or []
+        try:
+            if choice in ("B", "P"):
+                for qi in qs[pos:]:
+                    _apply_unit_choice(items, qi, choice == "B")
+                pos = len(qs)
+            elif choice in ("b", "p") and pos < len(qs):
+                _apply_unit_choice(items, qs[pos], choice == "b")
+                pos += 1
+            else:
+                await q.answer()
+                return
+        except (IndexError, KeyError, TypeError):
+            PENDING.pop(token, None)
+            await q.answer()
+            await q.edit_message_text("⚠️ Заявка повреждена — отправьте сообщение заново.")
+            return
+        p["pos"] = pos
+        if pos < len(qs):
+            p["_token"] = token
+            _persist_pending(token)
+            await q.answer()
+            text, kb = _unit_question(p)
+            await q.edit_message_text(text, parse_mode="HTML", reply_markup=kb)
+            return
+        PENDING.pop(token, None)
+        await q.answer()
+        data["_units_ok"] = True
+        lines = []
+        for qi in qs:
+            product = prices.match_product(qi["name"], qi["volume"])
+            title = (f"{prices._base_name(product['name']).upper()} {product['volume']}"
+                     if product else f"{qi['name']} {qi['volume']}")
+            if qi.get("as_box"):
+                lines.append(f"📦 {esc(title)}: {qi['n']} кор = {qi['n'] * qi['box']} шт")
+            else:
+                lines.append(f"🔢 {esc(title)}: {qi['n']} шт")
+        try:
+            await q.edit_message_text("✅ Количество уточнено:\n" + "\n".join(lines),
+                                      parse_mode="HTML")
+        except Exception:
+            pass
+        owner_row = db.get_user(p["user_id"])
+        if owner_row is None or not owner_row["active"]:
+            return
+        shim = SimpleNamespace(message=q.message,
+                               effective_chat=q.message.chat,
+                               effective_user=q.from_user)
+        await dispatch_data(shim, context, owner_row, data,
+                            draft=p.get("draft", False))
+        return
+
     if kind == "ps":  # выбран склад для отчёта об остатках
         if p.get("kind") != "pick_stock":
             await q.answer()
@@ -6259,7 +6483,7 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
     else:
         src_text = text
     await dispatch_action(update, context, actor, reply, draft, quiet=quiet,
-                          src_text=src_text)
+                          src_text=src_text, last_text=text)
 
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.
@@ -6269,13 +6493,16 @@ WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory", "writeoff",
 
 
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False,
-                          src_text=""):
+                          src_text="", last_text=None):
     data = extract_action(reply)
     if data is not None:
         # Исходный текст сообщения едет вместе с действием: по нему проверяем,
         # что модель не подменила имя клиента (_name_traceable). Переживает и
         # кнопку выбора склада — pick_wh хранит action_data целиком.
+        # _last_text — ТОЛЬКО последнее сообщение (для вопроса «коробок или
+        # штук?»: в склейке трёх реплик числа прошлых операций).
         data["_src_text"] = str(src_text or "")
+        data["_last_text"] = str(src_text if last_text is None else last_text)
         # «Проведи за Данияра: Валя приход 1490» — операция от имени сотрудника:
         # запишется на него в журнал, деньги лягут в ЕГО кассу. Только админ.
         as_emp = str(data.pop("as_employee", "") or "").strip()
@@ -6361,6 +6588,18 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             "имя клиента, например:\n<b>Черновик. Клиент: Аза Манас шаары "
             "(Бека)</b>\nЭнротоп 10 мл — 3 к\n…", parse_mode="HTML")
         return
+    # Количество без единицы у «коробочного» товара («Албенивер 500 мл - 6»)
+    # — спрашиваем кнопками, коробок это или штук (11.09.2026). После
+    # ответа заявка возвращается сюда с флагом _units_ok.
+    if action in UNIT_CHECK_ACTIONS and not data.get("_units_ok"):
+        try:
+            qs = _unit_questions(data)
+        except Exception:
+            log.exception("Проверка единиц количества не удалась")
+            qs = []
+        if qs:
+            await _ask_units(update, actor, data, qs, draft)
+            return
     try:
         if action == "invoice":
             await start_invoice(update, context, actor, data, draft=draft)

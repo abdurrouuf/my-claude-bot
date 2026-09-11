@@ -3105,6 +3105,95 @@ def test_payment_feed_full_receipt():
     assert db.client_get(c["id"])["debt"] == 0
 
 
+def test_unit_question_boxes_or_pieces():
+    """11.09.2026, просьба владельца: «Албенивер 500 мл - 6 (01/29)» —
+    единица не написана, бот молча принимал 6 ШТУК (а это 6 коробок = 120).
+    Теперь для «коробочного» товара с голым числом бот спрашивает кнопками
+    «коробок или штук?» ДО карточки; ответ продолжает операцию."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {78: 500, 77: 500, 76: 500})          # Албенивер 500/200/100 мл
+    db.clients_add_bulk(wh["id"], [("Дадажанов Фахридин", 1000)])
+    admin = db.get_user(ADMIN)
+    text = ("Дадажанов Фахридин\nАлбенивер 100 мл - 2 к (05/28)\n"
+            "Албенивер 500 мл - 6 (01/29)\nАлбенивер 200 мл - 6 (05/28)")
+    items = [{"name": "АЛБЕНИВЕР (альбен, ивермек суспензия)", "volume": "100 мл",
+              "qty": 160, "box_qty": 2, "price": 140},
+             {"name": "АЛБЕНИВЕР (альбен, ивермек суспензия)", "volume": "500 мл",
+              "qty": 6, "box_qty": None, "price": 580},
+             {"name": "АЛБЕНИВЕР (альбен, ивермек суспензия)", "volume": "200 мл",
+              "qty": 6, "box_qty": None, "price": 260}]
+    # 1. Разбор текста: «2 к» — коробки (вопроса нет), две голые «6» — вопрос
+    qs = bot._unit_questions({"items": items, "_last_text": text, "_src_text": text})
+    assert [q["i"] for q in qs] == [1, 2] and qs[0]["box"] == 20 and qs[1]["box"] == 50
+    # «6 шт» и «6 к» — вопросов нет; фото (текста нет) — тоже
+    t2 = text.replace("6 (01/29)", "6 шт (01/29)").replace("6 (05/28)", "6 к (05/28)")
+    it2 = [dict(i) for i in items]
+    it2[2].update(qty=300, box_qty=6)
+    assert bot._unit_questions({"items": it2, "_last_text": t2, "_src_text": t2}) == []
+    assert bot._unit_questions({"items": items, "_last_text": "", "_src_text": ""}) == []
+    # Товар без коробки в прайсе / число из прошлой реплики — не спрашиваем
+    t3 = "Асан, Дексатоп 50мл 10 шт, приход 6"
+    assert bot._unit_questions({"items": items[1:2], "_last_text": t3, "_src_text": t3}) == []
+
+    # 2. Полный путь: dispatch_data → вопрос кнопками → ответ → карточка
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append((t, kw.get("reply_markup")))
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=Msg())
+    data = {"action": "invoice", "client": "Дадажанов Фахридин",
+            "warehouse": "Каракол", "debt": 0, "payment": 0, "phone": None,
+            "items": [dict(i) for i in items], "_src_text": text, "_last_text": text}
+    asyncio.run(bot.dispatch_data(upd, SimpleNamespace(bot=None), admin, data))
+    assert replies and "коробок или штук" in replies[-1][0] and "1 из 2" in replies[-1][0]
+    assert "6 кор = 120 шт" in replies[-1][0]
+    token = [k for k, v in bot.PENDING.items() if v.get("kind") == "pick_unit"][0]
+    assert not [k for k, v in bot.PENDING.items() if v.get("kind") == "invoice"]
+    # первая позиция — коробками; вопрос переходит ко второй
+    answers, edits = [], []
+    u = _cb_update(ADMIN, f"pu:{token}:b", answers, edits)
+    u.callback_query.message.reply_text = Msg().reply_text
+    asyncio.run(bot.on_callback(u, SimpleNamespace(bot=None)))
+    assert edits and "2 из 2" in edits[-1] and token in bot.PENDING
+    # вторая — штуками; заявка снимается, идёт карточка накладной
+    replies.clear()
+    u = _cb_update(ADMIN, f"pu:{token}:p", answers, edits)
+    u.callback_query.message.reply_text = Msg().reply_text
+    asyncio.run(bot.on_callback(u, SimpleNamespace(bot=None)))
+    assert "Количество уточнено" in edits[-1] and "6 кор = 120 шт" in edits[-1]
+    assert token not in bot.PENDING
+    card = [k for k, v in bot.PENDING.items() if v.get("kind") == "invoice"]
+    assert card, "карточка накладной после ответа не появилась"
+    p = bot.PENDING[card[0]]
+    qtys = {(it["volume"]): it["qty"] for it in p["items"]}
+    assert qtys == {"100 мл": 160, "500 мл": 120, "200 мл": 6}, qtys
+    assert replies and "120" in replies[-1][0]
+    # Повторный проход с флагом _units_ok вопросов не задаёт
+    bot.PENDING.pop(card[0], None)
+
+    # 3. «Все — коробками» одним нажатием
+    replies.clear()
+    data2 = {"action": "invoice", "client": "Дадажанов Фахридин",
+             "warehouse": "Каракол", "debt": 0, "payment": 0, "phone": None,
+             "items": [dict(i) for i in items], "_src_text": text, "_last_text": text}
+    asyncio.run(bot.dispatch_data(upd, SimpleNamespace(bot=None), admin, data2))
+    token = [k for k, v in bot.PENDING.items() if v.get("kind") == "pick_unit"][0]
+    assert "Все 2 — коробками" in str(replies[-1][1].inline_keyboard)
+    u = _cb_update(ADMIN, f"pu:{token}:B", answers, edits)
+    u.callback_query.message.reply_text = Msg().reply_text
+    asyncio.run(bot.on_callback(u, SimpleNamespace(bot=None)))
+    card = [k for k, v in bot.PENDING.items() if v.get("kind") == "invoice"]
+    qtys = {(it["volume"]): it["qty"] for it in bot.PENDING[card[0]]["items"]}
+    assert qtys == {"100 мл": 160, "500 мл": 120, "200 мл": 300}, qtys
+    bot.PENDING.clear()
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)
