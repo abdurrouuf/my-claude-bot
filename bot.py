@@ -7214,8 +7214,36 @@ def _looks_like_operation(text: str) -> bool:
     return False
 
 
+
+def _forwarded_from_bot(message, context) -> bool:
+    """Пересланное сообщение самого бота («✅ Инкассация … принято
+    (операция №684)») — не операция: 14.09.2026 владелец переслал ответ
+    бота в чат склада, бот принял его за сообщение сотрудника и ответил
+    «Принято, зафиксировано» (лишний запрос к ИИ, могла бы выйти и
+    вторая карточка). Проверяем автора пересылки (id бота / имя при
+    скрытом профиле) и, на всякий случай, приметы своих ответов в тексте."""
+    fwd_user = getattr(message, "forward_from", None)
+    fwd_name = getattr(message, "forward_sender_name", None)
+    try:
+        bot_id = context.bot.id
+    except Exception:
+        bot_id = None
+    if fwd_user is not None and bot_id and getattr(fwd_user, "id", None) == bot_id:
+        return True
+    if fwd_user is not None and getattr(fwd_user, "is_bot", False):
+        return True
+    if fwd_name and "ВЕТОП" in str(fwd_name).upper():
+        return True
+    forwarded = bool(fwd_user or fwd_name or getattr(message, "forward_date", None))
+    text = str(getattr(message, "text", "") or "")
+    return forwarded and bool(re.search(r"\(операция №\d+\)|✅ Накладная №\d+ проведена",
+                                        text))
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or not update.message.text:
+        return
+    if _forwarded_from_bot(update.message, context):
         return
     # Ответ на вопрос о сроке годности ловим до всех фильтров: голое
     # «11.2028» в чате склада на операцию не похоже и иначе потерялось бы.

@@ -3325,6 +3325,32 @@ def test_admin_handover_for_employee():
     bot.PENDING.clear()
 
 
+def test_forwarded_bot_message_ignored():
+    """14.09.2026: владелец переслал в чат склада ответ бота «✅ Инкассация …
+    принято (операция №684)» — бот принял пересылку за операцию и ответил
+    «Принято, зафиксировано». Пересланные сообщения самого бота (по id,
+    по имени при скрытом профиле, по приметам текста) игнорируются;
+    пересылка от человека без примет — обрабатывается как раньше."""
+    from types import SimpleNamespace
+    ctx = SimpleNamespace(bot=SimpleNamespace(id=777))
+    txt = "✅ Инкассация: Азамат сдал 228'500 сом — принято (операция №684)."
+    m = SimpleNamespace(text=txt, forward_from=SimpleNamespace(id=777, is_bot=True),
+                        forward_sender_name=None, forward_date=1)
+    assert bot._forwarded_from_bot(m, ctx)
+    m = SimpleNamespace(text=txt, forward_from=None,
+                        forward_sender_name="ВЕТОП - помощник", forward_date=1)
+    assert bot._forwarded_from_bot(m, ctx)
+    m = SimpleNamespace(text=txt, forward_from=None, forward_sender_name=None,
+                        forward_date=1)
+    assert bot._forwarded_from_bot(m, ctx)                  # по приметам текста
+    m = SimpleNamespace(text="Асан приход 5000", forward_from=SimpleNamespace(id=5, is_bot=False),
+                        forward_sender_name=None, forward_date=1)
+    assert not bot._forwarded_from_bot(m, ctx)             # пересылка от человека
+    m = SimpleNamespace(text=txt, forward_from=None, forward_sender_name=None,
+                        forward_date=None)
+    assert not bot._forwarded_from_bot(m, ctx)             # не пересылка вовсе
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)
