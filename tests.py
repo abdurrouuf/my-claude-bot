@@ -3257,6 +3257,73 @@ def test_extract_action_lenient():
     assert bot.extract_action('{"action": "invoice", "items": [') is None   # обрыв
 
 
+def test_admin_handover_for_employee():
+    """14.09.2026: админ написал «Азамат сдал кассу: 228'500» — карточка
+    показала «Сотрудник: Абдурроууф» (сдача из кассы админа), владелец
+    нажал «Отмена». Теперь сдача проводится за названного сотрудника:
+    и через as_employee от модели (в т.ч. «Азамата» в падеже), и по имени
+    в самом тексте, если модель поле не отдала."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    admin = db.get_user(ADMIN)
+    manas = db.warehouse_by_name("Манас")
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1 WHERE id=?", (manas["id"],))
+    conn.commit()
+    db.clients_add_bulk(manas["id"], [("Тест Манас", 300000)])
+    c = db.client_exact(manas["id"], "Тест Манас")
+    db.commit_operation(AZAMAT, "payment", manas["id"], c["id"], "оплата",
+                        [], [(c["id"], -231680)], {"amount": 231680})
+    assert db.cash_on_hand(AZAMAT) == 231680
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append((t, kw.get("reply_markup")))
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=Msg())
+    bot.PENDING.clear()
+    # 1. Модель отдала as_employee в падеже
+    asyncio.run(bot.dispatch_action(
+        upd, SimpleNamespace(bot=None), admin,
+        '{"action": "handover", "amount": 228500, "as_employee": "Азамата"}',
+        src_text="Азамат сдал кассу: 228'500 с", last_text="Азамат сдал кассу: 228'500 с"))
+    assert replies and "Азамат" in replies[-1][0] and replies[-1][1] is not None
+    p = list(bot.PENDING.values())[0]
+    assert p["kind"] == "handover" and p["user_id"] == AZAMAT and not p.get("approver_id")
+    assert not any("отправлена админу" in r[0] for r in replies)
+    bot.PENDING.clear(); replies.clear()
+    # 2. Модель поле не отдала — имя берётся из текста
+    asyncio.run(bot.dispatch_action(
+        upd, SimpleNamespace(bot=None), admin,
+        '{"action": "handover", "amount": 228500}',
+        src_text="От Азамат: сдал кассу 228500", last_text="От Азамат: сдал кассу 228500"))
+    token, p = list(bot.PENDING.items())[0]
+    assert p["user_id"] == AZAMAT and "Азамат" in replies[-1][0]
+    # 3. Кнопка админа списывает из кассы Азамата
+    answers, edits = [], []
+    u = _cb_update(ADMIN, f"ok:{token}", answers, edits)
+    u.callback_query.message.reply_markup = SimpleNamespace(inline_keyboard=[[1]])
+
+    class FakeBot:
+        async def send_message(self, *a, **kw):
+            pass
+    asyncio.run(bot.on_callback(u, SimpleNamespace(bot=FakeBot())))
+    assert edits and "принято" in edits[-1]
+    assert db.cash_on_hand(AZAMAT) == 231680 - 228500
+    assert db.cash_on_hand(ADMIN) == 0
+    # 4. «сдал 5000» без имени — по-прежнему касса самого админа
+    bot.PENDING.clear(); replies.clear()
+    asyncio.run(bot.dispatch_action(
+        upd, SimpleNamespace(bot=None), admin,
+        '{"action": "handover", "amount": 5000}', src_text="сдал 5000", last_text="сдал 5000"))
+    assert list(bot.PENDING.values())[0]["user_id"] == ADMIN
+    bot.PENDING.clear()
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)

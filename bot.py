@@ -778,6 +778,11 @@ def _build_static_system() -> str:
     parts.append('Если сотрудник сдаёт наличные руководителю («сдал 50000», «сдаю выручку '
                  '50 000», «инкассация 30000»), верни ТОЛЬКО JSON:')
     parts.append('{"action": "handover", "amount": сумма}')
+    parts.append('- Если в сообщении назван СОТРУДНИК, который сдал деньги '
+                 '(«Азамат сдал кассу 228500», «от Азамата: сдал 50000», '
+                 '«Данияр сдал выручку 30000») — это админ принимает деньги '
+                 'у сотрудника: добавь поле "as_employee": "<Имя сотрудника>" '
+                 '(имя — из списка сотрудников в динамическом блоке).')
     parts.append("")
     parts.append("=== РЕЖИМ 11: ИЗМЕНЕНИЕ ОБЩЕГО ПРАЙСА (только админ) ===")
     parts.append('Если админ меняет цену в общем прайсе — БЕЗ имени клиента '
@@ -2542,6 +2547,22 @@ def commit_handover(p):
     return op_id, summary
 
 
+
+def _employee_in_text(text: str):
+    """Сотрудник (не админ), названный в первых словах сообщения:
+    «Азамат сдал кассу 228500», «от Азамата: сдал …». Один и только один."""
+    words = [w for w in re.findall(r"[^\W\d_]+", str(text or "").lower())][:4]
+    found = []
+    for u in db.list_users():
+        if u["role"] == "admin":
+            continue
+        nm = str(u["name"]).lower()
+        if any(len(w) >= 3 and _word_alike(w, nm) for w in words) \
+                and not any(x["id"] == u["id"] for x in found):
+            found.append(u)
+    return found[0] if len(found) == 1 else None
+
+
 async def start_handover(update, context, actor, data):
     # Сдача выручки доступна, если ЛЮБОЙ доступный сотруднику склад в полном
     # режиме: касса общая, а выручка могла прийти с полного склада (Бека —
@@ -2558,6 +2579,16 @@ async def start_handover(update, context, actor, data):
     if amount <= 0:
         await update.message.reply_text("Не понял сумму. Пример: «сдал 50000».")
         return
+    # Админ пишет «Азамат сдал кассу 228500» (14.09.2026: карточка показывала
+    # «Сотрудник: Абдурроууф» — сдача уходила бы из кассы АДМИНА, владелец
+    # нажал «Отмена»). Модель отдаёт as_employee, а если не отдала — имя
+    # сотрудника ищется в начале самого сообщения.
+    by_admin = bool(data.get("_by_admin"))
+    if is_admin(actor) and not by_admin:
+        emp = _employee_in_text(str(data.get("_last_text")
+                                    or data.get("_src_text") or ""))
+        if emp is not None:
+            actor, by_admin = emp, True
     payload = {
         "kind": "handover", "user_id": actor["id"],
         "chat_id": update.effective_chat.id, "amount": amount,
@@ -2566,7 +2597,7 @@ async def start_handover(update, context, actor, data):
                 if update.effective_chat else [])
     if len(feed_whs) == 1 and db.can_use_warehouse(actor, feed_whs[0]["id"]):
         payload["wh_id"] = feed_whs[0]["id"]
-    if is_admin(actor):
+    if is_admin(actor) or by_admin:
         token = new_pending(payload)
         await update.message.reply_text(handover_summary(payload), parse_mode="HTML",
                                         reply_markup=confirm_kb(token))
@@ -6529,6 +6560,10 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
         as_emp = str(data.pop("as_employee", "") or "").strip()
         if as_emp and is_admin(actor):
             emp = db.user_by_ref(as_emp)
+            if emp is None:
+                # «за Азамата», «Азамат» с опечаткой — как в /cash
+                emp = _match_employee(as_emp, [u for u in db.list_users()
+                                               if u["role"] != "admin"])
             if emp is None or not emp["active"]:
                 await update.message.reply_text(
                     f"Сотрудник «{esc(as_emp)}» не найден. Сотрудники: "
@@ -6536,6 +6571,7 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
                     parse_mode="HTML")
                 return
             actor = emp
+            data["_by_admin"] = True
     if data is None:
         if "{" in reply and '"action"' in reply:
             # Модель начала выдавать JSON операции, но он не разобрался —
