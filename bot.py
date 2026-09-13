@@ -2538,6 +2538,15 @@ def commit_handover(p):
     wh = (db.warehouse_by_id(p["wh_id"]) if p.get("wh_id")
           else db.warehouse_of(p["user_id"]))
     summary = f"Инкассация: {u['name']} сдал {fmt_num(p['amount'])} сом"
+    # Остаток на руках — в самой сводке (лента, /log): просьба владельца
+    # 14.09.2026 «в этом же сообщении показать остаток в кассе».
+    left = db.cash_on_hand(p["user_id"]) - float(p["amount"])
+    if abs(left) < 0.5:
+        summary += ", касса обнулена"
+    elif left > 0:
+        summary += f", в кассе осталось {fmt_num(left)} сом"
+    else:
+        summary += f", касса ушла в минус: {fmt_num(left)} сом"
     extra = {"amount": p["amount"]}
     if p.get("approver_id"):
         extra["approved_by"] = p["approver_id"]

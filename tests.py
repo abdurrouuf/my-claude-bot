@@ -3313,6 +3313,7 @@ def test_admin_handover_for_employee():
             pass
     asyncio.run(bot.on_callback(u, SimpleNamespace(bot=FakeBot())))
     assert edits and "принято" in edits[-1]
+    assert "в кассе осталось 3" in edits[-1]        # остаток в сводке (лента; апостроф экранирован)
     assert db.cash_on_hand(AZAMAT) == 231680 - 228500
     assert db.cash_on_hand(ADMIN) == 0
     # 4. «сдал 5000» без имени — по-прежнему касса самого админа
