@@ -3428,6 +3428,40 @@ def test_revision_140926():
     assert replies and "коробок или штук" in replies[-1][0]
     db.set_setting("admin_only_clients", "[]")
     bot.PENDING.clear()
+    # 5. Приход извне → накладная: цена 0 от режима прихода берётся из прайса
+    u, replies = upd(ADMIN)
+    tr = {"action": "transfer", "from_warehouse": None, "to_warehouse": "Каракол",
+          "items": [{"name": "АЛБЕНИВЕР", "volume": "500 мл", "qty": 20, "box_qty": 1,
+                     "price": 0, "expiry": "01.2029"}],
+          "_src_text": "", "_last_text": "Асан Токмок\nАлбенивер 500 мл 1 к"}
+    asyncio.run(bot.dispatch_data(u, SimpleNamespace(bot=None), admin, dict(tr)))
+    inv = [v for v in bot.PENDING.values() if v.get("kind") == "invoice"]
+    assert inv and inv[0]["items"][0]["price"] == 580, inv
+    bot.PENDING.clear()
+    # Шапка = имя склада — приход остаётся приходом; «привёз» с ё — тоже
+    assert bot._transfer_client_guard(
+        admin, dict(tr, _last_text="Манас: Албенивер 500 мл 1 к")) == (None, None)
+    assert bot._transfer_client_guard(
+        admin, dict(tr, _last_text="Асан Токмок привёз Албенивер 500 мл 1 к")) == (None, None)
+    # 6. hidden_n считает только операции ЭТОГО склада
+    kb = db.warehouse_by_name("Кара-Балта")
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1 WHERE id=?", (kb["id"],))
+    conn.commit()
+    db.set_setting("hidden_debt_whs", json.dumps([wh["id"]]))
+    db.clients_add_bulk(kb["id"], [("Кубан", 0)])
+    ck = db.client_exact(kb["id"], "Кубан")
+    db.commit_operation(ADMIN, "payment", kb["id"], ck["id"], "оплата",
+                        [], [(ck["id"], -700)], {"amount": 700})
+    db.commit_operation(ADMIN, "payment", wh["id"], c["id"], "оплата",
+                        [], [(c["id"], -900)], {"amount": 900})
+    rd = bot.report_data([wh], 1, hide_admin=True)
+    rkb = bot.report_data([kb], 1, hide_admin=True)
+    assert rd[0]["hidden_n"] == 1 and rkb[0]["hidden_n"] == 0, (rd[0]["hidden_n"], rkb[0]["hidden_n"])
+    db.set_setting("hidden_debt_whs", "[]")
+    # 7. Квитанция показывает переплату
+    rc = bot.payment_receipt("Асан", 6450, 8000)
+    assert "Переплата" in rc and "1'550" in rc.replace("&#x27;", "'"), rc
 
 
 def _areply(sink):

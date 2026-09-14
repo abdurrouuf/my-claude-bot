@@ -1553,6 +1553,9 @@ def invoice_summary(p) -> str:
 
     warns = list(p["warnings"])
     for it in p["items"]:
+        if not it.get("price"):
+            warns.append(f"{it['name']} {it['volume']}: ЦЕНА 0 — товар спишется "
+                         f"без долга; проверьте цену")
         if it.get("product_id"):
             have = db.stock_qty(p["wh_id"], it["product_id"])
             if have < it["qty"]:
@@ -3007,6 +3010,8 @@ def payment_receipt(client_name, old_debt, amount) -> str:
     ]
     if remainder <= 0:
         lines.append("🎉 Долг полностью погашен!")
+        if remainder < -0.5:
+            lines.append(f"↩️ Переплата: <b>{money(-remainder)}</b>")
     else:
         lines.append(f"📌 Остаток долга: <b>{money(remainder)}</b>")
     return "\n".join(lines)
@@ -6678,7 +6683,7 @@ def _transfer_client_guard(actor, data: dict):
     if data.get("action") != "transfer" or data.get("from_warehouse"):
         return None, None
     text = str(data.get("_last_text") or data.get("_src_text") or "").strip()
-    if not text or _TRANSFER_WORDS_RE.search(text):
+    if not text or _TRANSFER_WORDS_RE.search(text.replace("ё", "е").replace("Ё", "Е")):
         return None, None
     head_words = [w for w in re.findall(r"[^\W\d_]+", text.lower())][:3]
     try:
@@ -6697,8 +6702,8 @@ def _transfer_client_guard(actor, data: dict):
     if not header and lines:
         header = [re.split(r"[,:;—–-]", lines[0])[0]]
     hint = _text_name_hint(" ".join(header))
-    if len(hint) < 3:
-        return None, None
+    if len(hint) < 3 or db.warehouse_by_name(hint) is not None:
+        return None, None                 # «Манас: …» — склад, не клиент
     client, wh = _client_by_text(actor, hint)
     if client is None or not _name_covered(hint, client["name"]):
         return None, None
@@ -6731,8 +6736,21 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
         if client is not None:
             log.warning("Приход извне с именем клиента «%s» — провожу как накладную",
                         client["name"])
+            items = []
+            for it in (data.get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                it = dict(it)
+                if not it.get("price"):
+                    # В режиме прихода цена не обязательна — накладная на
+                    # 0 сом списала бы товар без долга (аудит 14.09.2026).
+                    prod = prices.match_product(str(it.get("name") or ""),
+                                                str(it.get("volume") or ""))
+                    it["price"] = prod["price"] if prod else 0
+                items.append(it)
             data = dict(data, action="invoice", client=client["name"],
-                        warehouse=cwh["name"], debt=0, payment=0, phone=None)
+                        warehouse=cwh["name"], debt=0, payment=0, phone=None,
+                        items=items)
             data.pop("from_warehouse", None)
             data.pop("to_warehouse", None)
             action = "invoice"
@@ -7252,8 +7270,8 @@ def _forwarded_from_bot(message, context) -> bool:
         return True
     if fwd_user is not None and getattr(fwd_user, "is_bot", False):
         return True
-    if fwd_name and "ВЕТОП" in str(fwd_name).upper():
-        return True
+    if fwd_name and "ПОМОЩНИК" in str(fwd_name).upper():
+        return True                       # «ВЕТОП - помощник» при скрытом профиле
     forwarded = bool(fwd_user or fwd_name or getattr(message, "forward_date", None))
     text = str(getattr(message, "text", "") or "")
     return forwarded and bool(re.search(r"\(операция №\d+\)|✅ Накладная №\d+ проведена",
@@ -8364,7 +8382,8 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
                 data = json.loads(op["data"])
             except (ValueError, TypeError):
                 continue
-            muted = hide_admin and _feed_muted_op(op["type"], op["user_id"], wh["id"])
+            muted = (hide_admin and op["warehouse_id"] == wh["id"]
+                     and _feed_muted_op(op["type"], op["user_id"], wh["id"]))
             if muted and hide_admin != "money":
                 hidden_n += 1
                 continue
@@ -9994,7 +10013,7 @@ def build_order_report(warehouses, horizon=None):
     stock_total, sold_total = {}, {}
     for wh in warehouses:
         for pid, q in db.stock_map(wh["id"]).items():
-            stock_total[pid] = stock_total.get(pid, 0) + q
+            stock_total[pid] = stock_total.get(pid, 0) + max(q, 0)   # минус склада — не запас
         for pid, q in sold_all.get(wh["id"], {}).items():
             sold_total[pid] = sold_total.get(pid, 0) + q
     bmap = buy_som_map()
