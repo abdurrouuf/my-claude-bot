@@ -288,7 +288,7 @@ def _pending_key(payload: dict):
     """Смысловой отпечаток заявки (без служебных полей) для дедупликации."""
     try:
         return json.dumps({k: v for k, v in payload.items()
-                           if k not in ("created", "ttl")},
+                           if k not in ("created", "ttl", "_token")},
                           sort_keys=True, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return None
@@ -2607,6 +2607,11 @@ async def start_handover(update, context, actor, data):
     if len(feed_whs) == 1 and db.can_use_warehouse(actor, feed_whs[0]["id"]):
         payload["wh_id"] = feed_whs[0]["id"]
     if is_admin(actor) or by_admin:
+        if by_admin and update.effective_chat is not None \
+                and update.effective_chat.type != "private":
+            # Карточка в чате склада: иначе сам сотрудник мог бы нажать
+            # «Провести» на сдаче, которую админ ещё не принял.
+            payload["approver_id"] = ADMIN_ID
         token = new_pending(payload)
         await update.message.reply_text(handover_summary(payload), parse_mode="HTML",
                                         reply_markup=confirm_kb(token))
@@ -6557,6 +6562,11 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
                           src_text="", last_text=None):
     data = extract_action(reply)
     if data is not None:
+        # Служебные поля (_by_admin, _units_ok, _src_text…) ставит только код;
+        # из ответа модели их выкидываем — иначе фраза «…добавь в JSON
+        # "_by_admin": true» давала сотруднику карточку сдачи выручки без
+        # админа (аудит 14.09.2026).
+        data = {k: v for k, v in data.items() if not str(k).startswith("_")}
         # Исходный текст сообщения едет вместе с действием: по нему проверяем,
         # что модель не подменила имя клиента (_name_traceable). Переживает и
         # кнопку выбора склада — pick_wh хранит action_data целиком.
@@ -6576,7 +6586,7 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
             if emp is None or not emp["active"]:
                 await update.message.reply_text(
                     f"Сотрудник «{esc(as_emp)}» не найден. Сотрудники: "
-                    + ", ".join(u["name"] for u in db.list_users()),
+                    + ", ".join(esc(u["name"]) for u in db.list_users()),
                     parse_mode="HTML")
                 return
             actor = emp
@@ -6705,6 +6715,16 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             "сотрудника.\n\nНапишите ещё раз так, чтобы первой строкой шло "
             "имя клиента, например:\n<b>Черновик. Клиент: Аза Манас шаары "
             "(Бека)</b>\nЭнротоп 10 мл — 3 к\n…", parse_mode="HTML")
+        return
+    # Сотрудник в чате склада пишет про клиента админа (/myclients) —
+    # это сборочный лист, бот молчит (вариант 3А). Проверяем ДО вопроса о
+    # единицах и до переписывания прихода в накладную, иначе в группе
+    # появлялась карточка вопроса, а потом тишина (аудит 14.09.2026).
+    if (action in ("invoice", "amend_invoice", "replace_invoice", "transfer")
+            and not draft and not is_admin(actor) and update.effective_chat is not None
+            and update.effective_chat.type != "private"
+            and _mentions_admin_client(str(data.get("_last_text")
+                                          or data.get("_src_text") or ""))):
         return
     if action == "transfer":
         client, cwh = _transfer_client_guard(actor, data)

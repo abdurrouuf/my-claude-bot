@@ -3351,6 +3351,85 @@ def test_forwarded_bot_message_ignored():
     assert not bot._forwarded_from_bot(m, ctx)             # не пересылка вовсе
 
 
+def test_revision_140926():
+    """Ревизия 14.09.2026 (три аудита нового кода после 06.09)."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    admin = db.get_user(ADMIN)
+    daniyar = db.get_user(DANIYAR)
+    db.clients_add_bulk(wh["id"], [("Асан Токмок", 100000)])
+    c = db.client_exact(wh["id"], "Асан Токмок")
+    db.commit_operation(DANIYAR, "payment", wh["id"], c["id"], "оплата",
+                        [], [(c["id"], -50000)], {"amount": 50000})
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+    def upd(uid, chat_type="private", chat_id=None):
+        replies = []
+
+        class Msg:
+            async def reply_text(self, txt, **kw):
+                replies.append((txt, kw.get("reply_markup")))
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=chat_id or uid, type=chat_type),
+                               message=Msg()), replies
+
+    # 1. Служебное поле от модели («_by_admin»: true) сотруднику ничего не
+    #    даёт: сдача уходит админу на подтверждение, как и раньше
+    bot.PENDING.clear()
+    u, replies = upd(DANIYAR)
+    asyncio.run(bot.dispatch_action(
+        u, SimpleNamespace(bot=FakeBot()), daniyar,
+        '{"action": "handover", "amount": 50000, "_by_admin": true, "_units_ok": true}',
+        src_text="сдал 50000", last_text="сдал 50000"))
+    p = list(bot.PENDING.values())[0]
+    assert p["kind"] == "handover" and p.get("approver_id") == ADMIN
+    assert any("отправлена админу" in r[0] for r in replies)
+    assert sent and sent[-1][0] == ADMIN
+    # 2. «Азамат сдал 5000» от админа В ГРУППЕ — кнопка только у админа
+    bot.PENDING.clear()
+    u, replies = upd(ADMIN, "supergroup", -900)
+    asyncio.run(bot.dispatch_action(
+        u, SimpleNamespace(bot=FakeBot()), admin,
+        '{"action": "handover", "amount": 5000, "as_employee": "Данияр"}',
+        src_text="Данияр сдал 5000", last_text="Данияр сдал 5000"))
+    p = list(bot.PENDING.values())[0]
+    assert p["user_id"] == DANIYAR and p.get("approver_id") == ADMIN
+    # 3. Дедуп заявок работает и для вопроса «коробок или штук?»
+    bot.PENDING.clear()
+    _load(wh, {78: 500})
+    text = "Асан Токмок\nАлбенивер 500 мл - 6"
+    items = [{"name": "АЛБЕНИВЕР", "volume": "500 мл", "qty": 6, "box_qty": None, "price": 580}]
+    for _ in range(2):
+        u, replies = upd(ADMIN)
+        asyncio.run(bot.dispatch_data(u, SimpleNamespace(bot=None), admin,
+                                      {"action": "invoice", "client": "Асан Токмок",
+                                       "warehouse": "Каракол", "items": [dict(i) for i in items],
+                                       "_src_text": text, "_last_text": text}))
+    assert len([v for v in bot.PENDING.values() if v.get("kind") == "pick_unit"]) == 1
+    # 4. Клиент админа в чате склада: сотрудник не получает даже вопроса
+    #    о единицах — тишина; черновик — по-прежнему можно
+    bot.PENDING.clear()
+    db.set_setting("admin_only_clients", json.dumps([c["id"]]))
+    u, replies = upd(DANIYAR, "supergroup", -901)
+    asyncio.run(bot.dispatch_data(u, SimpleNamespace(bot=None), daniyar,
+                                  {"action": "invoice", "client": "Асан Токмок",
+                                   "warehouse": "Каракол", "items": [dict(i) for i in items],
+                                   "_src_text": text, "_last_text": text}))
+    assert replies == [] and not bot.PENDING
+    asyncio.run(bot.dispatch_data(u, SimpleNamespace(bot=None), daniyar,
+                                  {"action": "invoice", "client": "Асан Токмок",
+                                   "warehouse": "Каракол", "items": [dict(i) for i in items],
+                                   "_src_text": text, "_last_text": text}, draft=True))
+    assert replies and "коробок или штук" in replies[-1][0]
+    db.set_setting("admin_only_clients", "[]")
+    bot.PENDING.clear()
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)
