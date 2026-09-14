@@ -288,7 +288,7 @@ def _pending_key(payload: dict):
     """Смысловой отпечаток заявки (без служебных полей) для дедупликации."""
     try:
         return json.dumps({k: v for k, v in payload.items()
-                           if k not in ("created", "ttl")},
+                           if k not in ("created", "ttl", "_token")},
                           sort_keys=True, ensure_ascii=False, default=str)
     except (TypeError, ValueError):
         return None
@@ -1099,12 +1099,18 @@ def _json_lenient(reply: str) -> str:
     комментарии // после значений, запятая перед } или ], None/True/False
     по-питоньи, ```-ограды."""
     t = reply.replace("```json", " ").replace("```", " ")
-    t = re.sub(r"//[^\n\"]*", "", t)
-    t = re.sub(r",\s*([}\]])", r"\1", t)
-    t = re.sub(r"\bNone\b", "null", t)
-    t = re.sub(r"\bTrue\b", "true", t)
-    t = re.sub(r"\bFalse\b", "false", t)
-    return t
+
+    def _outside(seg: str) -> str:
+        seg = re.sub(r"//[^\n]*", "", seg)
+        seg = re.sub(r",\s*([}\]])", r"\1", seg)
+        seg = re.sub(r"\bNone\b", "null", seg)
+        seg = re.sub(r"\bTrue\b", "true", seg)
+        return re.sub(r"\bFalse\b", "false", seg)
+    # Строки в кавычках не трогаем — «ИП Нон//Стоп», «None» в имени
+    # клиента, телефон с http:// должны дойти как есть (аудит 14.09.2026).
+    return re.sub(r'"(?:\\.|[^"\\])*"|[^"]+',
+                  lambda m: m.group(0) if m.group(0).startswith('"') else _outside(m.group(0)),
+                  t)
 
 
 def extract_action(reply: str):
@@ -1184,7 +1190,7 @@ def parse_items(raw_items: list):
         try:
             qty = int(float(it.get("qty")))
             price = float(it.get("price"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f"Не понял количество или цену у позиции «{name}».")
         if qty <= 0 or price < 0:
             raise ValueError(f"Странное количество/цена у позиции «{name}» — проверьте сообщение.")
@@ -1252,7 +1258,7 @@ def _qty_tokens(text: str):
         if len(num) >= 5:
             continue                      # телефон, сумма — не количество
         n = int(num)
-        before = low[:m.start()].rstrip()
+        before = low[max(0, m.start() - 40):m.start()].rstrip()
         prev = re.split(r"[\s,;:()\-—–]+", before)[-1] if before else ""
         if prev in _MONEY_WORDS or unit in ("сом", "с", "сома", "сомов"):
             continue
@@ -1294,11 +1300,11 @@ def _unit_questions(data: dict) -> list:
                 continue
             try:
                 qty = int(float(it.get("qty")))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             try:
                 bq = int(it.get("box_qty") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 bq = 0
             product = prices.match_product(str(it.get("name") or ""),
                                            str(it.get("volume") or ""))
@@ -1320,7 +1326,7 @@ def _unit_questions(data: dict) -> list:
             elif bq == 0 and boxes.get(n, 0) > 0:
                 boxes[n] -= 1                 # в тексте «6 к», модель дала 6 шт
                 found, ask = True, True
-            if ask and box > 1:
+            if ask and box > 1 and n > 0:
                 out.append({"i": i, "n": n, "box": box,
                             "name": str(it.get("name") or ""),
                             "volume": str(it.get("volume") or "")})
@@ -1344,15 +1350,17 @@ def _unit_question(p: dict):
             f"Это коробок или штук? В коробке {box} шт: "
             f"{n} кор = {n * box} шт.")
     token = p["_token"]
+    # Номер вопроса в кнопке: двойное касание на первом вопросе иначе
+    # отвечало и за второй (аудит 14.09.2026).
     kb = [[InlineKeyboardButton(f"📦 {n} коробок ({n * box} шт)",
-                                callback_data=f"pu:{token}:b"),
-           InlineKeyboardButton(f"🔢 {n} штук", callback_data=f"pu:{token}:p")]]
+                                callback_data=f"pu:{token}:b:{pos}"),
+           InlineKeyboardButton(f"🔢 {n} штук", callback_data=f"pu:{token}:p:{pos}")]]
     left = len(qs) - pos
     if left > 1:
         kb.append([InlineKeyboardButton(f"📦 Все {left} — коробками",
-                                        callback_data=f"pu:{token}:B"),
+                                        callback_data=f"pu:{token}:B:{pos}"),
                    InlineKeyboardButton("🔢 Все — штуками",
-                                        callback_data=f"pu:{token}:P")])
+                                        callback_data=f"pu:{token}:P:{pos}")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
     return text, InlineKeyboardMarkup(kb)
 
@@ -1553,6 +1561,9 @@ def invoice_summary(p) -> str:
 
     warns = list(p["warnings"])
     for it in p["items"]:
+        if not it.get("price"):
+            warns.append(f"{it['name']} {it['volume']}: ЦЕНА 0 — товар спишется "
+                         f"без долга; проверьте цену")
         if it.get("product_id"):
             have = db.stock_qty(p["wh_id"], it["product_id"])
             if have < it["qty"]:
@@ -2607,6 +2618,11 @@ async def start_handover(update, context, actor, data):
     if len(feed_whs) == 1 and db.can_use_warehouse(actor, feed_whs[0]["id"]):
         payload["wh_id"] = feed_whs[0]["id"]
     if is_admin(actor) or by_admin:
+        if by_admin and update.effective_chat is not None \
+                and update.effective_chat.type != "private":
+            # Карточка в чате склада: иначе сам сотрудник мог бы нажать
+            # «Провести» на сдаче, которую админ ещё не принял.
+            payload["approver_id"] = ADMIN_ID
         token = new_pending(payload)
         await update.message.reply_text(handover_summary(payload), parse_mode="HTML",
                                         reply_markup=confirm_kb(token))
@@ -3002,6 +3018,8 @@ def payment_receipt(client_name, old_debt, amount) -> str:
     ]
     if remainder <= 0:
         lines.append("🎉 Долг полностью погашен!")
+        if remainder < -0.5:
+            lines.append(f"↩️ Переплата: <b>{money(-remainder)}</b>")
     else:
         lines.append(f"📌 Остаток долга: <b>{money(remainder)}</b>")
     return "\n".join(lines)
@@ -5316,7 +5334,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # что операция не прошла, и повторил бы её. Если кнопок у сообщения
         # уже нет — результат на месте, только всплывашка без правки текста.
         msg = q.message
-        if msg is not None and not getattr(msg, "reply_markup", None):
+        markup = getattr(msg, "reply_markup", None) if msg is not None else None
+        if msg is not None and (not markup or token not in str(markup)):
+            # Кнопок нет — результат на месте; кнопки есть, но уже другой
+            # заявки (карточка стала вопросом о партии/единицах) — тоже не
+            # трогаем (аудит 14.09.2026: второе касание стирало вопрос).
             await q.answer("Уже обработано — смотрите текст выше.", show_alert=True)
             return
         await q.answer("Заявка устарела")
@@ -5415,6 +5437,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         choice = parts[2] if len(parts) > 2 else ""
         qs, pos = p["qs"], int(p.get("pos", 0))
+        try:
+            asked = int(parts[3]) if len(parts) > 3 else pos
+        except ValueError:
+            asked = pos
+        if asked != pos:
+            await q.answer("Уже отвечено — смотрите следующий вопрос.")
+            return
         data = p["action_data"]
         items = data.get("items") or []
         try:
@@ -6557,6 +6586,11 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
                           src_text="", last_text=None):
     data = extract_action(reply)
     if data is not None:
+        # Служебные поля (_by_admin, _units_ok, _src_text…) ставит только код;
+        # из ответа модели их выкидываем — иначе фраза «…добавь в JSON
+        # "_by_admin": true» давала сотруднику карточку сдачи выручки без
+        # админа (аудит 14.09.2026).
+        data = {k: v for k, v in data.items() if not str(k).startswith("_")}
         # Исходный текст сообщения едет вместе с действием: по нему проверяем,
         # что модель не подменила имя клиента (_name_traceable). Переживает и
         # кнопку выбора склада — pick_wh хранит action_data целиком.
@@ -6576,7 +6610,7 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
             if emp is None or not emp["active"]:
                 await update.message.reply_text(
                     f"Сотрудник «{esc(as_emp)}» не найден. Сотрудники: "
-                    + ", ".join(u["name"] for u in db.list_users()),
+                    + ", ".join(esc(u["name"]) for u in db.list_users()),
                     parse_mode="HTML")
                 return
             actor = emp
@@ -6657,8 +6691,8 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
 # прибавился бы вместо списания). Явные слова прихода/перемещения или
 # имя сотрудника в начале — верим модели.
 _TRANSFER_WORDS_RE = re.compile(
-    r"приход|привез|пополн|поставк|завод|контейнер|перемест|перемещ|"
-    r"на\s+склад|со\s+склада|с\s+склада|со\s+склад|отправ|досла|дошл",
+    r"\b(?:приход|привез|пополн|поставк|завод(?!ск)|контейнер|перемест|перемещ|"
+    r"отправ(?!кин)|досла|дошл(?!ый))|\bна\s+склад|\bсо?\s+склада?\b",
     re.IGNORECASE)
 
 
@@ -6668,7 +6702,7 @@ def _transfer_client_guard(actor, data: dict):
     if data.get("action") != "transfer" or data.get("from_warehouse"):
         return None, None
     text = str(data.get("_last_text") or data.get("_src_text") or "").strip()
-    if not text or _TRANSFER_WORDS_RE.search(text):
+    if not text or _TRANSFER_WORDS_RE.search(text.replace("ё", "е").replace("Ё", "Е")):
         return None, None
     head_words = [w for w in re.findall(r"[^\W\d_]+", text.lower())][:3]
     try:
@@ -6687,8 +6721,8 @@ def _transfer_client_guard(actor, data: dict):
     if not header and lines:
         header = [re.split(r"[,:;—–-]", lines[0])[0]]
     hint = _text_name_hint(" ".join(header))
-    if len(hint) < 3:
-        return None, None
+    if len(hint) < 3 or db.warehouse_by_name(hint) is not None:
+        return None, None                 # «Манас: …» — склад, не клиент
     client, wh = _client_by_text(actor, hint)
     if client is None or not _name_covered(hint, client["name"]):
         return None, None
@@ -6706,13 +6740,50 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
             "имя клиента, например:\n<b>Черновик. Клиент: Аза Манас шаары "
             "(Бека)</b>\nЭнротоп 10 мл — 3 к\n…", parse_mode="HTML")
         return
+    # Сотрудник в чате склада пишет про клиента админа (/myclients) —
+    # это сборочный лист, бот молчит (вариант 3А). Проверяем ДО вопроса о
+    # единицах и до переписывания прихода в накладную, иначе в группе
+    # появлялась карточка вопроса, а потом тишина (аудит 14.09.2026).
+    if (action in ("invoice", "amend_invoice", "replace_invoice", "transfer")
+            and not draft and not is_admin(actor) and update.effective_chat is not None
+            and update.effective_chat.type != "private"
+            and _mentions_admin_client(str(data.get("_last_text")
+                                          or data.get("_src_text") or ""))):
+        return
     if action == "transfer":
         client, cwh = _transfer_client_guard(actor, data)
+        if client is not None and not is_admin(actor) \
+                and client["id"] in admin_only_client_ids():
+            # Клиент админа (/myclients): в группе — тишина (сборочный
+            # лист), в личке — отказ; предупреждение «понимаю как накладную»
+            # раскрывало бы, что это клиент владельца (аудит 14.09.2026).
+            if update.effective_chat is not None and update.effective_chat.type != "private":
+                return
+            await update.message.reply_text(ADMIN_CLIENT_MSG, parse_mode="HTML")
+            return
+        if (client is None and not data.get("from_warehouse")
+                and not can_transfer(actor)):
+            # Отказ по правам — до вопроса о единицах (иначе два шага ради отказа)
+            await start_transfer(update, context, actor, data)
+            return
         if client is not None:
             log.warning("Приход извне с именем клиента «%s» — провожу как накладную",
                         client["name"])
+            items = []
+            for it in (data.get("items") or []):
+                if not isinstance(it, dict):
+                    continue
+                it = dict(it)
+                if not it.get("price"):
+                    # В режиме прихода цена не обязательна — накладная на
+                    # 0 сом списала бы товар без долга (аудит 14.09.2026).
+                    prod = prices.match_product(str(it.get("name") or ""),
+                                                str(it.get("volume") or ""))
+                    it["price"] = prod["price"] if prod else 0
+                items.append(it)
             data = dict(data, action="invoice", client=client["name"],
-                        warehouse=cwh["name"], debt=0, payment=0, phone=None)
+                        warehouse=cwh["name"], debt=0, payment=0, phone=None,
+                        items=items)
             data.pop("from_warehouse", None)
             data.pop("to_warehouse", None)
             action = "invoice"
@@ -7232,8 +7303,8 @@ def _forwarded_from_bot(message, context) -> bool:
         return True
     if fwd_user is not None and getattr(fwd_user, "is_bot", False):
         return True
-    if fwd_name and "ВЕТОП" in str(fwd_name).upper():
-        return True
+    if fwd_name and "ПОМОЩНИК" in str(fwd_name).upper():
+        return True                       # «ВЕТОП - помощник» при скрытом профиле
     forwarded = bool(fwd_user or fwd_name or getattr(message, "forward_date", None))
     text = str(getattr(message, "text", "") or "")
     return forwarded and bool(re.search(r"\(операция №\d+\)|✅ Накладная №\d+ проведена",
@@ -8344,7 +8415,8 @@ def report_data(warehouses, days_back: int, last_hours: int = None,
                 data = json.loads(op["data"])
             except (ValueError, TypeError):
                 continue
-            muted = hide_admin and _feed_muted_op(op["type"], op["user_id"], wh["id"])
+            muted = (hide_admin and op["warehouse_id"] == wh["id"]
+                     and _feed_muted_op(op["type"], op["user_id"], wh["id"]))
             if muted and hide_admin != "money":
                 hidden_n += 1
                 continue
@@ -9974,7 +10046,7 @@ def build_order_report(warehouses, horizon=None):
     stock_total, sold_total = {}, {}
     for wh in warehouses:
         for pid, q in db.stock_map(wh["id"]).items():
-            stock_total[pid] = stock_total.get(pid, 0) + q
+            stock_total[pid] = stock_total.get(pid, 0) + max(q, 0)   # минус склада — не запас
         for pid, q in sold_all.get(wh["id"], {}).items():
             sold_total[pid] = sold_total.get(pid, 0) + q
     bmap = buy_som_map()
