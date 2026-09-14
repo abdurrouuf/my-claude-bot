@@ -1099,12 +1099,18 @@ def _json_lenient(reply: str) -> str:
     комментарии // после значений, запятая перед } или ], None/True/False
     по-питоньи, ```-ограды."""
     t = reply.replace("```json", " ").replace("```", " ")
-    t = re.sub(r"//[^\n\"]*", "", t)
-    t = re.sub(r",\s*([}\]])", r"\1", t)
-    t = re.sub(r"\bNone\b", "null", t)
-    t = re.sub(r"\bTrue\b", "true", t)
-    t = re.sub(r"\bFalse\b", "false", t)
-    return t
+
+    def _outside(seg: str) -> str:
+        seg = re.sub(r"//[^\n]*", "", seg)
+        seg = re.sub(r",\s*([}\]])", r"\1", seg)
+        seg = re.sub(r"\bNone\b", "null", seg)
+        seg = re.sub(r"\bTrue\b", "true", seg)
+        return re.sub(r"\bFalse\b", "false", seg)
+    # Строки в кавычках не трогаем — «ИП Нон//Стоп», «None» в имени
+    # клиента, телефон с http:// должны дойти как есть (аудит 14.09.2026).
+    return re.sub(r'"(?:\\.|[^"\\])*"|[^"]+',
+                  lambda m: m.group(0) if m.group(0).startswith('"') else _outside(m.group(0)),
+                  t)
 
 
 def extract_action(reply: str):
@@ -1184,7 +1190,7 @@ def parse_items(raw_items: list):
         try:
             qty = int(float(it.get("qty")))
             price = float(it.get("price"))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             raise ValueError(f"Не понял количество или цену у позиции «{name}».")
         if qty <= 0 or price < 0:
             raise ValueError(f"Странное количество/цена у позиции «{name}» — проверьте сообщение.")
@@ -1252,7 +1258,7 @@ def _qty_tokens(text: str):
         if len(num) >= 5:
             continue                      # телефон, сумма — не количество
         n = int(num)
-        before = low[:m.start()].rstrip()
+        before = low[max(0, m.start() - 40):m.start()].rstrip()
         prev = re.split(r"[\s,;:()\-—–]+", before)[-1] if before else ""
         if prev in _MONEY_WORDS or unit in ("сом", "с", "сома", "сомов"):
             continue
@@ -1294,11 +1300,11 @@ def _unit_questions(data: dict) -> list:
                 continue
             try:
                 qty = int(float(it.get("qty")))
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 continue
             try:
                 bq = int(it.get("box_qty") or 0)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 bq = 0
             product = prices.match_product(str(it.get("name") or ""),
                                            str(it.get("volume") or ""))
@@ -1320,7 +1326,7 @@ def _unit_questions(data: dict) -> list:
             elif bq == 0 and boxes.get(n, 0) > 0:
                 boxes[n] -= 1                 # в тексте «6 к», модель дала 6 шт
                 found, ask = True, True
-            if ask and box > 1:
+            if ask and box > 1 and n > 0:
                 out.append({"i": i, "n": n, "box": box,
                             "name": str(it.get("name") or ""),
                             "volume": str(it.get("volume") or "")})
@@ -1344,15 +1350,17 @@ def _unit_question(p: dict):
             f"Это коробок или штук? В коробке {box} шт: "
             f"{n} кор = {n * box} шт.")
     token = p["_token"]
+    # Номер вопроса в кнопке: двойное касание на первом вопросе иначе
+    # отвечало и за второй (аудит 14.09.2026).
     kb = [[InlineKeyboardButton(f"📦 {n} коробок ({n * box} шт)",
-                                callback_data=f"pu:{token}:b"),
-           InlineKeyboardButton(f"🔢 {n} штук", callback_data=f"pu:{token}:p")]]
+                                callback_data=f"pu:{token}:b:{pos}"),
+           InlineKeyboardButton(f"🔢 {n} штук", callback_data=f"pu:{token}:p:{pos}")]]
     left = len(qs) - pos
     if left > 1:
         kb.append([InlineKeyboardButton(f"📦 Все {left} — коробками",
-                                        callback_data=f"pu:{token}:B"),
+                                        callback_data=f"pu:{token}:B:{pos}"),
                    InlineKeyboardButton("🔢 Все — штуками",
-                                        callback_data=f"pu:{token}:P")])
+                                        callback_data=f"pu:{token}:P:{pos}")])
     kb.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
     return text, InlineKeyboardMarkup(kb)
 
@@ -5326,7 +5334,11 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # что операция не прошла, и повторил бы её. Если кнопок у сообщения
         # уже нет — результат на месте, только всплывашка без правки текста.
         msg = q.message
-        if msg is not None and not getattr(msg, "reply_markup", None):
+        markup = getattr(msg, "reply_markup", None) if msg is not None else None
+        if msg is not None and (not markup or token not in str(markup)):
+            # Кнопок нет — результат на месте; кнопки есть, но уже другой
+            # заявки (карточка стала вопросом о партии/единицах) — тоже не
+            # трогаем (аудит 14.09.2026: второе касание стирало вопрос).
             await q.answer("Уже обработано — смотрите текст выше.", show_alert=True)
             return
         await q.answer("Заявка устарела")
@@ -5425,6 +5437,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         choice = parts[2] if len(parts) > 2 else ""
         qs, pos = p["qs"], int(p.get("pos", 0))
+        try:
+            asked = int(parts[3]) if len(parts) > 3 else pos
+        except ValueError:
+            asked = pos
+        if asked != pos:
+            await q.answer("Уже отвечено — смотрите следующий вопрос.")
+            return
         data = p["action_data"]
         items = data.get("items") or []
         try:
@@ -6672,8 +6691,8 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
 # прибавился бы вместо списания). Явные слова прихода/перемещения или
 # имя сотрудника в начале — верим модели.
 _TRANSFER_WORDS_RE = re.compile(
-    r"приход|привез|пополн|поставк|завод|контейнер|перемест|перемещ|"
-    r"на\s+склад|со\s+склада|с\s+склада|со\s+склад|отправ|досла|дошл",
+    r"\b(?:приход|привез|пополн|поставк|завод(?!ск)|контейнер|перемест|перемещ|"
+    r"отправ(?!кин)|досла|дошл(?!ый))|\bна\s+склад|\bсо?\s+склада?\b",
     re.IGNORECASE)
 
 
@@ -6733,6 +6752,20 @@ async def dispatch_data(update, context, actor, data, reply="", draft=False):
         return
     if action == "transfer":
         client, cwh = _transfer_client_guard(actor, data)
+        if client is not None and not is_admin(actor) \
+                and client["id"] in admin_only_client_ids():
+            # Клиент админа (/myclients): в группе — тишина (сборочный
+            # лист), в личке — отказ; предупреждение «понимаю как накладную»
+            # раскрывало бы, что это клиент владельца (аудит 14.09.2026).
+            if update.effective_chat is not None and update.effective_chat.type != "private":
+                return
+            await update.message.reply_text(ADMIN_CLIENT_MSG, parse_mode="HTML")
+            return
+        if (client is None and not data.get("from_warehouse")
+                and not can_transfer(actor)):
+            # Отказ по правам — до вопроса о единицах (иначе два шага ради отказа)
+            await start_transfer(update, context, actor, data)
+            return
         if client is not None:
             log.warning("Приход извне с именем клиента «%s» — провожу как накладную",
                         client["name"])

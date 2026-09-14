@@ -3070,7 +3070,8 @@ def test_double_tap_keeps_result():
     assert edits == [] and answers and "Уже обработано" in answers[-1]
     answers.clear(); edits.clear()
     upd2 = _cb_update(ADMIN, "ok:deadbeef0002", answers, edits)
-    upd2.callback_query.message.reply_markup = SimpleNamespace(inline_keyboard=[[1]])
+    upd2.callback_query.message.reply_markup = SimpleNamespace(
+        inline_keyboard=[[SimpleNamespace(callback_data="ok:deadbeef0002")]])   # кнопки ЭТОЙ заявки
     asyncio.run(bot.on_callback(upd2, SimpleNamespace(bot=None)))
     assert edits and "устарела" in edits[-1]
 
@@ -3462,6 +3463,56 @@ def test_revision_140926():
     # 7. Квитанция показывает переплату
     rc = bot.payment_receipt("Асан", 6450, 8000)
     assert "Переплата" in rc and "1'550" in rc.replace("&#x27;", "'"), rc
+    # 8. Двойное касание на первом вопросе «коробок или штук?» не отвечает
+    #    за второй (номер вопроса в кнопке)
+    bot.PENDING.clear()
+    _load(wh, {77: 500})
+    text2 = "Асан Токмок\nАлбенивер 500 мл 6\nАлбенивер 200 мл 6"
+    items2 = [dict(items[0]), {"name": "АЛБЕНИВЕР", "volume": "200 мл", "qty": 6,
+                               "box_qty": None, "price": 260}]
+    u, replies = upd(ADMIN)
+    asyncio.run(bot.dispatch_data(u, SimpleNamespace(bot=None), admin,
+                                  {"action": "invoice", "client": "Асан Токмок",
+                                   "warehouse": "Каракол", "items": items2,
+                                   "_src_text": text2, "_last_text": text2}))
+    token = [k for k, v in bot.PENDING.items() if v.get("kind") == "pick_unit"][0]
+    assert f"pu:{token}:b:0" in str(replies[-1][1].inline_keyboard)
+    answers, edits = [], []
+    for _ in range(2):
+        cb = _cb_update(ADMIN, f"pu:{token}:b:0", answers, edits)
+        cb.callback_query.message.reply_text = u.message.reply_text
+        asyncio.run(bot.on_callback(cb, SimpleNamespace(bot=None)))
+    assert bot.PENDING[token]["pos"] == 1 and "Уже отвечено" in answers[-1]
+    assert not [v for v in bot.PENDING.values() if v.get("kind") == "invoice"]
+    # 9. Второе касание, когда карточка уже стала другим вопросом, — не
+    #    стирает его («Уже обработано»), текст цел
+    answers, edits = [], []
+    cb = _cb_update(ADMIN, "ok:deadbeef0009", answers, edits)
+    cb.callback_query.message.reply_markup = SimpleNamespace(
+        inline_keyboard=[[SimpleNamespace(callback_data=f"pu:{token}:p:1")]])
+    asyncio.run(bot.on_callback(cb, SimpleNamespace(bot=None)))
+    assert edits == [] and "Уже обработано" in answers[-1]
+    bot.PENDING.clear()
+    # 10. Guard приход→накладная по клиенту админа: сотруднику в группе —
+    #     тишина, в личке — отказ без раскрытия склада
+    db.set_setting("admin_only_clients", json.dumps([c["id"]]))
+    tr4 = {"action": "transfer", "from_warehouse": None, "to_warehouse": "Каракол",
+           "items": [{"name": "АЛБЕНИВЕР", "volume": "500 мл", "qty": 20, "box_qty": 1,
+                      "price": 580}],
+           "_src_text": "", "_last_text": "Асан\nТокмок\nАлбенивер 500 мл 1 к"}
+    u, replies = upd(DANIYAR, "supergroup", -902)
+    asyncio.run(bot.dispatch_data(u, SimpleNamespace(bot=None), daniyar, dict(tr4)))
+    assert replies == [] and not bot.PENDING
+    u, replies = upd(DANIYAR)
+    asyncio.run(bot.dispatch_data(u, SimpleNamespace(bot=None), daniyar, dict(tr4)))
+    assert replies and "НАКЛАДНУЮ" not in replies[-1][0] and not bot.PENDING
+    db.set_setting("admin_only_clients", "[]")
+    # 11. Лояльный JSON не портит строки; qty 0 — без вопроса
+    d = bot.extract_action('{"action": "invoice", "client": "ИП Нон//Стоп None", '
+                           '"phone": "http://t.me/x", "items": [{"qty": 1,},],}')
+    assert d["client"] == "ИП Нон//Стоп None" and d["phone"] == "http://t.me/x"
+    assert bot._unit_questions({"items": [dict(items[0], qty=0)],
+                                "_last_text": "Асан\nАлбенивер 500 мл 0"}) == []
 
 
 def _areply(sink):
