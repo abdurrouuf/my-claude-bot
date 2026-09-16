@@ -9226,6 +9226,7 @@ FORECAST_EMPTY_WINDOW = 60
 # дней вперёд; своё число — в команде: /order 120, /order Бишкек 60.
 ORDER_WINDOW = 60
 ORDER_HORIZON = 90
+ORDER_LONG_WINDOW = 180   # окно для закончившегося товара (без продаж за ORDER_WINDOW)
 
 
 def _others_stock_text(wh_id, pid, other_whs, other_maps) -> str:
@@ -10054,20 +10055,36 @@ def build_order_report(warehouses, horizon=None):
     Возвращает (pdf, подпись-итог)."""
     horizon = horizon or ORDER_HORIZON
     sold_all = sales_by_warehouse(ORDER_WINDOW)
-    stock_total, sold_total = {}, {}
+    sold_long_all = sales_by_warehouse(ORDER_LONG_WINDOW)
+    stock_total, sold_total, sold_long, seen = {}, {}, {}, set()
     for wh in warehouses:
         for pid, q in db.stock_map(wh["id"]).items():
+            seen.add(pid)                 # товар когда-то был на складе
             stock_total[pid] = stock_total.get(pid, 0) + max(q, 0)   # минус склада — не запас
         for pid, q in sold_all.get(wh["id"], {}).items():
             sold_total[pid] = sold_total.get(pid, 0) + q
+        for pid, q in sold_long_all.get(wh["id"], {}).items():
+            sold_long[pid] = sold_long.get(pid, 0) + q
     bmap = buy_som_map()
-    rows = []
+    rows, no_data = [], []
     for p in prices.PRICE_LIST_DATA:
         sold = sold_total.get(p["id"], 0)
-        if sold <= 0:
-            continue
         have = max(stock_total.get(p["id"], 0), 0)   # минус — ошибка учёта, не запас
-        per_day = sold / ORDER_WINDOW
+        long_fallback = False
+        if sold > 0:
+            per_day = sold / ORDER_WINDOW
+        else:
+            # Товара не было на складе — продаж за окно нет, но заказывать
+            # его надо в первую очередь (замечание владельца 17.09.2026:
+            # «бот не видит закончившиеся позиции»). Скорость — нижняя
+            # граница по продажам за ORDER_LONG_WINDOW дней.
+            ls = sold_long.get(p["id"], 0)
+            if ls <= 0:
+                if have <= 0 and p["id"] in seen:
+                    no_data.append(f"{p['name'].split('(')[0].strip()} {p['volume']}")
+                continue
+            per_day = ls / ORDER_LONG_WINDOW
+            long_fallback = True
         need = per_day * horizon - have
         if need <= 0:
             continue
@@ -10079,11 +10096,12 @@ def build_order_report(warehouses, horizon=None):
             boxes, order_qty = None, int(math.ceil(need))
         days_left = have / per_day if per_day else 0
         cost = bmap.get(p["id"])
-        rows.append((days_left, p, have, sold, order_qty, boxes, cost))
-    if not rows:
+        rows.append((days_left, p, have, sold, order_qty, boxes, cost,
+                     sold_long.get(p["id"], 0) if long_fallback else None))
+    if not rows and not no_data:
         return None
-    out, n_boxes, total_cost, no_buy = [], 0, 0.0, 0
-    for days_left, p, have, sold, order_qty, boxes, cost in sorted(rows, key=lambda r: r[0]):
+    out, n_boxes, total_cost, no_buy, n_long = [], 0, 0.0, 0, 0
+    for days_left, p, have, sold, order_qty, boxes, cost, ls in sorted(rows, key=lambda r: r[0]):
         label = p["name"].split("(")[0].strip()
         if cost is None:
             no_buy += 1
@@ -10092,8 +10110,14 @@ def build_order_report(warehouses, horizon=None):
             total_cost += cost * order_qty
             cost_txt = fmt_num(cost * order_qty)
         n_boxes += boxes or 0
-        out.append([label, p["volume"], f"{fmt_num(have)} шт",
-                    f"{fmt_num(sold)} шт", f"≈{int(days_left)} дн.",
+        if ls is not None:
+            n_long += 1
+            sold_txt = f"0 (за {ORDER_LONG_WINDOW} дн.: {fmt_num(ls)})"
+            left_txt = "ЗАКОНЧИЛСЯ" if have <= 0 else f"≈{int(days_left)} дн."
+        else:
+            sold_txt = f"{fmt_num(sold)} шт"
+            left_txt = f"≈{int(days_left)} дн."
+        out.append([label, p["volume"], f"{fmt_num(have)} шт", sold_txt, left_txt,
                     f"{fmt_num(order_qty)} шт" + (f" ({boxes} кор)" if boxes else ""),
                     cost_txt])
     names = ", ".join(f"«{w['name']}»" for w in warehouses)
@@ -10101,6 +10125,17 @@ def build_order_report(warehouses, horizon=None):
               f"{money(total_cost)}")
     if no_buy:
         footer += f" (без закупочной цены: {no_buy} поз.)"
+    if n_long:
+        footer += (f". Без продаж за {ORDER_WINDOW} дн. — {n_long} поз.: товара не "
+                   f"было, скорость взята по продажам за {ORDER_LONG_WINDOW} дн. "
+                   f"(нижняя граница — реальный спрос может быть выше)")
+    if no_data:
+        shown = no_data[:20]
+        more = f" и ещё {len(no_data) - 20}" if len(no_data) > 20 else ""
+        footer += (f". НЕТ В НАЛИЧИИ и продаж не было {ORDER_LONG_WINDOW} дн. "
+                   f"(решайте сами): " + ", ".join(shown) + more)
+    if not out:
+        out = [["—", "", "", "", "", "", ""]]
     date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
     pdf = generate_report_pdf(
         "ЗАЯВКА ПОСТАВЩИКУ",
@@ -10113,8 +10148,12 @@ def build_order_report(warehouses, horizon=None):
           "rows": out, "widths": [36, 20, 19, 22, 17, 28, 17],
           "numbered": True, "footer": footer}])
     return pdf, (f"📦 Заявка поставщику на {horizon} дн. ({names}): "
-                 f"{len(out)} поз., {n_boxes} кор., закуп ≈ {money(total_cost)}"
+                 f"{len(rows)} поз., {n_boxes} кор., закуп ≈ {money(total_cost)}"
                  + (f"; без закупочной цены: {no_buy} поз." if no_buy else "")
+                 + (f"\n‼️ Закончившихся (по продажам за {ORDER_LONG_WINDOW} дн.): {n_long}"
+                    if n_long else "")
+                 + (f"\n❓ Нет в наличии, продаж давно нет: {len(no_data)} поз. — в подвале"
+                    if no_data else "")
                  + f"\nДругой горизонт: /order {horizon * 2}. "
                  "Что и где лежит: /forecast.")
 
