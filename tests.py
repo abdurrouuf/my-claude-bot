@@ -8,6 +8,7 @@ import json
 import os
 import sys
 import tempfile
+from datetime import datetime, timedelta
 
 _TMP = tempfile.mkdtemp(prefix="vetop_tests_")
 os.environ.setdefault("TELEGRAM_TOKEN", "1:test")
@@ -3029,6 +3030,34 @@ def test_order_report():
     # Горизонт числом: на 7 дней №16 хватает (105 шт при 1.25/дн) — не в заявке
     pdf7, cap7 = bot.build_order_report([wh, m], 7)
     assert "1 поз." in cap7 and "на 7 дн." in cap7
+    # 17.09.2026: закончившийся товар без продаж за 60 дн. — в заявке по
+    # продажам за 180 дн. (нижняя граница); ноль без продаж 180 дн. — в
+    # подвале «решайте сами»
+    conn = db.connect()
+    old_ts = (datetime.now() - timedelta(days=100)).isoformat()
+    _load(wh, {24: 40, 25: 10})
+    c_t = db.client_exact(wh["id"], "Тест")
+    _invoice(wh, ADMIN, "Тест", [_item(24, 40, 230)], client_id=c_t["id"])   # №24 продан весь
+    conn.execute("UPDATE operations SET ts=? WHERE id=(SELECT MAX(id) FROM operations)",
+                 (old_ts,))
+    conn.commit()
+    _invoice(wh, ADMIN, "Тест", [_item(25, 10, 100)], client_id=c_t["id"])   # №25 продан, но давно
+    conn.execute("UPDATE operations SET ts=? WHERE id=(SELECT MAX(id) FROM operations)",
+                 ((datetime.now() - timedelta(days=200)).isoformat(),))
+    conn.commit()
+    captured.clear()
+    bot.generate_report_pdf = spy
+    try:
+        pdf2, cap2 = bot.build_order_report([wh, m])
+    finally:
+        bot.generate_report_pdf = orig
+    rows2 = {r[0] + " " + r[1]: r for r in captured["rows"]}
+    r24 = rows2[prices.BY_ID[24]["name"].split("(")[0].strip() + " " + prices.BY_ID[24]["volume"]]
+    assert r24[4] == "ЗАКОНЧИЛСЯ" and "за 180 дн.: 40" in r24[3], r24
+    assert "Закончившихся" in cap2
+    assert (prices.BY_ID[25]["name"].split("(")[0].strip() + " "
+            + prices.BY_ID[25]["volume"]) not in rows2          # №25 — в подвале, не в таблице
+    assert "Нет в наличии, продаж давно нет: 1" in cap2
     # Команда: только админ, только личка; число в аргументах — горизонт
     replies = []
     upd = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
