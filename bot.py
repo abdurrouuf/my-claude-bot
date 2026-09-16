@@ -802,7 +802,9 @@ def _build_static_system() -> str:
                  '«15 числа» → конкретная дата ISO. Если дата не названа — поставь завтра.')
     parts.append('- Если сумма не названа — amount: 0.')
     parts.append('Если клиент ВЫПОЛНИЛ обещание («Асан выполнил обещание», «Асан закрыл '
-                 'обещание») — верни ТОЛЬКО JSON: {"action": "promise_done", "client": "Имя"}')
+                 'обещание») или обещание надо УБРАТЬ («удали обещание Асана», «отмени '
+                 'обещание Асан», «сними обещание») — верни ТОЛЬКО JSON: '
+                 '{"action": "promise_done", "client": "Имя"}')
     parts.append('- promise_done выбирай только при слове «обещание». Если названа сумма '
                  'принесённых денег («Асан принёс 5000») — это оплата, режим 3.')
     parts.append("")
@@ -3659,6 +3661,14 @@ async def promises_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if actor is None:
         return
     admin = is_admin(actor)
+    arg = " ".join(context.args).strip().lower() if context.args else ""
+    if arg in ("очистить", "clear", "удалить", "все", "всё"):
+        # Снять все открытые обещания разом (просьба владельца 16.09.2026:
+        # «как удалить все эти обещания»). Сотрудник — только свои.
+        n = db.promises_close_all(None if admin else actor["id"])
+        await update.message.reply_text(
+            f"🧹 Снято обещаний: {n}." if n else "📅 Открытых обещаний и так нет.")
+        return
     rows = db.promises_open(None if admin else actor["id"])
     if not rows:
         await update.message.reply_text(
@@ -3668,7 +3678,8 @@ async def promises_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     today = datetime.now(BISHKEK).date()
     lines = ["📅 <b>Обещания оплаты</b>", ""]
     lines += [_promise_line(r, today, with_author=admin) for r in rows]
-    lines += ["", "Когда клиент заплатит: «Асан выполнил обещание»"]
+    lines += ["", "Когда клиент заплатит: «Асан выполнил обещание». "
+                  "Убрать одно: «удали обещание Асана»; все сразу: /promises очистить"]
     await send_long(update.message, "\n".join(lines))
 
 

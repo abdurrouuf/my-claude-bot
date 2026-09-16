@@ -3515,6 +3515,38 @@ def test_revision_140926():
                                 "_last_text": "Асан\nАлбенивер 500 мл 0"}) == []
 
 
+def test_promises_clear():
+    """16.09.2026: «как удалить все эти обещания» — /promises очистить (админ:
+    все, сотрудник: только свои); фраза «удали обещание X» = promise_done."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    db.promise_add("Фахриддин", 100000, "2026-08-20", ADMIN)
+    db.promise_add("Диана", 0, "2026-09-09", ADMIN)
+    db.promise_add("Диана", 0, "2026-09-09", DANIYAR)
+    assert len(db.promises_open()) == 3
+    replies = []
+
+    async def reply_text(t, **kw):
+        replies.append(t)
+
+    async def run(uid, args):
+        u = SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                            effective_chat=SimpleNamespace(id=uid, type="private"),
+                            message=SimpleNamespace(reply_text=reply_text))
+        await bot.promises_cmd(u, SimpleNamespace(args=args))
+    # сотрудник чистит только своё
+    asyncio.run(run(DANIYAR, ["очистить"]))
+    assert "Снято обещаний: 1" in replies[-1] and len(db.promises_open()) == 2
+    # админ — всё
+    asyncio.run(run(ADMIN, ["очистить"]))
+    assert "Снято обещаний: 2" in replies[-1] and db.promises_open() == []
+    asyncio.run(run(ADMIN, ["очистить"]))
+    assert "и так нет" in replies[-1]
+    # подсказка в промпте про «удали обещание»
+    assert "удали обещание" in bot._build_static_system()
+
+
 def _areply(sink):
     async def reply_text(text, **kw):
         sink.append(text)

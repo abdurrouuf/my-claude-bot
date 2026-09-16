@@ -621,6 +621,20 @@ def promises_due(today: str):
         (today,)).fetchall()
 
 
+def promises_close_all(user_id=None) -> int:
+    """Закрывает ВСЕ открытые обещания (user_id — только записанные этим
+    сотрудником; None — все, для админа). Возвращает, сколько закрыто."""
+    conn = connect()
+    with _lock, conn:
+        if user_id is None:
+            cur = conn.execute("UPDATE promises SET status='done' WHERE status='open'")
+        else:
+            cur = conn.execute(
+                "UPDATE promises SET status='done' WHERE status='open' AND user_id=?",
+                (user_id,))
+        return cur.rowcount
+
+
 def promises_close(client: str, user_id=None):
     """Закрывает открытые обещания клиента. user_id — только записанные этим
     сотрудником (None — все, для админа). Возвращает, сколько закрыто."""
