@@ -3719,13 +3719,22 @@ def test_moves_report():
     out.clear()
     asyncio.run(bot.moves_cmd(upd, SimpleNamespace(args=["Каракол", "Абракадабра"])))
     assert "Примеры" in out["text"]
-    # в группе — только личка
+    # в группе без привязки — отказ «в личку»
     out.clear()
     upd_g = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
                             effective_chat=SimpleNamespace(id=-5, type="supergroup"),
                             message=Msg())
     asyncio.run(bot.moves_cmd(upd_g, SimpleNamespace(args=[wh["name"]] + words)))
-    assert "личке" in out["text"]
+    assert "личку" in out["text"]
+    # в чате склада — склад чата, без слова склада («делай» 18.09.2026);
+    # чужой склад в аргументах игнорируется
+    db.set_feed_chat(wh["id"], -5, "чат")
+    out.clear()
+    asyncio.run(bot.moves_cmd(upd_g, SimpleNamespace(args=words)))
+    assert out.get("pdf", b"")[:4] == b"%PDF" and "остаток 72" in out["cap"], out.get("cap")
+    out.clear()
+    asyncio.run(bot.moves_cmd(upd_g, SimpleNamespace(args=["Манас"] + words)))
+    assert "остаток 72" in out["cap"] and wh["name"] in out["cap"]
 
 
 def main():

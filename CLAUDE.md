@@ -2206,6 +2206,10 @@ json_each по stock_deltas — единый источник для накла�
 «moves», params pids/label — правило проекта). bot: moves_cmd,
 _moves_split_args, product_moves_rows, _moves_op_text, _moves_report;
 db.product_moves. В меню STAFF_COMMANDS. Тест test_moves_report.
+В ЧАТЕ СКЛАДА работает (тем же днём, «Do» владельца): _group_only_feed_whs
+— склад чата, «/moves Топмектин гель» без слова склада, аргумент-склад
+игнорируется (как /stock, /debts); группа без привязки — «напишите в
+личку». В личке — как раньше (кнопки/all).
 Идея-очередь: /moves по клиенту (все товары клиента) — не просили.
 
 ## Инвентаризация Каракола 18.09.2026 (сверка в чате, БЕЗ кода в боте)
