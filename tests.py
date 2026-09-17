@@ -3355,6 +3355,80 @@ def test_admin_handover_for_employee():
     bot.PENDING.clear()
 
 
+def test_payment_wh_by_client():
+    """17.09.2026: владелец написал «От Беки / Приход Мира эже кировка
+    талас / 21'840» — операция пошла от имени Беки (два склада), и бот
+    спросил «на каком складе провести?», хотя клиент есть только на
+    Бишкеке. Теперь оплата/возврат клиенту, который существует ровно на
+    одном из складов сотрудника, идёт туда без вопроса; клиент на двух
+    складах или незнакомый — вопрос как раньше."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    admin = db.get_user(ADMIN)
+    beka = 5808155644
+    bish = db.warehouse_by_name("Бишкек")
+    kb = db.warehouse_by_name("Кара-Балта")
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1 WHERE id IN (?, ?)",
+                 (bish["id"], kb["id"]))
+    conn.commit()
+    assert len(db.operable_warehouses(db.get_user(beka))) == 2
+    db.clients_add_bulk(bish["id"], [("Мира эже Кировка Талас", 50000)])
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append((t, kw.get("reply_markup")))
+
+    def upd(uid):
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=uid, type="private"),
+                               message=Msg())
+    text = "От Беки\nПриход Мира эже кировка талас\n21'840"
+    action = ('{"action": "payment", "client": "Мира эже кировка талас", '
+              '"amount": 21840, "as_employee": "Бека"}')
+    # 1. Админ «за Беку»: клиент только на Бишкеке — карточка сразу
+    bot.PENDING.clear()
+    asyncio.run(bot.dispatch_action(upd(ADMIN), SimpleNamespace(bot=None), admin,
+                                    action, src_text=text, last_text=text))
+    assert not any("нескольким складам" in r[0] for r in replies), replies
+    p = list(bot.PENDING.values())[0]
+    assert p["kind"] == "payment" and p["user_id"] == beka
+    assert p["wh_id"] == bish["id"] and p["amount"] == 21840
+    # 2. Сам Бека в личке без склада — тоже без вопроса
+    bot.PENDING.clear(); replies.clear()
+    asyncio.run(bot.dispatch_action(
+        upd(beka), SimpleNamespace(bot=None), db.get_user(beka),
+        '{"action": "payment", "client": "Мира эже кировка талас", "amount": 5000}',
+        src_text="Мира эже приход 5000", last_text="Мира эже приход 5000"))
+    p = list(bot.PENDING.values())[0]
+    assert p["kind"] == "payment" and p["wh_id"] == bish["id"]
+    # 3. Незнакомый клиент — вопрос о складе, как раньше
+    bot.PENDING.clear(); replies.clear()
+    asyncio.run(bot.dispatch_action(
+        upd(beka), SimpleNamespace(bot=None), db.get_user(beka),
+        '{"action": "payment", "client": "Неизвестный", "amount": 5000}',
+        src_text="Неизвестный приход 5000", last_text="Неизвестный приход 5000"))
+    assert list(bot.PENDING.values())[0]["kind"] == "pick_wh"
+    assert "нескольким складам" in replies[-1][0]
+    # 4. Клиент с таким именем на ОБОИХ складах — тоже вопрос
+    db.clients_add_bulk(kb["id"], [("Мира эже Кировка Талас", 0)])
+    bot.PENDING.clear(); replies.clear()
+    asyncio.run(bot.dispatch_action(upd(ADMIN), SimpleNamespace(bot=None), admin,
+                                    action, src_text=text, last_text=text))
+    assert list(bot.PENDING.values())[0]["kind"] == "pick_wh"
+    # 5. Накладная не трогается (новому клиенту — на любой склад)
+    bot.PENDING.clear(); replies.clear()
+    asyncio.run(bot.dispatch_action(
+        upd(beka), SimpleNamespace(bot=None), db.get_user(beka),
+        '{"action": "invoice", "client": "Новый Клиент", "items": '
+        '[{"name": "Альтопен", "volume": "100 мл", "qty": 1, "price": 90}]}',
+        src_text="Новый Клиент Альтопен 100 мл 1 шт", last_text="Новый Клиент Альтопен 100 мл 1 шт"))
+    assert list(bot.PENDING.values())[0]["kind"] == "pick_wh"
+    bot.PENDING.clear()
+
+
 def test_forwarded_bot_message_ignored():
     """14.09.2026: владелец переслал в чат склада ответ бота «✅ Инкассация …
     принято (операция №684)» — бот принял пересылку за операцию и ответил
