@@ -2987,10 +2987,16 @@ def payment_summary(p) -> str:
     remainder = old_debt - p["amount"]
     part = (f" ({p['part_i']} из {p['part_n']})"
             if p.get("part_n") and int(p["part_n"]) > 1 else "")
+    # Кто принял деньги (в чью кассу): при «От Беки …» от админа карточка
+    # раньше не показывала сотрудника — вопрос владельца 17.09.2026
+    # «а где видно, что от имени Беки?». commit_payment пишет на user_id.
+    taker = db.get_user(p["user_id"])
+    taker_name = taker["name"] if taker else "?"
     lines = [
         f"💵 <b>Подтвердите приход{part}</b>",
         f"🏬 Склад: <b>{esc(p['wh_name'])}</b>",
         f"👤 Клиент: <b>{esc(c['name'])}</b>",
+        f"💼 Принял деньги: <b>{esc(taker_name)}</b> (в его кассу)",
         f"⚠️ Текущий долг: {money(old_debt)}"
         + (" (с учётом карточки выше)" if offset else ""),
         f"✅ Оплата: <b>{money(p['amount'])}</b>",
