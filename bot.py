@@ -10567,6 +10567,27 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📊 Экспорт {label}: операции, долги, остатки, кассы")
 
 
+async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/history — Excel: движение и продажи ВСЕХ товаров по дням и месяцам
+    (просьба владельца 18.09.2026 — файл для разбора спроса и планирования
+    закупок в Китае). Только админ, только личка: закупочные решения и
+    продажи по всем складам."""
+    if await _require_admin(update) is None:
+        return
+    if not await _require_private(update):
+        return
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id,
+                                       action="upload_document")
+    import export_xlsx
+    xlsx = export_xlsx.build_history(training_wh_ids=training_wh_ids())
+    filename = f"история_ВЕТОП_{datetime.now(BISHKEK).strftime('%d%m%Y')}.xlsx"
+    await update.message.reply_document(
+        document=InputFile(xlsx, filename=filename),
+        caption="📈 История движения товара: продажи по месяцам и дням, все "
+                "движения, остатки со скоростью продаж — по всем складам. "
+                "Скиньте файл Джарвису для разбора.")
+
+
 async def rate_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Настройки закупа: курс, накладные расходы, сколько цен задано."""
     if await _require_admin(update) is None:
@@ -12869,6 +12890,7 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("deadstock", "Мёртвый товар"),
     ("forecast", "Прогноз закупки"),
     ("export", "Excel-экспорт всего учёта"),
+    ("history", "Excel: продажи по месяцам/дням, все движения товара"),
     ("minstock", "Минимальные остатки"),
     ("pricelog", "История изменения цен"),
     ("users", "Команда и доступы"),
@@ -13063,6 +13085,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("minstock", minstock_cmd))
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
+    app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("margin", margin_cmd))
     app.add_handler(CommandHandler("stockcost", stockcost_cmd))

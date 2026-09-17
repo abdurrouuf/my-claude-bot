@@ -3737,6 +3737,64 @@ def test_moves_report():
     assert "остаток 72" in out["cap"] and wh["name"] in out["cap"]
 
 
+def test_history_xlsx():
+    # /history — Excel по всем товарам: продажи по месяцам/дням, движения,
+    # остатки (18.09.2026, для планирования закупок)
+    import asyncio
+    from types import SimpleNamespace
+    from openpyxl import load_workbook
+    wh = _fresh_db()
+    pid = prices.match_product("Топмектин гель", "30 мл")["id"]
+    _load(wh, {pid: 100, 16: 20})
+    (op1, *_), _ = _invoice(wh, ADMIN, "Асан", [_item(pid, 7, 220)])
+    _invoice(wh, ADMIN, "Болот", [_item(pid, 3, 220)])
+    db.cancel_operation(op1)          # отменённая не должна считаться
+    import export_xlsx
+    buf = export_xlsx.build_history()
+    wb = load_workbook(buf)
+    assert wb.sheetnames[:5] == ["Продажи по месяцам", "По складам и месяцам",
+                                 "Продажи по дням", "Все движения", "Остатки и скорость"]
+    ws = wb["Продажи по месяцам"]
+    hdr = [c.value for c in ws[1]]
+    month = datetime.now().strftime("%Y-%m")
+    assert month in hdr
+    row = next(r for r in ws.iter_rows(min_row=2, values_only=True) if r[0] == pid)
+    assert row[hdr.index(month)] == 3 and row[hdr.index("Итого")] == 3
+    assert row[hdr.index("Остаток сейчас")] == 97
+    ws4 = wb["Все движения"]
+    types = [r[6] for r in ws4.iter_rows(min_row=2, values_only=True)]
+    assert types.count("Накладная") == 1 and "Инвентаризация" in types
+    ws5 = wb["Остатки и скорость"]
+    r5 = next(r for r in ws5.iter_rows(min_row=2, values_only=True) if r[1] == pid)
+    assert r5[4] == 97 and r5[5] == 3
+
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["doc"], out["cap"] = document.input_file_content, caption
+
+    class Bot:
+        async def send_chat_action(self, **kw):
+            pass
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    asyncio.run(bot.history_cmd(upd, SimpleNamespace(args=[], bot=Bot())))
+    assert out.get("doc", b"")[:2] == b"PK" and "История" in out["cap"]
+    # сотруднику — отказ (закупочные решения — дело владельца)
+    out.clear()
+    upd_e = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                            effective_chat=SimpleNamespace(id=2, type="private"),
+                            message=Msg())
+    asyncio.run(bot.history_cmd(upd_e, SimpleNamespace(args=[], bot=Bot())))
+    assert "doc" not in out
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

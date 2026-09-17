@@ -1,7 +1,7 @@
 # Экспорт учёта в Excel: операции за период + текущие долги, остатки, кассы.
 import io
 import json
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Font, PatternFill
@@ -168,3 +168,204 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
     wb.save(buffer)
     buffer.seek(0)
     return buffer
+
+
+# ---------- /history — движение и продажи ВСЕХ товаров по датам ----------
+# Просьба владельца 18.09.2026: «все движения, все препараты, по дням, по
+# месяцам — сколько продалось в августе, в сентябре… чтобы знать, что и
+# когда заказывать из Китая». Файл он скидывает Джарвису на разбор, поэтому
+# формат — плоские таблицы Excel, а не PDF.
+
+def _month_key(ts: str) -> str:
+    return ts[:7]            # «2026-08»
+
+
+def _day_key(ts: str) -> str:
+    return ts[:10]           # «2026-08-14»
+
+
+def build_history(training_wh_ids=None) -> io.BytesIO:
+    """Excel: продажи по месяцам (товар × месяц), по месяцам и складам,
+    по дням, все движения товара, остатки со скоростью продаж, справка.
+    Только проведённые операции (отменённые не искажают спрос); учебные
+    склады (training_wh_ids) не входят."""
+    skip = set(training_wh_ids or ())
+    whs = {w["id"]: w["name"] for w in db.all_warehouses() if w["id"] not in skip}
+    users = {u["id"]: u["name"] for u in db.list_users(active_only=False)}
+    clients = {r["id"]: r["name"] for r in
+               db.connect().execute("SELECT id, name FROM clients")}
+    prods = {p["id"]: p for p in prices.PRICE_LIST_DATA}
+    order = {p["id"]: i for i, p in enumerate(prices.PRICE_LIST_DATA)}
+
+    # sold[(wh, pid)][month] = чисто продано (накладные − возвраты)
+    sold_m, sold_d, money_d = {}, {}, {}
+    months = set()
+    moves = []
+    for op in db.operations_since("2000-01-01"):
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        t, ts = op["type"], op["ts"]
+        deltas = [(w, p, d) for w, p, d in data.get("stock_deltas", [])
+                  if w in whs and d]
+        if not deltas:
+            continue
+        # продажи: накладная (минус) и возврат (плюс)
+        if t in ("invoice", "return"):
+            price_by_pid = {}
+            for it in data.get("items") or []:
+                if it.get("product_id"):
+                    price_by_pid[it["product_id"]] = float(it.get("price") or 0)
+            for w, p, d in deltas:
+                q = -d if t == "invoice" else -d      # накладная −d>0; возврат d>0 → −d<0
+                mk, dk = _month_key(ts), _day_key(ts)
+                months.add(mk)
+                sold_m.setdefault((w, p), {})
+                sold_m[(w, p)][mk] = sold_m[(w, p)].get(mk, 0) + q
+                key = (dk, w, p)
+                cur = sold_d.setdefault(key, [0, 0])
+                if t == "invoice":
+                    cur[0] += -d
+                else:
+                    cur[1] += d
+                money_d[key] = money_d.get(key, 0.0) + q * price_by_pid.get(p, 0.0)
+        # все движения
+        for w, p, d in deltas:
+            others = sorted({x for x, _p, _d in data.get("stock_deltas", []) if x != w})
+            if t in ("invoice", "return"):
+                who = clients.get(op["client_id"], "—")
+            elif t == "transfer":
+                if not others:
+                    who = "поставка (приход извне)"
+                else:
+                    names = ", ".join(whs.get(x) or db.warehouse_by_id(x)["name"] for x in others)
+                    who = ("из " if d > 0 else "в ") + names
+            elif t == "writeoff":
+                who = (data.get("reason") or "").strip() or "—"
+            elif t == "inventory":
+                s = (op["summary"] or "").lower()
+                who = "стартовая загрузка" if ("загрузка" in s or "стартов" in s) else "корректировка"
+            else:
+                who = "—"
+            pr = prods.get(p)
+            moves.append([
+                _day_key(ts), ts[11:16], op["id"], whs[w],
+                _txt(pr["name"].split(" (")[0] if pr else f"товар №{p}"),
+                pr["volume"] if pr else "", OP_TYPES.get(t, t),
+                d if d > 0 else None, -d if d < 0 else None,
+                _txt(who), users.get(op["user_id"], "—"),
+            ])
+
+    months = sorted(months)
+    wb = Workbook()
+
+    # --- 1. Продажи по месяцам, все склады вместе ---
+    ws = wb.active
+    ws.title = "Продажи по месяцам"
+    stock_total = {}
+    for w in whs:
+        for p, q in db.stock_map(w).items():
+            stock_total[p] = stock_total.get(p, 0) + q
+    _sheet_header(ws, ["№", "Товар", "Фасовка"] + months + ["Итого", "Остаток сейчас"],
+                  [5, 34, 14] + [10] * len(months) + [10, 14])
+    by_pid = {}
+    for (w, p), mm in sold_m.items():
+        for mk, q in mm.items():
+            by_pid.setdefault(p, {})[mk] = by_pid.get(p, {}).get(mk, 0) + q
+    for p in sorted(prods, key=order.get):
+        pr = prods[p]
+        row_m = [by_pid.get(p, {}).get(mk, 0) for mk in months]
+        ws.append([p, _txt(pr["name"].split(" (")[0]), pr["volume"]]
+                  + row_m + [sum(row_m), stock_total.get(p, 0)])
+    ws.append([])
+    ws.append(["", "ИТОГО", ""] + [sum(by_pid.get(p, {}).get(mk, 0) for p in prods) for mk in months]
+              + [sum(sum(v.values()) for v in by_pid.values()), sum(stock_total.values())])
+    for c in ws[ws.max_row]:
+        c.font = Font(bold=True)
+
+    # --- 2. Продажи по месяцам и складам ---
+    ws2 = wb.create_sheet("По складам и месяцам")
+    _sheet_header(ws2, ["Склад", "№", "Товар", "Фасовка"] + months + ["Итого", "Остаток"],
+                  [12, 5, 34, 14] + [10] * len(months) + [10, 10])
+    for w in sorted(whs, key=lambda x: whs[x]):
+        smap = db.stock_map(w)
+        for p in sorted(prods, key=order.get):
+            mm = sold_m.get((w, p), {})
+            if not mm and not smap.get(p):
+                continue
+            pr = prods[p]
+            row_m = [mm.get(mk, 0) for mk in months]
+            ws2.append([whs[w], p, _txt(pr["name"].split(" (")[0]), pr["volume"]]
+                       + row_m + [sum(row_m), smap.get(p, 0)])
+
+    # --- 3. Продажи по дням ---
+    ws3 = wb.create_sheet("Продажи по дням")
+    _sheet_header(ws3, ["Дата", "Склад", "№", "Товар", "Фасовка", "Продано",
+                        "Возвращено", "Чистыми", "Сумма, сом"],
+                  [12, 12, 5, 34, 14, 10, 11, 10, 12])
+    for (dk, w, p), (s, r) in sorted(sold_d.items(), key=lambda kv: (kv[0][0], whs[kv[0][1]], order.get(kv[0][2], 999))):
+        pr = prods.get(p)
+        ws3.append([dk, whs[w], p, _txt(pr["name"].split(" (")[0] if pr else f"товар №{p}"),
+                    pr["volume"] if pr else "", s, r, s - r, round(money_d.get((dk, w, p), 0.0))])
+
+    # --- 4. Все движения ---
+    ws4 = wb.create_sheet("Все движения")
+    _sheet_header(ws4, ["Дата", "Время", "№ оп.", "Склад", "Товар", "Фасовка", "Тип",
+                        "Приход", "Расход", "Контрагент / откуда-куда / причина", "Сотрудник"],
+                  [12, 7, 7, 12, 34, 14, 16, 9, 9, 34, 14])
+    for row in moves:
+        ws4.append(row)
+
+    # --- 5. Остатки и скорость ---
+    ws5 = wb.create_sheet("Остатки и скорость")
+    _sheet_header(ws5, ["Склад", "№", "Товар", "Фасовка", "Остаток",
+                        "Продано 30 дн", "Продано 60 дн", "Продано 90 дн",
+                        "Хватит дней (по 90)"],
+                  [12, 5, 34, 14, 10, 13, 13, 13, 16])
+    today = datetime.now(db.BISHKEK).date()
+
+    def _sold_since(w, p, days):
+        cut = (today - timedelta(days=days)).isoformat()
+        return sum(s - r for (dk, ww, pp), (s, r) in sold_d.items()
+                   if ww == w and pp == p and dk >= cut)
+    for w in sorted(whs, key=lambda x: whs[x]):
+        smap = db.stock_map(w)
+        for p in sorted(prods, key=order.get):
+            q = smap.get(p, 0)
+            s30, s60, s90 = (_sold_since(w, p, n) for n in (30, 60, 90))
+            if not q and not s90:
+                continue
+            pr = prods[p]
+            days_left = round(q / (s90 / 90), 0) if s90 > 0 and q > 0 else None
+            ws5.append([whs[w], p, _txt(pr["name"].split(" (")[0]), pr["volume"], q,
+                        s30, s60, s90, days_left if days_left is not None else ("—" if q > 0 else "0")])
+
+    # --- 6. Справка ---
+    ws6 = wb.create_sheet("Справка")
+    ws6.column_dimensions["A"].width = 110
+    for line in [
+        f"ИСТОРИЯ ДВИЖЕНИЯ ТОВАРА · ОсОО «ВЕТОП» · сформировано {datetime.now(db.BISHKEK).strftime('%d.%m.%Y %H:%M')}",
+        "",
+        "Продажи = накладные минус возвраты, в штуках (единицах прайса: для 10 мл — пачки по 10 флаконов).",
+        "Только проведённые операции; отменённые (/undo, замены) не считаются. Черновики переходного периода не входят.",
+        "Учебные склады исключены." if skip else "Учебных складов нет.",
+        f"Период журнала: {months[0] if months else '—'} … {months[-1] if months else '—'}. "
+        "ВНИМАНИЕ: первые месяцы у складов неполные — учёт по складам запускался постепенно "
+        "(Каракол 21.07, Кара-Балта ~02.08, Манас 05.08, Бишкек 13.08.2026).",
+        "",
+        "Листы:",
+        "1. Продажи по месяцам — товар × месяц, все склады вместе; последняя колонка — остаток сейчас по всем складам.",
+        "2. По складам и месяцам — то же с разбивкой по складам (строки без продаж и без остатка скрыты).",
+        "3. Продажи по дням — дата, склад, товар: продано / возвращено / чистыми / сумма по ценам накладных.",
+        "4. Все движения — каждая операция, задевшая остаток: приход/расход, контрагент, сотрудник.",
+        "5. Остатки и скорость — остаток и продажи за 30/60/90 дней по складу, «хватит дней» по скорости за 90 дней.",
+        "",
+        "Для анализа Джарвисом: скинуть файл в чат Claude — читается напрямую.",
+    ]:
+        ws6.append([line])
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf
