@@ -6593,6 +6593,29 @@ WAREHOUSE_ACTIONS = {"invoice", "payment", "return", "inventory", "writeoff",
                      "set_price", "client_alias", "fix_expiry"}
 
 
+def _wh_by_client(data: dict, whs):
+    """Склад операции по клиенту (17.09.2026): сотрудник с несколькими
+    складами (или админ «за сотрудника»: «От Беки / Приход Мира эже …»)
+    склад не назвал, а клиент операции существует РОВНО на одном из его
+    складов — берём этот склад без вопроса «на каком провести?».
+    Только для операций с существующим клиентом (оплата, возврат):
+    накладная новому клиенту может быть на любой склад — там спрашиваем.
+    Клиент на нескольких складах или нигде — None (вопрос как раньше)."""
+    if data.get("action") not in ("payment", "return"):
+        return None
+    name = str(data.get("client") or "").strip()
+    if not name:
+        return None
+    found = []
+    for w in whs:
+        try:
+            if db.client_exact(w["id"], name):
+                found.append(w)
+        except Exception:
+            return None
+    return found[0] if len(found) == 1 else None
+
+
 async def dispatch_action(update, context, actor, reply, draft=False, quiet=False,
                           src_text="", last_text=None):
     data = extract_action(reply)
@@ -6672,7 +6695,13 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
             and not op_id_given
             and not str(data.get("warehouse") or "").strip()):
         whs = db.operable_warehouses(actor)
-        if len(whs) > 1:
+        by_client = _wh_by_client(data, whs) if len(whs) > 1 else None
+        if by_client is not None:
+            # Клиент есть ровно на одном из складов — вопрос не нужен
+            # (17.09.2026: «От Беки / Приход Мира эже кировка талас /
+            # 21'840» спрашивал склад, хотя клиент только на Бишкеке).
+            data["warehouse"] = by_client["name"]
+        elif len(whs) > 1:
             payload = {"kind": "pick_wh", "user_id": actor["id"],
                        "chat_id": update.effective_chat.id,
                        "action_data": data, "draft": draft}
