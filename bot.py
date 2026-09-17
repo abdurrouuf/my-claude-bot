@@ -10159,14 +10159,26 @@ async def _moves_report(update, whs, actor, params):
 async def moves_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/moves Склад Товар [фасовка] — карточка движения товара по складу
     (приход, продажи, перемещения, списания, инвентаризации с бегущим
-    остатком). Без склада — кнопки выбора (правило проекта). Только личка:
-    в строках клиенты и другие склады."""
+    остатком). Без склада — кнопки выбора (правило проекта). В чате склада
+    (18.09.2026, «делай» владельца) — склад этого чата, как /stock и /debts:
+    пишется просто «/moves Товар», аргумент-склад игнорируется; клиенты
+    склада в его ленте и так видны."""
     actor = await get_actor(update)
     if actor is None:
         return
-    if not await _require_private(update):
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group and not whs_group:
         return
-    whs_arg, label, pids = _moves_split_args(context.args or [])
+    args = context.args or []
+    whs_arg, label, pids = None, None, None
+    if in_group:
+        # Всё сообщение — препарат; если слово склада всё же написали,
+        # разбираем как в личке, но склад берём у чата
+        got = _parse_sales_query(" ".join(args)) if args else (None, None, None, [])
+        if got[1] and not got[2]:
+            label, pids = got[0], got[1]
+    if not pids:
+        whs_arg, label, pids = _moves_split_args(args)
     if not pids:
         await update.message.reply_text(
             "📈 Движение товара по складу: когда пришёл, кому продан, куда "
@@ -10177,7 +10189,9 @@ async def moves_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "/moves all Дексатоп 50мл — по всем складам")
         return
     visible = db.visible_warehouses(actor)
-    if whs_arg == "all":
+    if in_group:
+        whs = whs_group
+    elif whs_arg == "all":
         whs = visible
     elif whs_arg:
         whs = [w for w in whs_arg if db.can_view_warehouse(actor, w["id"])]
