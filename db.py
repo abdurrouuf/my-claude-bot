@@ -1521,6 +1521,37 @@ def product_sales(pids, wh_ids, client_ids=None):
     return out
 
 
+def product_moves(wh_id: int, product_id: int):
+    """Карточка товара по складу (/moves, 18.09.2026): ВСЕ операции журнала,
+    задевшие остаток (склад, товар) — включая отменённые (их дельты уже
+    сторнированы, показываем пометкой), по возрастанию id. Возвращает
+    [(op_row + client_name + user_name, дельта, data_dict)]. Дельта берётся из
+    stock_deltas — единый источник для накладных, возвратов, перемещений,
+    списаний и инвентаризаций; fix_expiry остаток не меняет и сюда не входит."""
+    out = []
+    for op in connect().execute(
+            "SELECT o.*, c.name AS client_name, u.name AS user_name "
+            "FROM operations o "
+            "LEFT JOIN clients c ON c.id = o.client_id "
+            "LEFT JOIN users u ON u.id = o.user_id "
+            "WHERE json_valid(o.data) AND EXISTS (SELECT 1 FROM "
+            "json_each(o.data, '$.stock_deltas') je "
+            "WHERE json_extract(je.value, '$[0]')=? "
+            "AND json_extract(je.value, '$[1]')=?) "
+            "ORDER BY o.id", (wh_id, product_id)):
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        delta = 0
+        for wh, pid, d in data.get("stock_deltas", []):
+            if wh == wh_id and pid == product_id:
+                delta += d
+        if delta:
+            out.append((op, delta, data))
+    return out
+
+
 def draft_items_all():
     """Черновики с составом и датой — для истории продаж переходного периода."""
     return connect().execute(

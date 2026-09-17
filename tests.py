@@ -3658,6 +3658,76 @@ def _areply(sink):
     return reply_text
 
 
+def test_moves_report():
+    # /moves Склад Товар — карточка движения товара с бегущим остатком
+    # (18.09.2026, инвентаризация Каракола: «куда делись 63 Топмектин геля?»)
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    wh2 = db.warehouse_by_name("Манас")
+    pid = prices.match_product("Топмектин гель", "30 мл")["id"]
+    _load(wh, {pid: 100, 16: 10})
+    (op1, *_), _ = _invoice(wh, ADMIN, "Асан", [_item(pid, 7, 220)])
+    _invoice(wh, ADMIN, "Болот", [_item(pid, 3, 220)])
+    # перемещение на другой склад
+    db.commit_operation(ADMIN, "transfer", wh2["id"], None, "Перемещение",
+                        [(wh2["id"], pid, 20), (wh["id"], pid, -20)], [],
+                        {"items": []})
+    # списание
+    db.commit_operation(ADMIN, "writeoff", wh["id"], None, "Списание",
+                        [(wh["id"], pid, -5)], [], {"items": [], "reason": "бой"})
+    # отмена одной накладной — строка остаётся, остаток не трогает
+    db.cancel_operation(op1)
+    rows, tot = bot.product_moves_rows(wh["id"], pid)
+    assert [r[6] for r in rows] == ["100", "—", "97", "77", "72"], rows
+    assert tot["bal"] == db.stock_qty(wh["id"], pid) == 72
+    assert tot["sold"] == 3 and tot["moved_out"] == 20 and tot["written"] == 5
+    assert rows[1][2].startswith("ОТМЕНЕНА") and "Асан" in rows[1][2]
+    assert "Перемещение в «Манас»" in rows[3][2]
+    assert "Списание: бой" in rows[4][2]
+    assert rows[0][2].startswith("Стартовая загрузка") or rows[0][2].startswith("Инвентаризация")
+    # другой товар склада в карточку не попадает
+    assert bot.product_moves_rows(wh["id"], 16)[1]["bal"] == 10
+    # на складе-получателе перемещение — приход
+    rows2, tot2 = bot.product_moves_rows(wh2["id"], pid)
+    assert tot2["moved_in"] == 20 and "из «" in rows2[0][2]
+
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"], out["kb"] = text, kw.get("reply_markup")
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["pdf"], out["cap"] = document.input_file_content, caption
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=1, type="private"),
+                          message=Msg())
+    words = bot._base_name(prices.BY_ID[pid]).split()   # «ТОПМЕКТИН ГЕЛЬ»
+    # склад + товар — сразу PDF; склад можно писать и после товара
+    asyncio.run(bot.moves_cmd(upd, SimpleNamespace(args=[wh["name"]] + words)))
+    assert out.get("pdf", b"")[:4] == b"%PDF" and "остаток 72" in out["cap"], out.get("cap")
+    out.clear()
+    asyncio.run(bot.moves_cmd(upd, SimpleNamespace(args=words + [wh["name"]])))
+    assert out.get("pdf", b"")[:4] == b"%PDF"
+    # без склада — кнопки выбора (правило проекта)
+    out.clear()
+    asyncio.run(bot.moves_cmd(upd, SimpleNamespace(args=words)))
+    assert out.get("kb") is not None and "какому складу" in out["text"]
+    # непонятный товар — подсказка, не падение
+    out.clear()
+    asyncio.run(bot.moves_cmd(upd, SimpleNamespace(args=["Каракол", "Абракадабра"])))
+    assert "Примеры" in out["text"]
+    # в группе — только личка
+    out.clear()
+    upd_g = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                            effective_chat=SimpleNamespace(id=-5, type="supergroup"),
+                            message=Msg())
+    asyncio.run(bot.moves_cmd(upd_g, SimpleNamespace(args=[wh["name"]] + words)))
+    assert "личке" in out["text"]
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

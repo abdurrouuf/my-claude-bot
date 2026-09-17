@@ -9950,6 +9950,252 @@ async def sales_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         document=InputFile(pdf, filename=fname), caption=cap[:1000])
 
 
+# ---------- /moves — карточка движения товара по складу ----------
+# Просьба владельца 18.09.2026 (инвентаризация Каракола: «куда делись 63
+# Топмектин геля?»): одна карточка — все движения товара по складу с
+# бегущим остатком, как оборотная ведомость в 1С.
+
+def _moves_split_args(args: list):
+    """«Каракол Топмектин гель» / «Топмектин гель Каракол» / «all Дексатоп
+    50мл» → (склады|None|"all", подпись, pids). Склад ищется префиксом или
+    суффиксом в 1–2 слова (warehouse_by_name прощает опечатки), остаток
+    должен разобраться как препарат; без склада — (None, подпись, pids),
+    команда спросит кнопками. Не поняли препарат — (None, None, None)."""
+    words = [w for w in args if w.strip()]
+    if not words:
+        return None, None, None
+
+    def _prod(ws):
+        if not ws:
+            return None
+        label, pids, cli, _c = _parse_sales_query(" ".join(ws))
+        if not pids or cli:      # хвост-«клиент» здесь — не разобранный мусор
+            return None
+        return label, pids
+
+    # Сначала склад в одно слово: warehouse_by_name прощает опечатки, и
+    # «ГЕЛЬ Каракол» двумя словами тоже похож на «Каракол» — слово товара
+    # уехало бы в склад.
+    for k in (1, 2):
+        if len(words) <= k:
+            continue
+        for head, rest in ((words[:k], words[k:]), (words[-k:], words[:-k])):
+            joined = " ".join(head)
+            if joined.lower() == "all":
+                got = _prod(rest)
+                if got:
+                    return "all", got[0], got[1]
+                continue
+            wh = db.warehouse_by_name(joined)
+            if wh is None:
+                continue
+            got = _prod(rest)
+            if got:
+                return [wh], got[0], got[1]
+    got = _prod(words)
+    if got:
+        return None, got[0], got[1]
+    return None, None, None
+
+
+def _moves_op_text(op, delta, data, wh_id: int, pid: int) -> str:
+    """Описание строки карточки: что за операция и с кем."""
+    t = op["type"]
+    cli = op["client_name"] or "—"
+    if t == "invoice":
+        txt = f"Накладная: {cli}"
+        if data.get("replaces"):
+            txt += f" (замена №{data['replaces']})"
+    elif t == "return":
+        txt = f"Возврат от: {cli}"
+    elif t == "transfer":
+        others = sorted({wh for wh, _pid, _d in data.get("stock_deltas", [])
+                         if wh != wh_id})
+        if not others:
+            txt = "Приход извне (поставка)"
+        else:
+            names = ", ".join((db.warehouse_by_id(w) or {"name": f"склад {w}"})["name"]
+                              for w in others)
+            txt = f"Перемещение из «{names}»" if delta > 0 else f"Перемещение в «{names}»"
+    elif t == "writeoff":
+        reason = (data.get("reason") or "").strip()
+        txt = f"Списание: {reason}" if reason and reason != "не указана" else "Списание"
+    elif t == "inventory":
+        summ = (op["summary"] or "").lower()
+        txt = "Стартовая загрузка" if ("загрузка" in summ or "стартов" in summ) \
+            else "Инвентаризация"
+        # Корректировка хранит «было → стало» по позиции — показываем, чтобы
+        # было видно, что это пересчёт, а не движение товара
+        for it in data.get("items") or []:
+            if it.get("base") is None or it.get("fact") is None:
+                continue
+            pr = prices.match_product(str(it.get("name") or ""),
+                                      str(it.get("volume") or ""))
+            if pr and pr["id"] == pid:
+                txt += f": было {it['base']} → стало {it['fact']}"
+                break
+    else:
+        txt = LOG_TYPE_NAMES.get(t, t)
+    if op["status"] != "done":
+        txt = "ОТМЕНЕНА — " + txt
+    return txt
+
+
+def product_moves_rows(wh_id: int, pid: int):
+    """Строки карточки товара: (дата, №, операция, сотрудник, приход, расход,
+    остаток после) + итоги. Бегущий остаток идёт от нуля по проведённым
+    операциям; отменённые показываются, но остаток не меняют."""
+    rows, bal = [], 0
+    n_in = n_out = n_cancel = 0
+    sold = returned = written = moved_in = moved_out = arrived = 0
+    for op, delta, data in db.product_moves(wh_id, pid):
+        try:
+            dstr = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y %H:%M")
+        except ValueError:
+            dstr = op["ts"][:16]
+        live = op["status"] == "done"
+        if live:
+            bal += delta
+            if delta > 0:
+                n_in += delta
+            else:
+                n_out += -delta
+            t = op["type"]
+            if t == "invoice":
+                sold += -delta
+            elif t == "return":
+                returned += delta
+            elif t == "writeoff":
+                written += -delta
+            elif t == "transfer":
+                others = {wh for wh, _p, _d in data.get("stock_deltas", []) if wh != wh_id}
+                if not others:
+                    arrived += delta
+                elif delta > 0:
+                    moved_in += delta
+                else:
+                    moved_out += -delta
+        else:
+            n_cancel += 1
+        rows.append([dstr, str(op["id"]), _moves_op_text(op, delta, data, wh_id, pid),
+                     op["user_name"] or "—",
+                     str(delta) if delta > 0 else "",
+                     str(-delta) if delta < 0 else "",
+                     str(bal) if live else "—"])
+    return rows, {"bal": bal, "n_in": n_in, "n_out": n_out, "n_cancel": n_cancel,
+                  "sold": sold, "returned": returned, "written": written,
+                  "moved_in": moved_in, "moved_out": moved_out, "arrived": arrived}
+
+
+MOVES_MAX_ROWS = 250   # страховка от бесконечного PDF по ходовому товару
+
+
+async def _moves_report(update, whs, actor, params):
+    pids = [int(x) for x in (params.get("pids") or [])]
+    label = params.get("label") or "товар"
+    sections, caps = [], []
+    for wh in whs:
+        for pid in pids:
+            pr = prices.BY_ID.get(pid)
+            if pr is None:
+                continue
+            rows, tot = product_moves_rows(wh["id"], pid)
+            if not rows:
+                continue
+            cut = ""
+            if len(rows) > MOVES_MAX_ROWS:
+                cut = f" · показаны последние {MOVES_MAX_ROWS} из {len(rows)}"
+                rows = rows[-MOVES_MAX_ROWS:]
+            now = db.stock_qty(wh["id"], pid)
+            check = "" if now == tot["bal"] else \
+                f" · ⚠ по журналу {tot['bal']}, покажите Джарвису"
+            parts = []
+            if tot["arrived"]:
+                parts.append(f"поставки +{tot['arrived']}")
+            if tot["moved_in"]:
+                parts.append(f"перемещено сюда +{tot['moved_in']}")
+            if tot["returned"]:
+                parts.append(f"возвраты +{tot['returned']}")
+            if tot["sold"]:
+                parts.append(f"продано −{tot['sold']}")
+            if tot["moved_out"]:
+                parts.append(f"перемещено отсюда −{tot['moved_out']}")
+            if tot["written"]:
+                parts.append(f"списано −{tot['written']}")
+            other = (tot["n_in"] - tot["arrived"] - tot["moved_in"] - tot["returned"]) \
+                - (tot["n_out"] - tot["sold"] - tot["moved_out"] - tot["written"])
+            if other:
+                parts.append(f"инвентаризации {other:+d}")
+            foot = (f"Приход {tot['n_in']} · расход {tot['n_out']} · "
+                    f"ОСТАТОК ПО БОТУ: {now} шт"
+                    + (f" · отменённых операций: {tot['n_cancel']}" if tot["n_cancel"] else "")
+                    + cut + check.replace("⚠", "ВНИМАНИЕ:"))
+            if parts:
+                foot += " · Итого: " + ", ".join(parts)
+            sections.append({
+                "title": f"{_base_name(pr)} {pr['volume']} — склад «{wh['name']}»",
+                "headers": ["Дата", "№", "Операция", "Сотрудник", "Приход", "Расход", "Остаток"],
+                "rows": rows, "widths": [24, 10, 58, 24, 19, 19, 20],
+                "footer": foot})
+            caps.append(f"📈 {_base_name(pr)} {pr['volume']} — «{wh['name']}»: "
+                        f"+{tot['n_in']} / −{tot['n_out']}, остаток {now}"
+                        + (f" ({', '.join(parts)})" if parts else "") + check)
+    if not sections:
+        names = ", ".join(f"«{w['name']}»" for w in whs)
+        await update.message.reply_text(
+            f"По «{esc(label)}» на складе {esc(names)} движений в журнале нет.",
+            parse_mode="HTML")
+        return
+    date_str = datetime.now(BISHKEK).strftime("%d.%m.%Y")
+    pdf = generate_report_pdf(
+        "ДВИЖЕНИЕ ТОВАРА", f"ОсОО «ВЕТОП» · {label} · на {date_str}", sections,
+        footer="Остаток — после каждой операции. ОТМЕНЕНА — операция снята "
+               "(/undo или замена), остаток не меняет. Сроки партий — /expiry.")
+    fname = safe_filename(f"движение_{label}") + ".pdf"
+    await update.message.reply_document(
+        document=InputFile(pdf, filename=fname), caption="\n".join(caps)[:1000])
+
+
+async def moves_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/moves Склад Товар [фасовка] — карточка движения товара по складу
+    (приход, продажи, перемещения, списания, инвентаризации с бегущим
+    остатком). Без склада — кнопки выбора (правило проекта). Только личка:
+    в строках клиенты и другие склады."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    if not await _require_private(update):
+        return
+    whs_arg, label, pids = _moves_split_args(context.args or [])
+    if not pids:
+        await update.message.reply_text(
+            "📈 Движение товара по складу: когда пришёл, кому продан, куда "
+            "перемещён — с остатком после каждой операции.\n\n"
+            "Примеры:\n"
+            "/moves Каракол Топмектин гель\n"
+            "/moves Дексатоп 50мл — спрошу, какой склад\n"
+            "/moves all Дексатоп 50мл — по всем складам")
+        return
+    visible = db.visible_warehouses(actor)
+    if whs_arg == "all":
+        whs = visible
+    elif whs_arg:
+        whs = [w for w in whs_arg if db.can_view_warehouse(actor, w["id"])]
+        if not whs:
+            await update.message.reply_text(
+                f"Склад «{esc(whs_arg[0]['name'])}» — нет доступа.", parse_mode="HTML")
+            return
+    else:
+        whs = visible
+        if not whs:
+            await update.message.reply_text("У вас нет склада. Пример: /moves Бишкек Дексатоп")
+            return
+        if await _maybe_ask_warehouse(update, actor, "moves",
+                                      {"pids": pids, "label": label}):
+            return
+    await _moves_report(update, whs, actor, {"pids": pids, "label": label})
+
+
 def _overdue_caption(min_days, found, total, grew_n, grew_total) -> str:
     parts = []
     if found:
@@ -12583,6 +12829,7 @@ STAFF_COMMANDS = [
     ("act", "Акт сверки PDF: /act Имя"),
     ("expiry", "Сроки годности по партиям"),
     ("sales", "История продаж препарата: /sales Дексатоп"),
+    ("moves", "Движение товара по складу: /moves Каракол Дексатоп"),
     ("cash", "Касса (наличные на руках)"),
     ("report", "Отчёт за день/неделю/месяц"),
     ("price", "Прайс-лист"),
@@ -12654,6 +12901,10 @@ def _register_report_picks():
             "emoji": "📋", "question": "Наличие какого склада показать?",
             "whs": lambda a: db.visible_warehouses(a),
             "render": _instock_report},
+        "moves": {
+            "emoji": "📈", "question": "Движение товара по какому складу показать?",
+            "whs": lambda a: db.visible_warehouses(a),
+            "render": _moves_report},
         "instockprice": {
             "emoji": "💰", "question": "Наличие с ценами какого склада показать?",
             "whs": lambda a: db.visible_warehouses(a),
@@ -12787,6 +13038,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("myclients", myclients_cmd))
     app.add_handler(CommandHandler("showdebt", showdebt_cmd))
     app.add_handler(CommandHandler("sales", sales_cmd))
+    app.add_handler(CommandHandler("moves", moves_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))
     app.add_handler(CommandHandler("forecast", forecast_cmd))
     app.add_handler(CommandHandler("order", order_cmd))
