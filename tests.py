@@ -3396,6 +3396,8 @@ def test_payment_wh_by_client():
     p = list(bot.PENDING.values())[0]
     assert p["kind"] == "payment" and p["user_id"] == beka
     assert p["wh_id"] == bish["id"] and p["amount"] == 21840
+    # карточка показывает, кто принял деньги (в чью кассу)
+    assert "Принял деньги: <b>Бека</b>" in replies[-1][0], replies[-1][0]
     # 2. Сам Бека в личке без склада — тоже без вопроса
     bot.PENDING.clear(); replies.clear()
     asyncio.run(bot.dispatch_action(
