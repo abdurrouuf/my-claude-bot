@@ -970,6 +970,16 @@ def _build_static_system() -> str:
                  'выбрасывай из имени слова, включая города («Ден Каракол» '
                  'остаётся «Ден Каракол»). Сомневаешься — оставь имя как есть, '
                  'бот сам предложит похожих кнопками.')
+    parts.append('- Ты НЕ проводишь операции сам: после твоего JSON бот показывает '
+                 'карточку, которую человек ещё должен подтвердить кнопкой, а бот '
+                 'может и отказать (клиента нет, товара не хватает). Никогда не '
+                 'пиши «я провёл/записал приход/накладную». Пометка '
+                 '[ИТОГ БОТА: …] в твоём прошлом ответе — это реальный результат, '
+                 'опирайся только на неё.')
+    parts.append('- Список «Известные клиенты» НЕПОЛНЫЙ (лишь часть справочника). '
+                 'На вопрос «есть ли клиент X?» не отвечай по списку — скажи, что '
+                 'точно проверить можно командой /client X (карточка, ищет по всем '
+                 'складам) или /clients Склад (весь справочник).')
     parts.append("")
     parts.append("ПРАЙС-ЛИСТ (формат: №. Название | Фасовка | шт/кор | цена):")
     parts.append(prices.PRICE_LIST_TEXT)
@@ -3219,6 +3229,8 @@ async def start_payment(update, context, actor, data):
             await update.message.reply_text(
                 _client_mismatch_msg(hint, exact["name"], wh["name"], "оплату"),
                 parse_mode="HTML")
+            _note_outcome(update, "приход НЕ проведён — клиент не найден, "
+                                  "попросил написать имя точно")
             return
 
     if not is_admin(actor) and not wh["full_mode"]:
@@ -3253,10 +3265,42 @@ async def start_payment(update, context, actor, data):
 
     candidates = db.fuzzy_clients(wh["id"], client_name)
     if not candidates:
+        # На этом складе похожих нет — ищем по ДРУГИМ операбельным складам
+        # сотрудника (инцидент 18.09.2026: «Чолпон Аалиева» на Бишкеке —
+        # отказ, хотя похожий клиент мог лежать на другом складе). Кнопка
+        # переключит склад заявки (alt_whs проверяется в pk). Сотруднику —
+        # только склады в полном учёте: на черновичном оплата всё равно
+        # запрещена.
+        alt = []
+        for w2 in db.operable_warehouses(actor):
+            if w2["id"] == wh["id"] or (not is_admin(actor) and not w2["full_mode"]):
+                continue
+            for c in db.fuzzy_clients(w2["id"], client_name):
+                alt.append((c, w2))
+        if not alt:
+            await update.message.reply_text(
+                f"❌ Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}» "
+                f"(и похожих на других складах нет). Приход можно принять только от "
+                f"существующего клиента.\nПроверить по всем складам: "
+                f"/client {esc(client_name.split()[0])}",
+                parse_mode="HTML")
+            _note_outcome(update, f"приход НЕ проведён — клиента «{client_name}» "
+                                  f"нет ни на одном складе")
+            return
+        alt = alt[:6]
+        payload["alt_whs"] = sorted({w2["id"] for _c, w2 in alt})
+        token = new_pending(payload)
+        rows = [[InlineKeyboardButton(f"{_client_btn(actor, w2['id'], c)} — {w2['name']}",
+                                      callback_data=f"pk:{token}:{c['id']}")]
+                for c, w2 in alt]
+        rows.append([InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")])
         await update.message.reply_text(
-            f"❌ Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}». "
-            f"Приход можно принять только от существующего клиента.",
-            parse_mode="HTML")
+            f"Клиент «<b>{esc(client_name)}</b>» не найден на складе «{esc(wh['name'])}».\n"
+            f"Похожие есть на других складах — это он?",
+            parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+        _note_outcome(update, f"приход НЕ проведён — клиента «{client_name}» нет на "
+                              f"складе «{wh['name']}», показаны похожие с других "
+                              f"складов кнопками")
         return
     token = new_pending(payload)
     rows = [[InlineKeyboardButton(_client_btn(actor, wh["id"], c),
@@ -3267,6 +3311,8 @@ async def start_payment(update, context, actor, data):
         f"Клиент «<b>{esc(client_name)}</b>» не найден на складе «{esc(wh['name'])}».\n"
         f"Возможно, вы имели в виду:",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(rows))
+    _note_outcome(update, f"клиент «{client_name}» точно не найден — показаны "
+                          f"похожие кнопками, приход ещё НЕ проведён")
 
 
 # ---------- Перемещение / приход товара ----------
@@ -5728,9 +5774,21 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             chosen = db.client_get(int(parts[2]))
         except (ValueError, IndexError):
             chosen = None
+        if chosen is not None and chosen["warehouse_id"] != p.get("wh_id") \
+                and p.get("kind") == "payment" \
+                and chosen["warehouse_id"] in (p.get("alt_whs") or []):
+            # Похожий клиент с ДРУГОГО склада (start_payment, 18.09.2026):
+            # заявка переезжает на его склад; список alt_whs собран из
+            # операбельных складов заявителя при создании карточки.
+            w2 = db.warehouse_by_id(chosen["warehouse_id"])
+            if w2 is None:
+                await q.answer("Клиент не найден", show_alert=True)
+                return
+            p["wh_id"], p["wh_name"] = w2["id"], w2["name"]
         if chosen is None or chosen["warehouse_id"] != p.get("wh_id"):
             await q.answer("Клиент не найден", show_alert=True)
             return
+        p.pop("alt_whs", None)
         p["client_id"] = chosen["id"]
         # Снимок в базу СРАЗУ: заявка живёт сутки, и после деплоя между
         # кнопками выбранный клиент иначе терялся — «Провести» создавало
@@ -6591,6 +6649,20 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
         src_text = text
     await dispatch_action(update, context, actor, reply, draft, quiet=quiet,
                           src_text=src_text, last_text=text)
+
+
+def _note_outcome(update, note: str):
+    """Пометка о реальном итоге в последнем ответе модели в истории диалога.
+    Модель не видит, что бот сделал с её JSON (инцидент 18.09.2026: приход
+    «Чолпон Аалиева» отклонён — клиента нет, а на следующий вопрос модель
+    ответила «по которому ты только что провёл приход»). Дописываем в
+    последнюю реплику ассистента (парность user/assistant не ломаем)."""
+    chat = getattr(update, "effective_chat", None)
+    if chat is None:
+        return
+    h = chat_histories.get(chat.id) or []
+    if h and h[-1]["role"] == "assistant" and isinstance(h[-1]["content"], str):
+        h[-1]["content"] = h[-1]["content"] + f"\n[ИТОГ БОТА: {note}]"
 
 
 # Действия, где склад берётся «свой по умолчанию», если не указан в сообщении.

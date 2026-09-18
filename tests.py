@@ -3795,6 +3795,71 @@ def test_history_xlsx():
     assert "doc" not in out
 
 
+def test_payment_suggests_other_warehouse_clients():
+    # Инцидент 18.09.2026: «Чолпон Аалиева 20'000 приход» на Бишкеке —
+    # голый отказ, хотя похожий клиент был на другом складе; а модель потом
+    # уверяла, что приход проведён. Теперь: кнопки с клиентами других
+    # складов (заявка переезжает на их склад) + пометка [ИТОГ БОТА] в истории.
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()                                   # Каракол
+    wh_b = db.warehouse_by_name("Бишкек")
+    db.clients_add_bulk(wh["id"], [("Чолпон Казарман", 5000)])
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"], out["kb"] = text, kw.get("reply_markup")
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=777, type="private"),
+                          message=Msg())
+    bot.chat_histories[777] = [{"role": "user", "content": "Чолпон Аалиева 20000 приход"},
+                               {"role": "assistant", "content": '{"action":"payment"}'}]
+    actor = db.get_user(ADMIN)
+    data = {"action": "payment", "client": "Чолпон Аалиева", "amount": 20000,
+            "warehouse": "Бишкек", "_src_text": "Чолпон Аалиева 20000 приход"}
+    asyncio.run(bot.start_payment(upd, SimpleNamespace(bot=None), actor, data))
+    assert "Похожие есть на других складах" in out["text"], out["text"]
+    btns = [b for row in out["kb"].inline_keyboard for b in row]
+    hit = next(b for b in btns if "Чолпон Казарман" in b.text)
+    assert wh["name"] in hit.text
+    # история: модель увидит, что приход НЕ проведён
+    assert "[ИТОГ БОТА" in bot.chat_histories[777][-1]["content"]
+    assert "НЕ проведён" in bot.chat_histories[777][-1]["content"]
+    # кнопка переключает заявку на склад клиента
+    token = hit.callback_data.split(":")[1]
+    p = bot.PENDING.get(token)
+    assert p["wh_id"] == wh_b["id"]
+    answers, edits = [], []
+    u = _cb_update(ADMIN, hit.callback_data, answers, edits)
+    asyncio.run(bot.on_callback(u, SimpleNamespace(bot=None)))
+    assert p["wh_id"] == wh["id"] and p["client_id"] and "alt_whs" not in p
+    assert edits and "Чолпон Казарман" in edits[-1]
+    # подделка: клиент чужого склада, которого не было в кнопках — отказ
+    wh_m = db.warehouse_by_name("Манас")       # склада нет в alt_whs
+    db.clients_add_bulk(wh_m["id"], [("Левый", 0)])
+    lev = db.client_exact(wh_m["id"], "Левый")
+    data2 = dict(data, client="Чолпон Аалиева")
+    out.clear()
+    asyncio.run(bot.start_payment(upd, SimpleNamespace(bot=None), actor, data2))
+    token2 = [b for row in out["kb"].inline_keyboard for b in row][0].callback_data.split(":")[1]
+    answers.clear()
+    u2 = _cb_update(ADMIN, f"pk:{token2}:{lev['id']}", answers, edits)
+    asyncio.run(bot.on_callback(u2, SimpleNamespace(bot=None)))
+    assert answers and answers[-1] == "Клиент не найден"
+    # нигде нет похожих — понятный отказ с подсказкой /client
+    out.clear()
+    bot.chat_histories[777].append({"role": "user", "content": "x"})
+    bot.chat_histories[777].append({"role": "assistant", "content": "{}"})
+    asyncio.run(bot.start_payment(upd, SimpleNamespace(bot=None), actor,
+                                  dict(data, client="Зузуна Абракадабра",
+                                       _src_text="Зузуна Абракадабра 20000")))
+    assert "похожих на других складах нет" in out["text"] and "/client" in out["text"]
+    assert "нет ни на одном складе" in bot.chat_histories[777][-1]["content"]
+    bot.chat_histories.pop(777, None)
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
