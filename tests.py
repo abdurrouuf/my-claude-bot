@@ -3860,6 +3860,60 @@ def test_payment_suggests_other_warehouse_clients():
     bot.chat_histories.pop(777, None)
 
 
+def test_return_only_purchased():
+    # Предложение владельца 18.09.2026: возврат — только того, что клиент
+    # покупал по журналу; сотруднику отказ, админу — предупреждение;
+    # карточка показывает «куплено: дата №оп — шт».
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {16: 50, 30: 50})
+    (inv_id, *_), _ = _invoice(wh, DANIYAR, "Вика Уманец", [_item(16, 10, 180)])
+    vika = db.client_exact(wh["id"], "Вика Уманец")
+    out, sent = {}, []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"], out["kb"] = text, kw.get("reply_markup")
+
+    class Bot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+    ctx = SimpleNamespace(bot=Bot())
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=DANIYAR),
+                          effective_chat=SimpleNamespace(id=DANIYAR, type="private"),
+                          message=Msg())
+    dan = db.get_user(DANIYAR)
+    # 1) не покупал Празимектоп 200 мл — отказ, админу ничего не уходит
+    asyncio.run(bot.start_return(upd, ctx, dan, {
+        "client": "Вика Уманец", "warehouse": wh["name"], "items": [{"name": "Празимектоп", "volume": "200 мл",
+                                             "qty": 3, "price": 0, "expiry": "11.2028"}]}))
+    assert "не принят" in out["text"] and "не покупал" in out["text"], out["text"]
+    assert not sent
+    # 2) больше купленного — отказ
+    asyncio.run(bot.start_return(upd, ctx, dan, {
+        "client": "Вика Уманец", "warehouse": wh["name"], "items": [{"name": "Дексатоп", "volume": "50 мл",
+                                             "qty": 12, "price": 0, "expiry": "11.2028"}]}))
+    assert "не больше 10" in out["text"], out["text"]
+    # 3) в пределах покупки — заявка админу с историей покупок
+    asyncio.run(bot.start_return(upd, ctx, dan, {
+        "client": "Вика Уманец", "warehouse": wh["name"], "items": [{"name": "Дексатоп", "volume": "50 мл",
+                                             "qty": 8, "price": 0, "expiry": "11.2028"}]}))
+    assert sent and "отправлен админу" in out["text"]
+    card = sent[-1][1]
+    assert f"№{inv_id} — 10 шт" in card and "куплено:" in card, card
+    # 4) админ может вернуть непокупавшееся — с предупреждением в карточке
+    upd_a = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                            effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                            message=Msg())
+    asyncio.run(bot.start_return(upd_a, ctx, db.get_user(ADMIN), {
+        "client": "Вика Уманец", "warehouse": wh["name"], "items": [{"name": "Празимектоп", "volume": "200 мл",
+                                             "qty": 3, "price": 0, "expiry": "11.2028"}]}))
+    assert out["kb"] is not None and "НЕ СХОДИТСЯ" in out["text"], out["text"]
+    assert "покупок в журнале нет" in out["text"]
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

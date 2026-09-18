@@ -2805,6 +2805,77 @@ async def cash_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Возврат товара ----------
 
+def _return_purchases(p) -> dict:
+    """История покупок клиента по позициям возврата (журнал: накладные и
+    возвраты, только проведённые). {pid: {"sold", "returned", "rows"}},
+    rows — [(дата, № оп., шт)] покупок, новые первыми."""
+    pids = [it["product_id"] for it in p["items"] if it.get("product_id")]
+    out = {pid: {"sold": 0, "returned": 0, "rows": []} for pid in pids}
+    if not pids or not p.get("client_id"):
+        return out
+    for op, it in db.product_sales(pids, {p["wh_id"]}, {p["client_id"]}):
+        h = out[it["product_id"]]
+        qty = int(float(it.get("qty") or 0))
+        if op["type"] == "invoice":
+            h["sold"] += qty
+            h["rows"].append((op["ts"][:10], op["id"], qty))
+        else:
+            h["returned"] += qty
+    return out
+
+
+def _return_purchase_check(requester, p):
+    """Возврат только того, что клиент реально покупал (предложение
+    владельца 18.09.2026: Данияр оформил возврат Дорамека, которого Вика
+    по журналу не брала). Сотруднику — отказ; админу — предупреждение
+    (продажи до запуска бота в журнале нет — их возвращает только он).
+    Возвращает (текст отказа | None, предупреждения)."""
+    hist = _return_purchases(p)
+    blocked, warns = [], []
+    for it in p["items"]:
+        pid = it.get("product_id")
+        if not pid:
+            continue
+        h = hist[pid]
+        avail = h["sold"] - h["returned"]
+        label = f"{it['name']} {it['volume']}"
+        if h["sold"] <= 0:
+            blocked.append(f"{label} — по журналу клиент его не покупал")
+        elif it["qty"] > avail:
+            blocked.append(f"{label} — куплено {h['sold']} шт"
+                           + (f", уже возвращено {h['returned']}" if h["returned"] else "")
+                           + f"; вернуть можно не больше {max(avail, 0)}, "
+                           f"а в возврате {it['qty']}")
+    if not blocked:
+        return None, warns
+    if is_admin(requester):
+        return None, ["ПО ЖУРНАЛУ НЕ СХОДИТСЯ (продажа до запуска бота?): "
+                      + "; ".join(blocked) + ". Проводите, если уверены."]
+    return ("❌ Возврат не принят — по журналу продаж:\n• " + "\n• ".join(blocked)
+            + "\n\nВозврат товара, проданного до запуска бота или другим "
+              "документом, может провести только админ."), warns
+
+
+def _purchase_lines(p) -> list:
+    """Строки «куплено: …» для карточки возврата — админ видит, что и
+    когда клиент брал (просьба владельца 18.09.2026)."""
+    hist = _return_purchases(p)
+    out = []
+    for it in p["items"]:
+        pid = it.get("product_id")
+        if not pid:
+            continue
+        h = hist[pid]
+        if not h["rows"]:
+            out.append(f"   ↳ {esc(it['name'])} {esc(it['volume'])}: покупок в журнале нет")
+            continue
+        parts = [f"{d[8:10]}.{d[5:7]} №{op} — {q} шт" for d, op, q in h["rows"][:4]]
+        more = f" +ещё {len(h['rows']) - 4}" if len(h["rows"]) > 4 else ""
+        ret = f"; уже возвращено {h['returned']}" if h["returned"] else ""
+        out.append(f"   ↳ куплено: {', '.join(parts)}{more}{ret}")
+    return out
+
+
 def return_summary(p) -> str:
     c = db.client_get(p["client_id"])
     lines = ["🔙 <b>Возврат товара — подтверждение</b>",
@@ -2821,6 +2892,7 @@ def return_summary(p) -> str:
         special = " 💲спеццена" if it.get("special") else ""
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
                      f"{fmt_num(it['price'])}{special} = <b>{money(sub)}</b>")
+    lines += _purchase_lines(p)
     lines.append("")
     lines.append(f"🔙 Сумма возврата: <b>{money(total)}</b>")
     new_debt = c["debt"] - total
@@ -2936,6 +3008,13 @@ async def start_return(update, context, actor, data):
 
     async def _proceed():
         apply_client_prices(payload)
+        refusal, pw = _return_purchase_check(actor, payload)
+        if refusal:
+            await update.message.reply_text(refusal)
+            _note_outcome(update, "возврат НЕ принят — клиент не покупал этот товар "
+                                  "по журналу (или возвращает больше купленного)")
+            return
+        payload["warnings"] = list(payload.get("warnings") or []) + pw
         # Возврат уменьшает долг и увеличивает склад — проводит только админ.
         if not is_admin(actor):
             payload["approver_id"] = ADMIN_ID
@@ -5805,6 +5884,13 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p["kind"] == "return":
             apply_client_prices(p)
             requester = db.get_user(p["user_id"])
+            refusal, pw = _return_purchase_check(requester, p)
+            if refusal:
+                PENDING.pop(token, None)
+                await q.edit_message_text(refusal)
+                return
+            p["warnings"] = list(p.get("warnings") or []) + pw
+            _persist_pending(token)
             if requester["role"] != "admin":
                 p["approver_id"] = ADMIN_ID
                 p["requester_name"] = requester["name"]
