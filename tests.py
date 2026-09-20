@@ -3914,6 +3914,79 @@ def test_return_only_purchased():
     assert "покупок в журнале нет" in out["text"]
 
 
+def test_payment_wh_by_client_and_phantom_as_employee():
+    # Инцидент 20.09.2026: владелец в личке написал «Дадажанов Фахридин
+    # 120'000 с» (клиент Бишкека) — бот ответил «не найден на складе Каракол
+    # (и похожих на других складах нет)», хотя от админа обязан был найти.
+    # Единственный путь к такому отказу — модель тихо добавила as_employee
+    # (Данияр, из истории про Каракол): клиент искался по ЕГО складам.
+    # Теперь: (1) as_employee без имени сотрудника в тексте игнорируется;
+    # (2) склад с несуществующим клиентом заменяется складом, где клиент
+    # есть ровно один, с пометкой в карточке; (3) отказ «за сотрудника»
+    # объясняет, от чьего имени шла операция и где клиент есть.
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()                                   # Каракол
+    wh_b = db.warehouse_by_name("Бишкек")
+    db.clients_add_bulk(wh_b["id"], [("Дадажанов Фахридин", 2743195)])
+    db.clients_add_bulk(wh["id"], [("Валя", 5000)])
+    admin = db.get_user(ADMIN)
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append((t, kw.get("reply_markup")))
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=Msg())
+    bot.chat_histories[ADMIN] = [{"role": "user", "content": "x"},
+                                 {"role": "assistant", "content": "{}"}]
+    bot.PENDING.clear()
+    txt = "Дадажанов Фахридин 120'000 с"
+    # 1. Фантомный as_employee + склад из истории → карточка от админа на Бишкек
+    asyncio.run(bot.dispatch_action(
+        upd, SimpleNamespace(bot=None), admin,
+        '{"action": "payment", "client": "Дадажанов Фахридин", "amount": 120000, '
+        '"warehouse": "Каракол", "as_employee": "Данияр"}', src_text=txt, last_text=txt))
+    assert replies and replies[-1][1] is not None, replies
+    p = list(bot.PENDING.values())[0]
+    assert p["kind"] == "payment" and p["user_id"] == ADMIN and p["wh_id"] == wh_b["id"]
+    assert "Склад взят по клиенту" in replies[-1][0] and "Бишкек" in replies[-1][0]
+    bot.PENDING.clear(); replies.clear()
+    # 2. Сотрудник назван в тексте — подмена работает как раньше
+    txt2 = "проведи за Данияра: Валя приход 1490"
+    asyncio.run(bot.dispatch_action(
+        upd, SimpleNamespace(bot=None), admin,
+        '{"action": "payment", "client": "Валя", "amount": 1490, "as_employee": "Данияр"}',
+        src_text=txt2, last_text=txt2))
+    p = list(bot.PENDING.values())[0]
+    assert p["user_id"] == DANIYAR and p["wh_id"] == wh["id"]
+    assert "Склад взят по клиенту" not in replies[-1][0]
+    bot.PENDING.clear(); replies.clear()
+    # 3. Реально «за Данияра», а клиент — Бишкека: отказ объясняет, что к чему
+    txt3 = "проведи за Данияра: Дадажанов Фахридин приход 120000"
+    asyncio.run(bot.dispatch_action(
+        upd, SimpleNamespace(bot=None), admin,
+        '{"action": "payment", "client": "Дадажанов Фахридин", "amount": 120000, '
+        '"as_employee": "Данияр"}', src_text=txt3, last_text=txt3))
+    assert not bot.PENDING
+    t = replies[-1][0]
+    assert "от имени сотрудника" in t and "Данияр" in t and "Бишкек" in t, t
+    assert "без имени сотрудника" in t
+    # 4. Клиент есть на двух складах — склад сам не выбирается (кнопки похожих)
+    wh_m = db.warehouse_by_name("Манас")
+    db.clients_add_bulk(wh_m["id"], [("Дадажанов Фахридин", 10)])
+    replies.clear()
+    asyncio.run(bot.dispatch_action(
+        upd, SimpleNamespace(bot=None), admin,
+        '{"action": "payment", "client": "Дадажанов Фахридин", "amount": 120000, '
+        '"warehouse": "Каракол"}', src_text=txt, last_text=txt))
+    assert "Похожие есть на других складах" in replies[-1][0], replies[-1][0]
+    bot.PENDING.clear()
+    bot.chat_histories.pop(ADMIN, None)
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
@@ -3931,4 +4004,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
