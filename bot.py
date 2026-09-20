@@ -2580,6 +2580,20 @@ def commit_handover(p):
 
 
 
+def _employee_traceable(src_text: str, emp_name: str) -> bool:
+    """Назван ли сотрудник в самом сообщении («проведи за Данияра», «от
+    Беки»). Пусто (фото/голос без текста) — верим модели, как у клиентов
+    (_name_traceable). Сравнение нечёткое: падежи и опечатки проходят."""
+    text = str(src_text or "")
+    if not text.strip():
+        return True
+    words = [w for w in re.findall(r"[^\W\d_]+", text.lower()) if len(w) >= 3]
+    parts = [w for w in re.findall(r"[^\W\d_]+", str(emp_name).lower()) if len(w) >= 3]
+    if not words or not parts:
+        return True
+    return any(_word_alike(w, part) for part in parts for w in words)
+
+
 def _employee_in_text(text: str):
     """Сотрудник (не админ), названный в первых словах сообщения:
     «Азамат сдал кассу 228500», «от Азамата: сдал …». Один и только один."""
@@ -3090,6 +3104,8 @@ def payment_summary(p) -> str:
         + (" (с учётом карточки выше)" if offset else ""),
         f"✅ Оплата: <b>{money(p['amount'])}</b>",
     ]
+    if p.get("wh_note"):
+        lines.insert(2, p["wh_note"])
     if remainder <= 0:
         lines.append("🎉 Долг будет полностью погашен"
                      + (f" (переплата {money(-remainder)})" if remainder < 0 else ""))
@@ -3292,6 +3308,26 @@ async def start_payment(update, context, actor, data):
     amount = amounts[0]
 
     exact = db.client_exact(wh["id"], client_name)
+    wh_note = ""
+    if exact is None:
+        # Клиента на названном складе нет, а на ДРУГОМ операбельном складе
+        # он есть ровно один (модель взяла склад из истории диалога:
+        # 20.09.2026 «Дадажанов Фахридин 120'000» после фраз про Каракол
+        # ушло на Каракол, клиент — Бишкека) — склад берём по клиенту,
+        # в карточке говорим об этом. Сотруднику — только полные склады.
+        found = []
+        for w2 in db.operable_warehouses(actor):
+            if w2["id"] == wh["id"] or (not is_admin(actor) and not w2["full_mode"]):
+                continue
+            c2 = db.client_exact(w2["id"], client_name)
+            if c2:
+                found.append((c2, w2))
+        if len(found) == 1:
+            wh_note = (f"⚠️ Склад взят по клиенту: «{esc(found[0][1]['name'])}» "
+                       f"(на «{esc(wh['name'])}» такого клиента нет)")
+            log.warning("Оплата: склад «%s» заменён на «%s» — клиент «%s» есть "
+                        "только там", wh["name"], found[0][1]["name"], client_name)
+            exact, wh = found[0]
     # Имя, которого в сообщении нет, — верить ему нельзя (см. _name_traceable).
     src_text = str(data.get("_src_text") or "")
     if exact and not _name_traceable(src_text, exact["name"]):
@@ -3321,6 +3357,8 @@ async def start_payment(update, context, actor, data):
         "wh_id": wh["id"], "wh_name": wh["name"],
         "client_name": client_name, "client_id": None, "amount": amount,
     }
+    if wh_note:
+        payload["wh_note"] = wh_note
     if len(amounts) > 1:
         payload["amounts"] = amounts      # для пути с кнопками выбора клиента
 
@@ -3357,11 +3395,25 @@ async def start_payment(update, context, actor, data):
             for c in db.fuzzy_clients(w2["id"], client_name):
                 alt.append((c, w2))
         if not alt:
+            extra = ""
+            if data.get("_by_admin"):
+                # Операция шла «за сотрудника» — админ должен это видеть:
+                # клиент мог быть на складе, куда сотруднику нельзя.
+                whs_txt = ", ".join(w["name"] for w in db.operable_warehouses(actor)) or "—"
+                elsewhere = [w["name"] for w in db.all_warehouses()
+                             if db.client_exact(w["id"], client_name)
+                             and not db.can_use_warehouse(actor, w["id"])]
+                extra = (f"\n\n⚠️ Операция шла от имени сотрудника "
+                         f"<b>{esc(actor['name'])}</b> (склады: {esc(whs_txt)}).")
+                if elsewhere:
+                    extra += (f" Клиент есть на складе «{esc(elsewhere[0])}», куда "
+                              f"{esc(actor['name'])} проводить не может. Если деньги "
+                              f"принимали вы сами — напишите без имени сотрудника.")
             await update.message.reply_text(
                 f"❌ Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}» "
                 f"(и похожих на других складах нет). Приход можно принять только от "
                 f"существующего клиента.\nПроверить по всем складам: "
-                f"/client {esc(client_name.split()[0])}",
+                f"/client {esc(client_name.split()[0])}" + extra,
                 parse_mode="HTML")
             _note_outcome(update, f"приход НЕ проведён — клиента «{client_name}» "
                                   f"нет ни на одном складе")
@@ -6805,14 +6857,24 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
                 # «за Азамата», «Азамат» с опечаткой — как в /cash
                 emp = _match_employee(as_emp, [u for u in db.list_users()
                                                if u["role"] != "admin"])
-            if emp is None or not emp["active"]:
+            if emp is not None and not _employee_traceable(src_text, emp["name"]):
+                # Имени сотрудника в сообщении НЕТ — модель взяла его из
+                # истории диалога (инцидент 20.09.2026: «Дадажанов Фахридин
+                # 120'000» после серии фраз про Каракол ушло «за Данияра»,
+                # клиент искался только по его складам — отказ). Операция
+                # идёт от самого админа, как написано.
+                log.warning("as_employee «%s» не прослеживается в тексте — "
+                            "игнорирую, операция от админа", as_emp)
+                emp, as_emp = None, ""
+            if as_emp and (emp is None or not emp["active"]):
                 await update.message.reply_text(
                     f"Сотрудник «{esc(as_emp)}» не найден. Сотрудники: "
                     + ", ".join(esc(u["name"]) for u in db.list_users()),
                     parse_mode="HTML")
                 return
-            actor = emp
-            data["_by_admin"] = True
+            if emp is not None:
+                actor = emp
+                data["_by_admin"] = True
     if data is None:
         if "{" in reply and '"action"' in reply:
             # Модель начала выдавать JSON операции, но он не разобрался —
