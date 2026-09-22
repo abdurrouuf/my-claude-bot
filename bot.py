@@ -10430,6 +10430,96 @@ async def moves_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await _moves_report(update, whs, actor, {"pids": pids, "label": label})
 
 
+def _where_box_text(pid, qty) -> str:
+    """«31 кор + 20 шт» / «2 кор» / «» — коробки по вместимости прайса."""
+    if qty <= 0:
+        return ""
+    boxes, loose, _t, _p = box_breakdown([{"product_id": pid, "qty": qty}])
+    if not boxes:
+        return ""
+    return f"{boxes} кор" + (f" + {loose} шт" if loose else "")
+
+
+def where_report_text(pids, label, whs) -> str:
+    """Текст «где лежит товар»: по каждой фасовке — остаток на каждом
+    складе, партии со сроками (при одной фасовке), итог по всем складам.
+    Склады без остатка — прочерком, минус — с пометкой."""
+    lines = [f"📍 <b>{esc(label)}</b> — где лежит", ""]
+    lots = db.lots_map()
+    show_batches = len(pids) == 1
+    grand = 0
+    for pid in pids:
+        p = prices.BY_ID[pid]
+        if len(pids) > 1:
+            lines.append("")
+            lines.append(f"<b>{esc(p['volume'])}</b>")
+        total = 0
+        for w in whs:
+            q = db.stock_qty(w["id"], pid)
+            total += q
+            if q == 0:
+                lines.append(f"🏬 {esc(w['name'])}: —")
+                continue
+            box = _where_box_text(pid, q)
+            tail = f" ({box})" if box else ""
+            if q < 0:
+                tail = " (МИНУС! проверьте учёт)"
+            lines.append(f"🏬 {esc(w['name'])}: <b>{fmt_num(q)} шт</b>{tail}")
+            if show_batches and q > 0:
+                parts = []
+                for b in db.product_batches_of(w["id"], pid):
+                    exp = b["expiry"] or "без срока"
+                    lot = lots.get((pid, b["expiry"]))
+                    parts.append(f"{exp} — {fmt_num(b['qty'])} шт"
+                                 + (f" (серия {lot})" if lot else ""))
+                if parts:
+                    lines.append("   · " + ", ".join(esc(x) for x in parts))
+        grand += total
+        if len(whs) > 1:
+            box = _where_box_text(pid, total)
+            lines.append(f"Всего{' ' + esc(p['volume']) if len(pids) > 1 else ''}: "
+                         f"<b>{fmt_num(total)} шт</b>" + (f" ({box})" if box else ""))
+    if len(pids) > 1 and len(whs) > 1:
+        lines.append("")
+        lines.append(f"Итого по всем фасовкам: <b>{fmt_num(grand)} шт</b>")
+    return "\n".join(lines)
+
+
+async def where_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/where Товар [фасовка] — остаток одного препарата на всех доступных
+    складах разом («делай» владельца 22.09.2026: «Альтопен-Форте литровый —
+    остаток во всех складах»). Коротким текстом, с партиями и сроками.
+    Сотруднику — его склады (просмотр /watch включён), в чате склада —
+    только склад чата. Без фасовки — все фасовки препарата."""
+    actor = await get_actor(update)
+    if actor is None:
+        return
+    whs_group, in_group = await _group_only_feed_whs(update, actor)
+    if in_group and not whs_group:
+        return
+    text = " ".join(context.args or []).strip()
+    label, pids = None, None
+    if text:
+        label, pids, _cli, _c = _parse_sales_query(text)
+    if not pids:
+        await update.message.reply_text(
+            "📍 Где лежит товар: остаток препарата на всех ваших складах, "
+            "с партиями и сроками.\n\nПримеры:\n"
+            "/where Альтопен-Форте 1 л\n"
+            "/where Дексатоп — все фасовки")
+        return
+    if in_group:
+        whs = whs_group
+    else:
+        whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)] \
+            or db.visible_warehouses(actor)
+    if not whs:
+        await update.message.reply_text("У вас нет склада.")
+        return
+    await update.message.reply_text(where_report_text(pids, label, whs),
+                                    parse_mode="HTML")
+
+
 def _overdue_caption(min_days, found, total, grew_n, grew_total) -> str:
     parts = []
     if found:
@@ -13085,6 +13175,7 @@ STAFF_COMMANDS = [
     ("expiry", "Сроки годности по партиям"),
     ("sales", "История продаж препарата: /sales Дексатоп"),
     ("moves", "Движение товара по складу: /moves Каракол Дексатоп"),
+    ("where", "Где лежит товар — остаток на всех складах: /where Дексатоп 50мл"),
     ("cash", "Касса (наличные на руках)"),
     ("report", "Отчёт за день/неделю/месяц"),
     ("price", "Прайс-лист"),
@@ -13295,6 +13386,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("showdebt", showdebt_cmd))
     app.add_handler(CommandHandler("sales", sales_cmd))
     app.add_handler(CommandHandler("moves", moves_cmd))
+    app.add_handler(CommandHandler("where", where_cmd))
     app.add_handler(CommandHandler("deadstock", deadstock_cmd))
     app.add_handler(CommandHandler("forecast", forecast_cmd))
     app.add_handler(CommandHandler("order", order_cmd))
