@@ -3987,6 +3987,61 @@ def test_payment_wh_by_client_and_phantom_as_employee():
     bot.chat_histories.pop(ADMIN, None)
 
 
+def test_where_report():
+    # «Делай» владельца 22.09.2026: остаток одного препарата на всех
+    # складах разом — /where Альтопен-Форте 1 л (с партиями и сроками),
+    # /where Дексатоп — все фасовки; сотруднику — только его склады;
+    # в чате склада — только склад чата.
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()                                   # Каракол
+    wh_b = db.warehouse_by_name("Бишкек")
+    wh_m = db.warehouse_by_name("Манас")
+    pid = prices.match_product("Альтопен-Форте", "1 л")["id"]
+    d50 = prices.match_product("Дексатоп", "50 мл")["id"]
+    d100 = prices.match_product("Дексатоп", "100 мл")["id"]
+    _load(wh, {pid: 12, d50: 5})
+    _load(wh_b, {pid: 160, d100: 7},
+          batches={(wh_b["id"], pid): [("10.2026", 45), ("06.2029", 115)]})
+    # Манас — без Альтопен-Форте, минус по Дексатопу 100
+    db.commit_operation(ADMIN, "writeoff", wh_m["id"], None, "Списание",
+                        [(wh_m["id"], d100, -3)], [], {"items": []})
+    whs = [wh_b, db.warehouse_by_name("Кара-Балта"), wh, wh_m]
+    t = bot.where_report_text([pid], "АЛЬТОПЕН-ФОРТЕ 1 л", whs)
+    assert "Бишкек: <b>160 шт</b>" in t and "Каракол: <b>12 шт</b>" in t, t
+    assert "Кара-Балта: —" in t and "Манас: —" in t
+    assert "10.2026 — 45 шт" in t and "06.2029 — 115 шт" in t
+    assert "Всего: <b>172 шт</b>" in t
+    # несколько фасовок — секции, партии не показываются, общий итог
+    t2 = bot.where_report_text([d50, d100], "ДЕКСАТОП", whs)
+    assert "<b>50 мл</b>" in t2 and "<b>100 мл</b>" in t2
+    assert "МИНУС" in t2 and "Итого по всем фасовкам: <b>9 шт</b>" in t2
+    assert "—" in t2 and " · " not in t2
+    # команда: админ в личке — все склады; Данияр — только Каракол
+    out = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out.append(text)
+
+    def upd(uid, chat_id=777, ctype="private"):
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=chat_id, type=ctype),
+                               message=Msg())
+    ctx = SimpleNamespace(args=["Альтопен-Форте", "1", "л"], bot=None)
+    asyncio.run(bot.where_cmd(upd(ADMIN), ctx))
+    assert "Бишкек: <b>160 шт</b>" in out[-1] and "Каракол: <b>12 шт</b>" in out[-1]
+    asyncio.run(bot.where_cmd(upd(DANIYAR), ctx))
+    assert "Каракол: <b>12 шт</b>" in out[-1] and "Бишкек" not in out[-1], out[-1]
+    # в чате склада — только склад чата, даже у админа
+    db.set_feed_chat(wh["id"], -5001)
+    asyncio.run(bot.where_cmd(upd(ADMIN, -5001, "supergroup"), ctx))
+    assert "Каракол: <b>12 шт</b>" in out[-1] and "Бишкек" not in out[-1], out[-1]
+    # без аргумента — подсказка
+    asyncio.run(bot.where_cmd(upd(ADMIN), SimpleNamespace(args=[], bot=None)))
+    assert "/where" in out[-1]
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
