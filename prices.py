@@ -106,8 +106,8 @@ SEED_DATA = [
     {"id": 100,"name": "ФЕНБЕНЗОЛ 100 (фенбендазол 10%)",                       "volume": "1 л",           "box": 12,  "price": 1240},
     {"id": 101,"name": "ФЛОРФЕН ПЛЮС 300 (флорфеникол 30%)",                    "volume": "100 мл",        "box": 80,  "price": 480},
     {"id": 102,"name": "ЦЕФНОМ 25 (цефкинома 2.5%)",                            "volume": "50 мл",         "box": 150, "price": 530},
-    {"id": 103,"name": "ЦЕФНОМ LC (шприц / 75 мг цефкинома)",                   "volume": "8 г",           "box": 24,  "price": 135},
-    {"id": 104,"name": "ЦЕФТИ DC (шприц / 500 мг гидрохлорид цефтиофура)",      "volume": "10 мл",         "box": 24,  "price": 165},
+    {"id": 103,"name": "ЦЕФНОМ LC (шприц / 75 мг цефкинома)",                   "volume": "8 г",           "box": 288, "price": 135},
+    {"id": 104,"name": "ЦЕФТИ DC (шприц / 500 мг гидрохлорид цефтиофура)",      "volume": "10 мл",         "box": 288, "price": 165},
 ]
 
 # Перенумерация 21.07.2026 по фирменному прайсу владельца от 10.06.2026:
@@ -129,10 +129,29 @@ def _fmt_price(x):
     return int(x) if float(x) == int(x) else x
 
 
+# Пачки внутри коробки (решение владельца 25.09.2026): шприцы Цефти DC и
+# Цефном LC клиентам продаются малой пачкой (24 шт), а крупным — большой
+# коробкой 288 шт (12 пачек × 24). В прайсе «коробка» у них = 288, «пачка»
+# = 24; для остальных товаров пачек нет. Справочник — по id, не в базе.
+PACKS = {103: 24, 104: 24}
+
+
+def pack_size(product_id):
+    """Штук в пачке (только у товаров с пачками), иначе None."""
+    return PACKS.get(product_id)
+
+
+def _box_text(p):
+    pack = PACKS.get(p["id"])
+    if pack:
+        return f"{p['box']} шт/кор (пачка {pack} шт)"
+    return f"{p['box']} шт/кор"
+
+
 def _rebuild():
     global PRICE_LIST_TEXT, BY_ID, _KEYS
     PRICE_LIST_TEXT = "\n".join(
-        f"{p['id']}. {p['name']} | {p['volume']} | {p['box']} шт/кор | "
+        f"{p['id']}. {p['name']} | {p['volume']} | {_box_text(p)} | "
         f"{_fmt_price(p['price'])} сом"
         for p in PRICE_LIST_DATA
     )
@@ -167,6 +186,18 @@ def whole_boxes(product_id, qty):
     if per_box <= 0 or qty <= 0 or qty % per_box:
         return None
     return qty // per_box
+
+
+def whole_packs(product_id, qty):
+    """Сколько ЦЕЛЫХ пачек (у товаров с пачками) — только без остатка."""
+    pack = PACKS.get(product_id)
+    try:
+        qty = int(qty)
+    except (TypeError, ValueError):
+        return None
+    if not pack or qty <= 0 or qty % pack:
+        return None
+    return qty // pack
 
 
 def _base_name(name: str) -> str:

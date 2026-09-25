@@ -706,7 +706,7 @@ def test_box_note():
     # №6 АЛЬТОПЕН 100 мл — 80 шт/кор, №16 ДЕКСАТОП 50 мл — 100 шт/кор,
     # №8 АЛЬТОПЕН 1 л — 12 шт/кор
     items = [_item(6, 170, 90), _item(16, 100, 180), _item(8, 5, 570)]
-    assert bot.box_breakdown(items) == (3, 15, 275, 5)
+    assert bot.box_breakdown(items) == (3, 15, 275, 5, 0)
     note = bot.box_note_text(items)
     assert note == "Всего: 3 кор. + 15 шт россыпью (275 шт) · мест примерно 5"
     # в приходе общее число штук уже есть в строке «Итого» — не повторяем
@@ -4122,6 +4122,121 @@ def test_wrong_expiry_attempts():
         "items": [{"name": pr17["name"], "volume": pr17["volume"],
                    "qty": 5, "price": 0, "expiry": "05.2028"}]}))
     assert "Не провожу" not in replies[-1], replies
+
+
+def test_syringe_boxes_and_packs():
+    """Решение владельца 25.09.2026: у шприцев Цефти DC / Цефном LC коробка
+    БОЛЬШАЯ (288 = 12 пачек × 24), «пач/пачка/уп» = 24. Любое «к» у них
+    переспрашивается тремя кнопками (страховка от старой привычки «к» =
+    малая пачка); «2 пач» проходит без вопроса; у других товаров «пач» —
+    штуки, как раньше. Раскладка коробок показывает пачки. Старая база
+    (box=24) мигрирует на 288."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    ceft = prices.BY_ID[104]
+    assert ceft["box"] == 288 and prices.pack_size(104) == 24
+    assert prices.pack_size(16) is None
+    assert prices.whole_packs(104, 48) == 2 and prices.whole_packs(104, 50) is None
+    assert prices.whole_boxes(104, 288) == 1
+    assert "пачка 24" in prices.PRICE_LIST_TEXT.split("\n")[-1]
+    # миграция: старая база хранила 24
+    conn = db.connect()
+    conn.execute("UPDATE products SET box=24 WHERE id IN (103, 104)")
+    conn.execute("DELETE FROM settings WHERE key='syringe_box_288'")
+    conn.commit()
+    db.init(ADMIN, bot.WAREHOUSE_NAMES, bot.STAFF)
+    assert conn.execute("SELECT box FROM products WHERE id=104").fetchone()[0] == 288
+    prices.set_data(db.products_active())
+    assert prices.BY_ID[104]["box"] == 288
+
+    # разбор текста
+    bare, pieces, boxes, packs = bot._qty_tokens("Цефти DC 2 пач, Дексатоп 50 мл 3 уп")
+    assert packs == {2: 1, 3: 1} and not pieces
+    item = lambda qty, bq: {"name": "Цефти DC", "volume": "10 мл", "qty": qty,
+                            "box_qty": bq, "price": 165}
+    # «1 к» — модель дала 288, вопрос всё равно (forced)
+    qs = bot._unit_questions({"items": [item(288, 1)],
+                              "_last_text": "Асан\nЦефти DC 1 к", "_src_text": ""})
+    assert len(qs) == 1 and qs[0]["forced"] and qs[0]["pack"] == 24
+    # «2 пач» → 48 — без вопроса
+    assert bot._unit_questions({"items": [item(48, None)],
+                                "_last_text": "Асан\nЦефти DC 2 пач",
+                                "_src_text": ""}) == []
+    # «2 пач», модель дала 2 шт — вопрос
+    qs = bot._unit_questions({"items": [item(2, None)],
+                              "_last_text": "Асан\nЦефти DC 2 пач", "_src_text": ""})
+    assert len(qs) == 1 and not qs[0]["forced"]
+    # «288 шт» — без вопроса
+    assert bot._unit_questions({"items": [item(288, None)],
+                                "_last_text": "Цефти DC 288 шт", "_src_text": ""}) == []
+    # у обычного товара «2 пач» = штуки, вопроса нет
+    dex = {"name": "Дексатоп", "volume": "50 мл", "qty": 2, "box_qty": None, "price": 180}
+    assert bot._unit_questions({"items": [dex], "_last_text": "Дексатоп 50 мл 2 пач",
+                                "_src_text": ""}) == []
+
+    # полный путь: вопрос → «пачек» → карточка с 24 шт
+    _load(wh, {104: 1000})
+    db.clients_add_bulk(wh["id"], [("Асан", 0)])
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append((t, kw.get("reply_markup")))
+
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=Msg())
+    text = "Асан\nЦефти DC 1 к"
+    data = {"action": "invoice", "client": "Асан", "warehouse": "Каракол",
+            "debt": 0, "payment": 0, "phone": None,
+            "items": [item(288, 1)], "_src_text": text, "_last_text": text}
+    asyncio.run(bot.dispatch_data(upd, SimpleNamespace(bot=None),
+                                  db.get_user(ADMIN), data))
+    assert "пачек или штук" in replies[-1][0] and "БОЛЬШАЯ" in replies[-1][0]
+    kb = str(replies[-1][1].inline_keyboard)
+    assert "1 пачек (24 шт)" in kb and "1 коробок (288 шт)" in kb
+    token = [k for k, v in bot.PENDING.items() if v.get("kind") == "pick_unit"][0]
+    answers, edits = [], []
+    u = _cb_update(ADMIN, f"pu:{token}:k:0", answers, edits)
+    u.callback_query.message.reply_text = Msg().reply_text
+    asyncio.run(bot.on_callback(u, SimpleNamespace(bot=None)))
+    assert "1 пач = 24 шт" in edits[-1]
+    card = [v for v in bot.PENDING.values() if v.get("kind") == "invoice"]
+    assert card and card[0]["items"][0]["qty"] == 24
+    assert "1 пач / 24 шт" in replies[-1][0]
+    bot.PENDING.clear()
+
+    # раскладка коробок
+    items = [{"product_id": 104, "qty": 340}]
+    assert bot.box_breakdown(items) == (1, 4, 340, 4, 2)
+    assert bot.box_note_text(items) == ("Всего: 1 кор. + 2 пач. + 4 шт россыпью "
+                                        "(340 шт) · мест примерно 4")
+    assert bot.box_prefix({"product_id": 104, "qty": 48}) == "2 пач / "
+    assert bot.box_prefix({"product_id": 104, "qty": 288}) == "1 кор / "
+    assert bot._where_box_text(104, 340) == "1 кор + 2 пач + 4 шт"
+    # /stock: колонка «Коробок» с пачками (проверяем через захват секции)
+    _load(wh, {104: -1000 + 340})
+    captured = {}
+    orig = bot.generate_report_pdf
+
+    def fake_pdf(title, sub, sections, **kw):
+        captured["sections"] = sections
+        return orig(title, sub, sections, **kw)
+
+    bot.generate_report_pdf = fake_pdf
+    try:
+        async def reply_document(document=None, caption=None, **kw):
+            pass
+        upd2 = SimpleNamespace(
+            message=SimpleNamespace(reply_document=reply_document),
+            effective_chat=SimpleNamespace(id=1, type="private"),
+            effective_user=SimpleNamespace(id=ADMIN))
+        asyncio.run(bot._stock_report(upd2, None, db.get_user(ADMIN), [wh]))
+    finally:
+        bot.generate_report_pdf = orig
+    row = [r for r in captured["sections"][0]["rows"] if r[0] == 104][0]
+    assert row[-1] == "1 кор + 2 пач + 4 шт", row
 
 
 def main():

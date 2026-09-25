@@ -275,7 +275,8 @@ def generate_price_pdf(price_data) -> io.BytesIO:
             Paragraph(str(p["id"]), cell_style),
             Paragraph(xml_escape(p["name"]), cell_style),
             Paragraph(xml_escape(p["volume"]), cell_style),
-            Paragraph(str(p["box"]), cell_style),
+            Paragraph(str(p["box"]) + (f" (пач. {p['pack']})" if p.get("pack") else ""),
+                      cell_style),
             Paragraph(fmt_num(p["price"]), cell_right),
         ])
 
