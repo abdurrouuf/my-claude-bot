@@ -923,6 +923,9 @@ def _build_static_system() -> str:
     parts.append('- "Альтопен 100мл 2к" → 2 коробки × 80 шт/кор = qty: 160, box_qty: 2')
     parts.append('- "Дексатоп 50мл 10 шт" → qty: 10, box_qty: null (просто штуки, без пересчёта)')
     parts.append('Другие обозначения коробок: "к", "кор", "коробка", "коробок", "box"')
+    parts.append('ШПРИЦЫ ЦЕФТИ DC и ЦЕФНОМ LC: коробка БОЛЬШАЯ = 288 шт (12 пачек '
+                 'по 24). "пач"/"пачка"/"уп" = 24 шт: "Цефти DC 2 пач" → qty: 48, '
+                 'box_qty: null; "Цефти DC 1 к" → qty: 288, box_qty: 1.')
     parts.append("")
     parts.append("=== РЕЖИМ: ПЕРЕИМЕНОВАНИЕ КЛИЕНТА (только админ) ===")
     parts.append('«переименуй клиента Сапаркулова Алмагул в Сапаркулова Алмагуль» / '
@@ -1251,8 +1254,11 @@ _QTY_TOKEN_RE = re.compile(
 _VOL_UNITS = ("мл", "л", "г", "гр", "кг", "мг", "мкг", "таб", "табл", "%",
               "ml", "l", "g", "kg", "mg", "мл.", "литр", "литра", "литров",
               "грамм", "грам", "кило")
-_PIECE_UNIT_PREFIXES = ("шт", "фл", "уп", "бут", "пач", "амп", "банк", "пак",
+_PIECE_UNIT_PREFIXES = ("шт", "фл", "бут", "амп", "банк", "пак",
                         "шприц", "доз", "ед", "pc", "пуз")
+# Пачка внутри коробки (шприцы Цефти DC / Цефном LC: коробка 288 = 12 пачек
+# по 24). У товаров без пачек «пач»/«уп» считаются штуками, как раньше.
+_PACK_UNIT_PREFIXES = ("пач", "уп", "pack")
 _BOX_UNIT_PREFIXES = ("кор", "короб", "кароб", "box", "ящ")
 _MONEY_WORDS = ("приход", "оплата", "оплатил", "оплатила", "заплатил",
                 "заплатила", "долг", "сдал", "сдала", "сом", "сомов", "по",
@@ -1262,8 +1268,9 @@ _MONEY_WORDS = ("приход", "оплата", "оплатил", "оплати�
 
 def _qty_tokens(text: str):
     """Числа-количества в тексте по группам: голые (без единицы), штуки,
-    коробки. Возвращает три словаря число → сколько раз встретилось."""
-    bare, pieces, boxes = {}, {}, {}
+    коробки, пачки. Возвращает четыре словаря число → сколько раз
+    встретилось."""
+    bare, pieces, boxes, packs = {}, {}, {}, {}
     low = str(text or "").lower()
     for m in _QTY_TOKEN_RE.finditer(low):
         num, unit = m.group(1), m.group(2)
@@ -1278,11 +1285,13 @@ def _qty_tokens(text: str):
             continue
         if unit == "к" or unit.startswith(_BOX_UNIT_PREFIXES):
             boxes[n] = boxes.get(n, 0) + 1
+        elif unit and unit.startswith(_PACK_UNIT_PREFIXES):
+            packs[n] = packs.get(n, 0) + 1
         elif unit and unit.startswith(_PIECE_UNIT_PREFIXES):
             pieces[n] = pieces.get(n, 0) + 1
         else:
             bare[n] = bare.get(n, 0) + 1
-    return bare, pieces, boxes
+    return bare, pieces, boxes, packs
 
 
 def _unit_questions(data: dict) -> list:
@@ -1305,7 +1314,12 @@ def _unit_questions(data: dict) -> list:
     for text in texts:
         if not text.strip():
             continue
-        bare, pieces, boxes = _qty_tokens(text)
+        bare, pieces, boxes, packs = _qty_tokens(text)
+        # У товаров без пачек «2 пач» — это штуки (как раньше); пачечные
+        # товары берут свои числа из packs (см. ниже).
+        pieces_plain = dict(pieces)
+        for k, v in packs.items():
+            pieces_plain[k] = pieces_plain.get(k, 0) + v
         out, found = [], False
         for i, it in enumerate(items):
             if not isinstance(it, dict):
@@ -1324,13 +1338,22 @@ def _unit_questions(data: dict) -> list:
                 box = int(product["box"]) if product else 0
             except (TypeError, ValueError, KeyError):
                 box = 0
+            pack = prices.pack_size(product["id"]) if product else None
+            pcs = pieces if pack else pieces_plain
             n = bq if bq > 0 else qty
-            ask = False
+            ask = forced = False
             if bq > 0 and boxes.get(n, 0) > 0:
                 boxes[n] -= 1
                 found = True                  # «6 к» → коробки, всё честно
-            elif bq == 0 and pieces.get(n, 0) > 0:
-                pieces[n] -= 1
+                if pack:
+                    # Страховка (25.09.2026): у шприцев «к» раньше значило
+                    # малую пачку — переспрашиваем всегда, даже при явном «к».
+                    ask = forced = True
+            elif pack and qty % pack == 0 and packs.get(qty // pack, 0) > 0:
+                packs[qty // pack] -= 1
+                found = True                  # «2 пач» → 48 шт, модель поняла
+            elif bq == 0 and pcs.get(n, 0) > 0:
+                pcs[n] -= 1
                 found = True                  # «6 шт» — штуки, вопросов нет
             elif bare.get(n, 0) > 0:
                 bare[n] -= 1
@@ -1338,8 +1361,12 @@ def _unit_questions(data: dict) -> list:
             elif bq == 0 and boxes.get(n, 0) > 0:
                 boxes[n] -= 1                 # в тексте «6 к», модель дала 6 шт
                 found, ask = True, True
+            elif pack and packs.get(n, 0) > 0:
+                packs[n] -= 1                 # «2 пач», модель дала 2 шт
+                found, ask = True, True
             if ask and box > 1 and n > 0:
-                out.append({"i": i, "n": n, "box": box,
+                out.append({"i": i, "n": n, "box": box, "pack": pack,
+                            "forced": forced,
                             "name": str(it.get("name") or ""),
                             "volume": str(it.get("volume") or "")})
         if found:
@@ -1354,19 +1381,35 @@ def _unit_question(p: dict):
     product = prices.match_product(qi["name"], qi["volume"])
     title = (f"{prices._base_name(product['name']).upper()} {product['volume']}"
              if product else f"{qi['name']} {qi['volume']}")
-    n, box = qi["n"], qi["box"]
+    n, box, pack = qi["n"], qi["box"], qi.get("pack")
     head = "❓ Уточните количество"
     if len(qs) > 1:
         head += f" ({pos + 1} из {len(qs)})"
-    text = (f"{head}:\n<b>{esc(title)} — {n}</b>\n"
-            f"Это коробок или штук? В коробке {box} шт: "
-            f"{n} кор = {n * box} шт.")
     token = p["_token"]
     # Номер вопроса в кнопке: двойное касание на первом вопросе иначе
     # отвечало и за второй (аудит 14.09.2026).
-    kb = [[InlineKeyboardButton(f"📦 {n} коробок ({n * box} шт)",
-                                callback_data=f"pu:{token}:b:{pos}"),
-           InlineKeyboardButton(f"🔢 {n} штук", callback_data=f"pu:{token}:p:{pos}")]]
+    if pack:
+        text = (f"{head}:\n<b>{esc(title)} — {n}</b>\n"
+                f"Это коробок, пачек или штук? Большая коробка {box} шт "
+                f"({box // pack} пачек), пачка {pack} шт: "
+                f"{n} кор = {n * box} шт, {n} пач = {n * pack} шт.")
+        if qi.get("forced"):
+            text += ("\n⚠️ Написано «к»: у шприцев коробка теперь БОЛЬШАЯ "
+                     "(288 шт). Если имели в виду малую — выберите «пачек».")
+        kb = [[InlineKeyboardButton(f"📦 {n} коробок ({n * box} шт)",
+                                    callback_data=f"pu:{token}:b:{pos}")],
+              [InlineKeyboardButton(f"📦 {n} пачек ({n * pack} шт)",
+                                    callback_data=f"pu:{token}:k:{pos}"),
+               InlineKeyboardButton(f"🔢 {n} штук",
+                                    callback_data=f"pu:{token}:p:{pos}")]]
+    else:
+        text = (f"{head}:\n<b>{esc(title)} — {n}</b>\n"
+                f"Это коробок или штук? В коробке {box} шт: "
+                f"{n} кор = {n * box} шт.")
+        kb = [[InlineKeyboardButton(f"📦 {n} коробок ({n * box} шт)",
+                                    callback_data=f"pu:{token}:b:{pos}"),
+               InlineKeyboardButton(f"🔢 {n} штук",
+                                    callback_data=f"pu:{token}:p:{pos}")]]
     left = len(qs) - pos
     if left > 1:
         kb.append([InlineKeyboardButton(f"📦 Все {left} — коробками",
@@ -1388,21 +1431,32 @@ async def _ask_units(update, actor, data: dict, qs: list, draft: bool):
     await update.message.reply_text(text, parse_mode="HTML", reply_markup=kb)
 
 
-def _apply_unit_choice(items: list, qi: dict, as_box: bool):
+def _apply_unit_choice(items: list, qi: dict, choice: str):
+    """choice: "b" — коробки, "k" — пачки (только у товаров с пачками),
+    "p" — штуки."""
     it = items[qi["i"]]
-    if as_box:
+    if choice == "k" and not qi.get("pack"):
+        choice = "p"
+    if choice == "b":
         it["qty"] = qi["n"] * qi["box"]
         it["box_qty"] = qi["n"]
+    elif choice == "k":
+        it["qty"] = qi["n"] * qi["pack"]
+        it["box_qty"] = None
     else:
         it["qty"] = qi["n"]
         it["box_qty"] = None
-    qi["as_box"] = as_box
+    qi["as_box"] = choice == "b"
+    qi["unit"] = choice
 
 
 def box_prefix(it) -> str:
     """«N кор / » перед количеством позиции — только для целых коробок."""
     boxes = prices.whole_boxes(it.get("product_id"), it.get("qty"))
-    return f"{boxes} кор / " if boxes else ""
+    if boxes:
+        return f"{boxes} кор / "
+    packs = prices.whole_packs(it.get("product_id"), it.get("qty"))
+    return f"{packs} пач / " if packs else ""
 
 
 def box_lines(items) -> list:
@@ -1422,9 +1476,11 @@ def box_breakdown(items):
     прайса (поле box): целые коробки складываются, остаток идёт «россыпью».
     «Места» — сколько коробок займёт при погрузке, неполная коробка тоже
     место. Товар вне прайса (product_id пуст) считается только в штуках.
-    Возвращает (коробки, россыпь, всего_штук, места).
+    Возвращает (коробки, россыпь, всего_штук, места, пачки). Пачки — только
+    у товаров с пачками внутри коробки (шприцы, prices.PACKS): остаток от
+    целых коробок раскладывается на пачки, россыпь — что меньше пачки.
     """
-    boxes = loose = total = places = 0
+    boxes = loose = total = places = packs = 0
     for it in items:
         try:
             qty = int(it.get("qty") or 0)
@@ -1443,22 +1499,30 @@ def box_breakdown(items):
             continue
         boxes += qty // per_box
         rest = qty % per_box
+        pack = prices.pack_size(it.get("product_id"))
+        if pack and rest:
+            packs += rest // pack
+            places += rest // pack
+            rest = rest % pack
         loose += rest
         places += qty // per_box + (1 if rest else 0)
-    return boxes, loose, total, places
+    return boxes, loose, total, places, packs
 
 
 def box_note_text(items, with_total=True, prefix="Всего: ") -> str:
     """Строка «сколько это коробок» для накладной и прихода/перемещения."""
-    boxes, loose, total, places = box_breakdown(items)
+    boxes, loose, total, places, packs = box_breakdown(items)
     if total <= 0:
         return ""
-    if boxes and loose:
-        text = f"{prefix}{fmt_num(boxes)} кор. + {fmt_num(loose)} шт россыпью"
-        if with_total:
-            text += f" ({fmt_num(total)} шт)"
-    elif boxes:
-        text = f"{prefix}{fmt_num(boxes)} кор."
+    parts_ = []
+    if boxes:
+        parts_.append(f"{fmt_num(boxes)} кор.")
+    if packs:
+        parts_.append(f"{fmt_num(packs)} пач.")
+    if loose:
+        parts_.append(f"{fmt_num(loose)} шт россыпью")
+    if boxes or packs:
+        text = prefix + " + ".join(parts_)
         if with_total:
             text += f" ({fmt_num(total)} шт)"
     else:
@@ -5748,10 +5812,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
             if choice in ("B", "P"):
                 for qi in qs[pos:]:
-                    _apply_unit_choice(items, qi, choice == "B")
+                    _apply_unit_choice(items, qi, choice.lower())
                 pos = len(qs)
-            elif choice in ("b", "p") and pos < len(qs):
-                _apply_unit_choice(items, qs[pos], choice == "b")
+            elif choice in ("b", "k", "p") and pos < len(qs):
+                _apply_unit_choice(items, qs[pos], choice)
                 pos += 1
             else:
                 await q.answer()
@@ -5779,6 +5843,9 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                      if product else f"{qi['name']} {qi['volume']}")
             if qi.get("as_box"):
                 lines.append(f"📦 {esc(title)}: {qi['n']} кор = {qi['n'] * qi['box']} шт")
+            elif qi.get("unit") == "k":
+                lines.append(f"📦 {esc(title)}: {qi['n']} пач = "
+                             f"{qi['n'] * qi['pack']} шт")
             else:
                 lines.append(f"🔢 {esc(title)}: {qi['n']} шт")
         try:
@@ -7890,7 +7957,8 @@ async def pricepdf_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     await context.bot.send_chat_action(chat_id=update.effective_chat.id,
                                        action="upload_document")
-    pdf = generate_price_pdf(prices.PRICE_LIST_DATA)
+    pdf = generate_price_pdf([{**p, "pack": prices.pack_size(p["id"])}
+                              for p in prices.PRICE_LIST_DATA])
     filename = f"прайс_ВЕТОП_{datetime.now(BISHKEK).strftime('%d%m%Y')}.pdf"
     await update.message.reply_document(
         document=InputFile(pdf, filename=filename),
@@ -7918,11 +7986,12 @@ async def _stock_report(update, context, actor, whs, with_prices=False):
                 # Колонка «Коробок» (просьба владельца 18.08.2026): целые
                 # коробки по вместимости прайса + остаток россыпью.
                 if qty > 0 and p.get("box"):
-                    b, rest = qty // p["box"], qty % p["box"]
-                    if b and rest:
-                        box_cell = f"{b} кор + {rest} шт"
-                    elif b:
-                        box_cell = f"{b} кор"
+                    b, _l, _t, _pl, pk = box_breakdown(
+                        [{"product_id": p["id"], "qty": qty}])
+                    rest = qty - b * p["box"] - pk * (prices.pack_size(p["id"]) or 0)
+                    cells = ([f"{b} кор"] if b else []) + ([f"{pk} пач"] if pk else [])
+                    if cells:
+                        box_cell = " + ".join(cells) + (f" + {rest} шт" if rest else "")
                     else:
                         box_cell = "россыпь"
                 else:
@@ -10539,10 +10608,11 @@ def _where_box_text(pid, qty) -> str:
     """«31 кор + 20 шт» / «2 кор» / «» — коробки по вместимости прайса."""
     if qty <= 0:
         return ""
-    boxes, loose, _t, _p = box_breakdown([{"product_id": pid, "qty": qty}])
-    if not boxes:
+    boxes, loose, _t, _p, packs = box_breakdown([{"product_id": pid, "qty": qty}])
+    if not boxes and not packs:
         return ""
-    return f"{boxes} кор" + (f" + {loose} шт" if loose else "")
+    out = ([f"{boxes} кор"] if boxes else []) + ([f"{packs} пач"] if packs else [])
+    return " + ".join(out) + (f" + {loose} шт" if loose else "")
 
 
 def where_report_text(pids, label, whs) -> str:

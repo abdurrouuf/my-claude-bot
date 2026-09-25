@@ -366,6 +366,14 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
         _migrate_price_order(conn)
         _migrate_price_items(conn)
         _migrate_batches(conn)
+        # Шприцы Цефти DC / Цефном LC: коробка = 288 (большая), пачка 24
+        # (решение владельца 25.09.2026). Старые базы хранят box=24.
+        if not conn.execute("SELECT 1 FROM settings WHERE key='syringe_box_288'"
+                            ).fetchone():
+            conn.execute("UPDATE products SET box=288 WHERE id IN (103, 104) "
+                         "AND box=24")
+            conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                         "VALUES('syringe_box_288', '1')")
         # Починка сроков с «двухцифровым» годом из Excel (04.30 -> 1930):
         # настоящих сроков в 19xx не бывает, безопасно переносим в 20xx.
         for table in ("product_batches", "product_expiry"):
