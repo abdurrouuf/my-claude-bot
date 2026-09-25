@@ -3503,6 +3503,93 @@ def _wrong_expiry_warnings(p):
     return out
 
 
+# Несуществующий срок при перемещении/списании (25.09.2026, решение
+# владельца): сотруднику — отказ на 1-й и 2-й попытке, на 3-й одинаковой
+# карточка проходит с пометкой; админу — отказ один раз, 2-я проходит.
+EXPIRY_ATTEMPTS_KEY = "wrong_expiry_attempts"
+EXPIRY_ATTEMPT_WINDOW = 3600          # попытки считаются в течение часа
+EXPIRY_ATTEMPTS_ADMIN = 2
+EXPIRY_ATTEMPTS_STAFF = 3
+
+
+def _missing_expiry_items(p):
+    """Позиции с явно названным сроком, которого НЕТ на складе-источнике,
+    хотя датированные партии у товара там есть (почти всегда опечатка).
+    Товар, лежащий только «без срока», сюда не попадает — там названный
+    срок штатный (переносится на получателя), остаётся предупреждение."""
+    if p.get("kind") == "writeoff":
+        src_wh = p.get("wh_id")
+    else:
+        src_wh = p.get("from_wh_id")
+    out = []
+    if not src_wh:
+        return out
+    for it in p["items"]:
+        exp = it.get("expiry")
+        pid = it.get("product_id")
+        if not pid or not exp or it.get("expiry_asked"):
+            continue
+        if db.batch_qty(src_wh, pid, exp) > 0:
+            continue
+        batches = db.product_batches_of(src_wh, pid)
+        if any(b["expiry"] for b in batches):
+            out.append((it, batches))
+    return out
+
+
+def _expiry_attempt_gate(actor, p):
+    """Считает попытки с несуществующим сроком. Возвращает (текст отказа,
+    None) — операцию не создавать; или (None, пометка) — пропускаем
+    (пометка пуста, если ошибочных сроков нет). Счётчик — в settings
+    (переживает деплой), ключ: сотрудник + склад + товар + срок."""
+    bad = _missing_expiry_items(p)
+    if not bad:
+        return None, ""
+    src_wh = p["wh_id"] if p.get("kind") == "writeoff" else p["from_wh_id"]
+    src_name = p["wh_name"] if p.get("kind") == "writeoff" \
+        else p["from_wh_name"]
+    limit = EXPIRY_ATTEMPTS_ADMIN if is_admin(actor) else EXPIRY_ATTEMPTS_STAFF
+    now = time.time()
+    try:
+        store = json.loads(db.get_setting(EXPIRY_ATTEMPTS_KEY) or "{}")
+    except (ValueError, TypeError):
+        store = {}
+    store = {k: v for k, v in store.items()
+             if isinstance(v, list) and len(v) == 2
+             and now - v[1] < EXPIRY_ATTEMPT_WINDOW}
+    keys, lines, counts = [], [], []
+    for it, batches in bad:
+        k = f"{actor['id']}:{src_wh}:{it['product_id']}:{it['expiry']}"
+        cnt = store.get(k, [0, now])[0] + 1
+        store[k] = [cnt, now]
+        keys.append(k)
+        counts.append(cnt)
+        listed = ", ".join(f"{b['expiry'] or 'без срока'} — {b['qty']} шт"
+                           for b in batches)
+        lines.append(f"• {it['name']} {it['volume']}: срока {it['expiry']} "
+                     f"НЕТ. Есть партии: {listed}")
+    n = min(counts)
+    passed = n >= limit
+    if passed:
+        for k in keys:
+            store.pop(k, None)
+    db.set_setting(EXPIRY_ATTEMPTS_KEY, json.dumps(store))
+    if passed:
+        return None, (f"ВНИМАНИЕ: названного срока на складе «{src_name}» нет — "
+                      f"отправлено {n}-й раз, пропускаю. Проверьте перед "
+                      f"проведением!")
+    left = limit - n
+    msg = [f"❌ Не провожу: на складе «{esc(src_name)}» нет названного "
+           f"срока.", *[esc(x) for x in lines], "",
+           "Проверьте срок на упаковке и напишите заново с правильным сроком."]
+    if left == 1:
+        msg.append(f"⚠️ Это попытка {n}. Если срок ТОЧНО верный — отправьте "
+                   f"то же сообщение ещё раз, и я его пропущу.")
+    else:
+        msg.append(f"(попытка {n} из {limit})")
+    return "\n".join(msg), None
+
+
 def transfer_summary(p) -> str:
     header = "📦 <b>Приход товара</b>" if not p["from_wh_id"] else "📦 <b>Перемещение товара</b>"
     lines = [header]
@@ -3682,6 +3769,15 @@ async def start_transfer(update, context, actor, data):
         "from_wh_name": from_wh["name"] if from_wh else None,
         "items": items, "warnings": warnings,
     }
+
+    # Несуществующий срок на источнике: отказ до N-й попытки (25.09.2026)
+    refuse, note = _expiry_attempt_gate(actor, payload)
+    if refuse:
+        await update.message.reply_text(refuse, parse_mode="HTML")
+        _note_outcome(update, "операция НЕ создана — срока нет на складе")
+        return
+    if note:
+        payload["warnings"] = [note] + list(payload["warnings"])
 
     # Перемещение между складами подтверждает ТОЛЬКО админ.
     if from_wh is not None and not is_admin(actor):
@@ -4641,6 +4737,15 @@ async def start_writeoff(update, context, actor, data):
         "reason": str(data.get("reason") or "").strip() or "не указана",
         "items": items, "warnings": warnings,
     }
+
+    # Несуществующий срок на источнике: отказ до N-й попытки (25.09.2026)
+    refuse, note = _expiry_attempt_gate(actor, payload)
+    if refuse:
+        await update.message.reply_text(refuse, parse_mode="HTML")
+        _note_outcome(update, "операция НЕ создана — срока нет на складе")
+        return
+    if note:
+        payload["warnings"] = [note] + list(payload["warnings"])
 
     # Товар уходит со склада без денег — проводит только админ.
     if not is_admin(actor):
