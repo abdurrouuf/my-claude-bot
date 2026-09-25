@@ -745,6 +745,61 @@ def expiry_phantoms(wh_id: int):
         (wh_id,)).fetchall()
 
 
+def integrity_check():
+    """Ночная самопроверка учёта (25.09.2026, «делай» владельца): всё, что
+    бот может сверить сам, без человека. Возвращает список проблем
+    (wh_id, product_id | None, текст). Пусто — учёт сходится.
+
+    Проверки: (1) остаток в таблице stock = сумма stock_deltas проведённых
+    операций журнала (stock ведётся приращениями, журнал — источник);
+    (2) сумма партий = остаток; (3) минусовые датированные партии
+    (призраки); (4) минусовый остаток; (5) минусовая касса сотрудника."""
+    conn = connect()
+    out = []
+    journal = {}
+    for r in conn.execute(
+            "SELECT json_extract(je.value, '$[0]') wh, "
+            "json_extract(je.value, '$[1]') pid, "
+            "SUM(json_extract(je.value, '$[2]')) d "
+            "FROM operations o, json_each(o.data, '$.stock_deltas') je "
+            "WHERE o.status='done' AND json_valid(o.data) "
+            "GROUP BY 1, 2"):
+        journal[(r["wh"], r["pid"])] = r["d"] or 0
+    stock = {(r["warehouse_id"], r["product_id"]): r["qty"]
+             for r in conn.execute("SELECT warehouse_id, product_id, qty FROM stock")}
+    batches = {}
+    for r in conn.execute("SELECT warehouse_id, product_id, SUM(qty) s "
+                          "FROM product_batches GROUP BY 1, 2"):
+        batches[(r["warehouse_id"], r["product_id"])] = r["s"] or 0
+    keys = set(journal) | set(stock) | set(batches)
+    for wh, pid in sorted(keys, key=lambda k: (k[0] or 0, k[1] or 0)):
+        if wh is None or pid is None:
+            continue
+        have = stock.get((wh, pid), 0)
+        j = journal.get((wh, pid), 0)
+        if abs(have - j) > 0:
+            out.append((wh, pid, f"остаток {have}, по журналу {j} — "
+                                 f"расхождение {have - j:+d}"))
+        b = batches.get((wh, pid), 0)
+        if abs(have - b) > 0:
+            out.append((wh, pid, f"остаток {have}, сумма партий {b} — "
+                                 f"партии разъехались на {b - have:+d}"))
+        if have < 0:
+            out.append((wh, pid, f"минусовый остаток {have}"))
+    for r in conn.execute(
+            "SELECT warehouse_id, product_id, expiry, qty FROM product_batches "
+            "WHERE qty < 0 AND expiry != '' ORDER BY 1, 2"):
+        out.append((r["warehouse_id"], r["product_id"],
+                    f"призрак: партия {r['expiry']} = {r['qty']} шт "
+                    f"(«исправь срок … {r['expiry']} на <верный>»)"))
+    for u in conn.execute("SELECT id, name FROM users WHERE active=1"):
+        cash = cash_on_hand(u["id"])
+        if cash < -0.5:
+            out.append((None, None, f"касса {u['name']}: {cash:,.0f} сом в МИНУСЕ"
+                        .replace(",", "'")))
+    return out
+
+
 def known_client_names(limit: int = 40, wh_ids: list = None):
     """Имена клиентов для подсказок. wh_ids — только клиенты этих складов
     (сотруднику в промпт не даём имена чужих складов); None — вся база.
