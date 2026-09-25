@@ -4042,6 +4042,88 @@ def test_where_report():
     assert "/where" in out[-1]
 
 
+def test_wrong_expiry_attempts():
+    """Решение владельца 25.09.2026: перемещение/списание со сроком,
+    которого нет на складе-источнике (а датированные партии есть), —
+    сотруднику отказ на 1-й и 2-й попытке, на 3-й карточка проходит с
+    пометкой; админу — отказ один раз, 2-я проходит. Правильный срок и
+    «без срока» — как раньше, без отказов."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()                                   # Каракол
+    dst = db.warehouse_by_name("Кара-Балта")
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1")
+    conn.commit()
+    _load(wh, {16: 100}, {(wh["id"], 16): [("06.2029", 100)]})
+    pr = prices.BY_ID[16]
+    sent_admin = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **k):
+            sent_admin.append((chat_id, text))
+
+    ctx = SimpleNamespace(bot=FakeBot())
+
+    def run(uid, exp, kind="transfer"):
+        replies = []
+        u = SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                            effective_chat=SimpleNamespace(id=uid, type="private"),
+                            message=SimpleNamespace(reply_text=_areply(replies)))
+        item = {"name": pr["name"], "volume": pr["volume"], "qty": 30, "price": 0}
+        if exp:
+            item["expiry"] = exp
+        if kind == "transfer":
+            data = {"to_warehouse": "Кара-Балта", "from_warehouse": "Каракол",
+                    "items": [item]}
+            asyncio.run(bot.start_transfer(u, ctx, db.get_user(uid), data))
+        else:
+            data = {"warehouse": "Каракол", "items": [item], "reason": "бой"}
+            asyncio.run(bot.start_writeoff(u, ctx, db.get_user(uid), data))
+        return replies
+
+    n0 = len(bot.PENDING)
+    # сотрудник: 1-я и 2-я попытки — отказ, заявка не создаётся
+    r = run(DANIYAR, "06/28")
+    assert "Не провожу" in r[-1] and "06.2029 — 100 шт" in r[-1], r
+    assert "попытка 1 из 3" in r[-1]
+    r = run(DANIYAR, "06/28")
+    assert "Не провожу" in r[-1] and "ещё раз" in r[-1], r
+    assert len(bot.PENDING) == n0 and not sent_admin
+    # 3-я — заявка уходит админу с пометкой
+    r = run(DANIYAR, "06/28")
+    assert "отправлена админу" in r[-1], r
+    assert sent_admin and "отправлено 3-й раз" in sent_admin[-1][1]
+    # счётчик сброшен: следующая такая же ошибка — снова отказ
+    r = run(DANIYAR, "06/28")
+    assert "Не провожу" in r[-1]
+    # правильный срок и без срока — сразу, без отказа
+    assert "отправлена админу" in run(DANIYAR, "06/29")[-1]
+    assert "отправлена админу" in run(DANIYAR, None)[-1]
+    # админ: один отказ, вторая попытка — карточка
+    r = run(ADMIN, "01.2027")
+    assert "Не провожу" in r[-1] and "ещё раз" in r[-1], r
+    r = run(ADMIN, "01.2027")
+    assert "Не провожу" not in r[-1] and "отправлено 2-й раз" in r[-1], r
+    # списание — то же правило
+    r = run(ADMIN, "02.2027", kind="writeoff")
+    assert "Не провожу" in r[-1]
+    r = run(ADMIN, "02.2027", kind="writeoff")
+    assert "Списать этот товар" in r[-1] and "2-й раз" in r[-1], r
+    # товар лежит только «без срока» — названный срок штатный, без отказа
+    _load(wh, {17: 10})
+    pr17 = prices.BY_ID[17]
+    replies = []
+    u = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                        effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                        message=SimpleNamespace(reply_text=_areply(replies)))
+    asyncio.run(bot.start_transfer(u, ctx, db.get_user(ADMIN), {
+        "to_warehouse": "Кара-Балта", "from_warehouse": "Каракол",
+        "items": [{"name": pr17["name"], "volume": pr17["volume"],
+                   "qty": 5, "price": 0, "expiry": "05.2028"}]}))
+    assert "Не провожу" not in replies[-1], replies
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
