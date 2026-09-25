@@ -1180,6 +1180,28 @@ def _response_text(resp) -> str:
 CLAUDE_MAX_TOKENS = 8000
 
 
+SLOW_AI_SECONDS = 40   # через столько секунд ожидания — «⏳ думаю дольше обычного»
+
+
+async def _await_with_notice(coro, update, quiet=False):
+    """Ждёт ответ ИИ; если он не пришёл за SLOW_AI_SECONDS, пишет человеку
+    «⏳ думаю дольше обычного» (тишина 24.09.2026 выглядела как поломка —
+    владелец отправил сообщение три раза). В quiet-режиме чата склада
+    молчим, как и на всё остальное."""
+    task = asyncio.ensure_future(coro)
+    try:
+        return await asyncio.wait_for(asyncio.shield(task), SLOW_AI_SECONDS)
+    except asyncio.TimeoutError:
+        if not quiet:
+            try:
+                await update.message.reply_text(
+                    "⏳ Думаю дольше обычного — подождите, ответ придёт. "
+                    "Повторно отправлять не нужно.")
+            except Exception:
+                pass
+        return await task
+
+
 async def ask_claude(history: list, actor, draft=False) -> str:
     resp = await anthropic_client.messages.create(
         model=CLAUDE_MODEL,
@@ -1571,6 +1593,32 @@ def apply_client_prices(p):
         if pid in special and not it.get("price_explicit"):
             it["price"] = special[pid]
             it["special"] = True
+
+
+def apply_return_prices(p):
+    """Возврат — по цене ПРОДАЖИ (25.09.2026, «делай» владельца): цена
+    берётся из последней накладной этого клиента по товару на складе
+    заявки; продаж в журнале нет — спеццена клиента, иначе прайс. Иначе
+    клиент со спеццены 120 возвращал бы по прайсу 140 — минус 20 сом на
+    штуку владельцу. Явно названную цену не трогаем."""
+    apply_client_prices(p)
+    pids = [it["product_id"] for it in p["items"] if it.get("product_id")]
+    if not pids or not p.get("client_id"):
+        return
+    last = {}
+    for op, it in db.product_sales(pids, {p["wh_id"]}, {p["client_id"]}):
+        pid = it.get("product_id")
+        if op["type"] == "invoice" and pid not in last:
+            try:
+                last[pid] = float(it.get("price"))
+            except (TypeError, ValueError):
+                continue
+    for it in p["items"]:
+        pid = it.get("product_id")
+        if pid in last and not it.get("price_explicit"):
+            it["price"] = last[pid]
+            it["special"] = False
+            it["sold_price"] = True
 
 
 def insufficient_stock(wh_id: int, items, extra_available: dict | None = None):
@@ -2968,6 +3016,8 @@ def return_summary(p) -> str:
         total += sub
         box = box_prefix(it)
         special = " 💲спеццена" if it.get("special") else ""
+        if it.get("sold_price"):
+            special = " (по цене продажи)"
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
                      f"{fmt_num(it['price'])}{special} = <b>{money(sub)}</b>")
     lines += _purchase_lines(p)
@@ -3085,7 +3135,7 @@ async def start_return(update, context, actor, data):
     }
 
     async def _proceed():
-        apply_client_prices(payload)
+        apply_return_prices(payload)
         refusal, pw = _return_purchase_check(actor, payload)
         if refusal:
             await update.message.reply_text(refusal)
@@ -6106,7 +6156,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 f"✅ Телефон клиента «{esc(c['name'])}»: {esc(p['phone'])}", parse_mode="HTML")
             return
         if p["kind"] == "return":
-            apply_client_prices(p)
+            apply_return_prices(p)
             requester = db.get_user(p["user_id"])
             refusal, pw = _return_purchase_check(requester, p)
             if refusal:
@@ -6930,7 +6980,9 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
     if not quiet:
         await context.bot.send_chat_action(chat_id=chat_id, action="typing")
     try:
-        reply = await ask_claude(_request_history(chat_id), actor, draft=draft)
+        reply = await _await_with_notice(
+            ask_claude(_request_history(chat_id), actor, draft=draft),
+            update, quiet=quiet)
     except Exception as e:
         log.exception("Claude API error")
         # Убираем добавленное user-сообщение — иначе парность истории
@@ -6941,7 +6993,8 @@ async def process_text(update, context, actor, text, draft=False, quiet=False):
         # Отвечаем и в чате склада: сюда попадает только похожее на операцию
         # (фильтр), молчание = сотрудник уверен, что оплата записана.
         await update.message.reply_text(
-            f"⚠️ Не получилось обработать: {e}\nПопробуйте ещё раз или напишите боту в личку.")
+            "⚠️ Не получилось обработать — ИИ не ответил "
+            f"({type(e).__name__}). Отправьте сообщение ещё раз.")
         return
     chat_histories[chat_id].append({"role": "assistant", "content": reply})
     chat_histories[chat_id] = chat_histories[chat_id][-HISTORY_LIMIT:]
@@ -7379,9 +7432,10 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # История с обрезкой старых сообщений и гарантией «первым — user»
     messages = _request_history(chat_id) + [{"role": "user", "content": content}]
     try:
-        resp = await anthropic_client.messages.create(
+        resp = await _await_with_notice(anthropic_client.messages.create(
             model=CLAUDE_MODEL, max_tokens=CLAUDE_MAX_TOKENS,
-            system=system_blocks(actor, draft=draft), messages=messages)
+            system=system_blocks(actor, draft=draft), messages=messages),
+            update)
         track_usage(resp)
         reply = _response_text(resp)
     except Exception as e:
@@ -11003,6 +11057,76 @@ async def send_backup(bot):
             pass
 
 
+INTEGRITY_HOUR = int(os.environ.get("INTEGRITY_HOUR", "3"))
+INTEGRITY_MINUTE = 30
+
+
+def integrity_report_text(problems) -> str:
+    """Текст тревоги о расхождениях учёта (пусто — всё сошлось)."""
+    if not problems:
+        return ""
+    names = {w["id"]: w["name"] for w in db.all_warehouses()}
+    lines = [f"🩺 <b>Самопроверка учёта</b>: найдено {len(problems)} "
+             f"расхождени{'е' if len(problems) == 1 else 'й'}", ""]
+    for wh, pid, text in problems[:40]:
+        where = ""
+        if wh is not None:
+            where = f"«{esc(names.get(wh, wh))}»"
+        if pid is not None:
+            p = prices.BY_ID.get(pid)
+            where += (f" {esc(prices._base_name(p['name']).upper())} "
+                      f"{esc(p['volume'])}" if p else f" товар #{pid}")
+        lines.append(f"• {where}: {esc(text)}".replace("• :", "•"))
+    if len(problems) > 40:
+        lines.append(f"… и ещё {len(problems) - 40}")
+    lines.append("")
+    lines.append("Что смотреть: /expiry Склад (призраки → «исправь срок …»), "
+                 "/moves Склад Товар (откуда расхождение), /cash. "
+                 "Не сходится — покажите Джарвису.")
+    return "\n".join(lines)
+
+
+async def send_integrity_alert(bot) -> bool:
+    problems = db.integrity_check()
+    text = integrity_report_text(problems)
+    if not text:
+        return False
+    await send_long_bot(bot, ADMIN_ID, text)
+    return True
+
+
+async def integrity_loop(app):
+    """Каждую ночь после бэкапа — сверка учёта, тревога только при
+    расхождениях (25.09.2026)."""
+    while True:
+        now = datetime.now(BISHKEK)
+        target = now.replace(hour=INTEGRITY_HOUR, minute=INTEGRITY_MINUTE,
+                             second=0, microsecond=0)
+        if target <= now:
+            target += timedelta(days=1)
+        await asyncio.sleep((target - now).total_seconds())
+        try:
+            if not db.claim_daily_job(
+                    f"integrity:{datetime.now(BISHKEK).date().isoformat()}"):
+                continue
+            await send_integrity_alert(app.bot)
+        except Exception:
+            log.exception("Ошибка самопроверки учёта")
+
+
+async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/check — самопроверка учёта прямо сейчас (админ)."""
+    if await _require_admin(update) is None:
+        return
+    text = integrity_report_text(db.integrity_check())
+    if not text:
+        await update.message.reply_text(
+            "✅ Учёт сходится: остатки = журнал, партии = остатки, "
+            "призраков и минусовых касс нет.")
+        return
+    await send_long(update.message, text)
+
+
 async def daily_backup_loop(app):
     while True:
         now = datetime.now(BISHKEK)
@@ -13363,6 +13487,7 @@ STAFF_COMMANDS = [
 ]
 ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("money", "Сколько денег в складе: товар + долги + касса"),
+    ("check", "Самопроверка учёта: остатки, партии, призраки, кассы"),
     ("quality", "Качество работы сотрудников: переделки, ошибки"),
     ("margin", "Прибыль по закупочным ценам"),
     ("stockcost", "Остатки в закупочных ценах"),
@@ -13508,6 +13633,7 @@ async def _post_init(app):
     app.create_task(cash_alert_loop(app))
     app.create_task(weekly_debt_loop(app))
     app.create_task(daily_backup_loop(app))
+    app.create_task(integrity_loop(app))
     app.create_task(monthly_deadstock_loop(app))
     app.create_task(draft_summary_loop(app))
     app.create_task(promise_reminder_loop(app))
@@ -13569,6 +13695,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("act", act_cmd))
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("dbinfo", dbinfo_cmd))
+    app.add_handler(CommandHandler("check", check_cmd))
     app.add_handler(CommandHandler("minstock", minstock_cmd))
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))

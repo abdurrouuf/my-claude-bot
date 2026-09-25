@@ -4239,6 +4239,113 @@ def test_syringe_boxes_and_packs():
     assert row[-1] == "1 кор + 2 пач + 4 шт", row
 
 
+def test_integrity_check_and_slow_ai_notice():
+    """25.09.2026, «делай» владельца (пункты 2 и 5): ночная самопроверка
+    учёта (остаток = журнал, партии = остаток, призраки, минусовые кассы)
+    и «⏳ думаю дольше обычного», если ИИ молчит дольше SLOW_AI_SECONDS."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {16: 100}, {(wh["id"], 16): [("06.2029", 100)]})
+    # чистая база — проблем нет
+    assert db.integrity_check() == []
+    assert bot.integrity_report_text([]) == ""
+    conn = db.connect()
+    # 1. остаток разошёлся с журналом (кто-то правил stock руками)
+    conn.execute("UPDATE stock SET qty=90 WHERE warehouse_id=? AND product_id=16",
+                 (wh["id"],))
+    conn.commit()
+    probs = db.integrity_check()
+    texts = [t for _w, _p, t in probs]
+    assert any("по журналу 100" in t and "-10" in t for t in texts), texts
+    assert any("партии разъехались" in t for t in texts), texts
+    conn.execute("UPDATE stock SET qty=100 WHERE warehouse_id=? AND product_id=16",
+                 (wh["id"],))
+    conn.commit()
+    assert db.integrity_check() == []
+    # 2. призрак — перемещение с несуществующим сроком
+    dst = db.warehouse_by_name("Кара-Балта")
+    pr = prices.BY_ID[16]
+    p = {"kind": "transfer", "user_id": ADMIN, "chat_id": 1,
+         "wh_id": dst["id"], "wh_name": dst["name"],
+         "from_wh_id": wh["id"], "from_wh_name": wh["name"],
+         "items": [{"name": pr["name"], "volume": pr["volume"], "qty": 30,
+                    "box_qty": None, "product_id": 16, "expiry": "06.2028"}],
+         "warnings": []}
+    bot._fill_src_batches(p)
+    bot.commit_transfer(p)
+    probs = db.integrity_check()
+    assert len(probs) == 1 and "призрак" in probs[0][2] and "06.2028" in probs[0][2]
+    text = bot.integrity_report_text(probs)
+    assert "Каракол" in text and "ДЕКСАТОП 50 мл" in text and "исправь срок" in text
+    # 3. минусовая касса сотрудника
+    db.commit_operation(DANIYAR, "handover", wh["id"], None, "сдал", [], [],
+                        {"amount": 500})
+    probs = db.integrity_check()
+    assert any("касса" in t and "МИНУСЕ" in t for _w, _p, t in probs), probs
+    # 4. /check и ночная рассылка
+    sent = []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+    asyncio.run(bot.send_integrity_alert(FakeBot()))
+    assert sent and sent[0][0] == ADMIN and "Самопроверка" in sent[0][1]
+
+    # 5. «⏳ думаю дольше обычного»
+    replies = []
+    upd = SimpleNamespace(message=SimpleNamespace(reply_text=_areply(replies)))
+    bot.SLOW_AI_SECONDS = 0.05
+
+    async def slow():
+        await asyncio.sleep(0.15)
+        return "ответ"
+
+    async def fast():
+        return "быстро"
+
+    assert asyncio.run(bot._await_with_notice(slow(), upd)) == "ответ"
+    assert replies and "дольше обычного" in replies[-1]
+    replies.clear()
+    assert asyncio.run(bot._await_with_notice(fast(), upd)) == "быстро"
+    assert not replies
+    assert asyncio.run(bot._await_with_notice(slow(), upd, quiet=True)) == "ответ"
+    assert not replies                                  # в quiet-чате молчим
+    bot.SLOW_AI_SECONDS = 40
+
+
+def test_return_at_sold_price():
+    """25.09.2026 (пункт 4): возврат считается по цене ПОСЛЕДНЕЙ продажи
+    клиенту, а не по прайсу; продаж нет — спеццена/прайс; явная цена главнее."""
+    wh = _fresh_db()
+    _load(wh, {16: 100, 17: 100})
+    db.clients_add_bulk(wh["id"], [("Асан", 0)])
+    c = db.client_exact(wh["id"], "Асан")
+    db.set_client_price(c["id"], 16, 120)
+    _invoice(wh, ADMIN, "Асан", [_item(16, 10, 115)], client_id=c["id"])
+    _invoice(wh, ADMIN, "Асан", [_item(16, 5, 125)], client_id=c["id"])
+    pr16, pr17 = prices.BY_ID[16], prices.BY_ID[17]
+    p = {"kind": "return", "user_id": ADMIN, "chat_id": 1, "wh_id": wh["id"],
+         "wh_name": wh["name"], "client_name": "Асан", "client_id": c["id"],
+         "items": [{"name": pr16["name"], "volume": pr16["volume"], "qty": 3,
+                    "price": pr16["price"], "box_qty": None, "product_id": 16,
+                    "price_explicit": False, "expiry": "06.2029"},
+                   {"name": pr17["name"], "volume": pr17["volume"], "qty": 2,
+                    "price": pr17["price"], "box_qty": None, "product_id": 17,
+                    "price_explicit": False, "expiry": "06.2029"}],
+         "warnings": []}
+    bot.apply_return_prices(p)
+    assert p["items"][0]["price"] == 125 and p["items"][0].get("sold_price")
+    assert p["items"][1]["price"] == pr17["price"] and not p["items"][1].get("sold_price")
+    assert "по цене продажи" in bot.return_summary(p)
+    # явная цена не трогается
+    p["items"][0]["price"] = 100
+    p["items"][0]["price_explicit"] = True
+    bot.apply_return_prices(p)
+    assert p["items"][0]["price"] == 100
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
