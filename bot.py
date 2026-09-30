@@ -7853,6 +7853,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # «сертификат …» текстом в личке — не для ИИ: либо подпись к только что
     # присланному файлу (владелец шлёт файл и подпись отдельно, 08.08.2026),
     # либо подсказка про /cert. Бесплатно и без фантазий ИИ.
+    # «описание Альтопен: …» — описание для публичной карточки QR (админ,
+    # личка; 30.09.2026), тоже без ИИ.
+    if not quiet and await desc_text_reply(update, actor, text):
+        return
     if not quiet and CERT_CAPTION_RE.match(text) and len(text.split()) <= 25:
         if await cert_text_reply(update, actor, text):
             return
@@ -7885,6 +7889,7 @@ QR_SCAN_MARK = "[Отсканировано по QR:"
 # "hist_len": длина истории на момент последнего скана}} — новый скан
 # добавляется к списку, только если человек ничего не писал между сканами.
 QR_SCANS: dict = {}
+QR_SCAN_TTL = 30 * 60      # сканы копятся только в пределах получаса
 
 
 def qr_parse_start(arg: str):
@@ -7927,8 +7932,10 @@ def qr_register_scan(chat_id: int, pid: int, lot: str | None, box: bool) -> list
     st = QR_SCANS.get(chat_id)
     hist = chat_histories.get(chat_id) or []
     if not st or st.get("hist_len") != len(hist) or not hist \
-            or QR_SCAN_MARK not in str(hist[0].get("content") or ""):
+            or QR_SCAN_MARK not in str(hist[0].get("content") or "") \
+            or time.time() - float(st.get("ts") or 0) > QR_SCAN_TTL:
         st = {"items": []}
+    st["ts"] = time.time()
     items = st["items"]
     for it in items:
         if it["pid"] == pid and (it.get("lot") or "") == (lot or ""):
@@ -7998,12 +8005,193 @@ def qr_scan_text(actor, product_id: int, lot: str | None, whs,
     return "\n".join(lines)
 
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+VETOP_CONTACTS = "+996 700 99 88 11, +996 700 887 666, vettop@inbox.ru"
+
+
+def _expiry_passed(exp: str) -> bool:
+    """Срок MM.YYYY уже прошёл (месяц окончания включительно — годен)."""
+    m = re.fullmatch(r"(\d\d)\.(\d{4})", str(exp or ""))
+    if not m:
+        return False
+    now = datetime.now(BISHKEK)
+    return (int(m.group(2)), int(m.group(1))) < (now.year, now.month)
+
+
+def qr_public_text(product_id: int, lot: str | None) -> str | None:
+    """Публичная карточка препарата по QR — для ПОСТОРОННИХ (клиент, фермер;
+    «1» владельца 30.09.2026). Тот же код, что у сотрудников: кто сканирует,
+    бот узнаёт по Telegram-аккаунту. Ни остатков, ни цен, ни клиентов —
+    только название, серия/срок и подлинность серии, описание (если
+    задано фразой «описание X: …»), контакты. Без ИИ."""
+    p = prices.BY_ID.get(product_id)
+    if p is None:
+        return None
+    short = prices._base_name(p["name"]).upper()
+    lines = ["🐄 <b>ВЕТОП — проверка препарата</b>",
+             f"<b>{esc(short)} {esc(p['volume'])}</b>",
+             esc(p["name"])]
+    if lot:
+        exp = db.lot_expiry(product_id, lot)
+        if exp:
+            lines.append(f"🏷 Серия <b>{esc(lot)}</b> — годен до <b>{esc(exp)}</b>")
+            if _expiry_passed(exp):
+                lines.append("⛔ Срок годности ИСТЁК — применять нельзя")
+            else:
+                lines.append("✅ Серия числится в поставках ВЕТОП")
+        else:
+            lines.append(f"🏷 Серия <b>{esc(lot)}</b> — ⚠️ в поставках ВЕТОП не "
+                         "значится. Уточните у продавца или позвоните нам.")
+    info = db.product_info_get(short)
+    if info:
+        lines += ["", "📝 " + esc(info)]
+    certs = db.certs_of(short)
+    if certs:
+        lines += ["", "📄 Сертификат соответствия — файлом ниже"]
+    lines += ["", f"📞 ОсОО «ВЕТОП»: {VETOP_CONTACTS}",
+              "Оптовые поставки ветеринарных препаратов, Кыргызстан"]
+    return "\n".join(lines)
+
+
+async def _send_public_certs(update, short: str):
+    certs = db.certs_of(short)
+    if not certs:
+        return
+    for c in _cert_default(certs):
+        try:
+            if c["file_kind"] == "photo":
+                await update.message.reply_photo(c["file_id"], caption=f"📜 Сертификат: {short}")
+            else:
+                await update.message.reply_document(c["file_id"], caption=f"📜 Сертификат: {short}")
+        except Exception:
+            log.warning("Публичный сертификат «%s» не отправился", short, exc_info=True)
+
+
+# Описание препарата для публичной карточки QR (админ, личка, до ИИ):
+# «описание Альтопен: текст» — задать; «описание Альтопен» — показать;
+# «описание Альтопен: удалить» — убрать; «описания» — список.
+DESC_RE = re.compile(r"^\s*описани[ея]\s+(?:препарата\s+)?([^:\n]+?)\s*(?::\s*(.+))?$",
+                     re.IGNORECASE | re.DOTALL)
+
+
+async def desc_text_reply(update, actor, text: str) -> bool:
+    if not is_admin(actor) or update.effective_chat.type != "private":
+        return False
+    if re.fullmatch(r"\s*описания\s*", text, re.IGNORECASE):
+        names = db.product_info_names()
+        await update.message.reply_text(
+            "📝 Описания заданы: " + ", ".join(names) if names
+            else "📝 Описаний пока нет. Задать: «описание Альтопен: текст».")
+        return True
+    m = DESC_RE.match(text)
+    if not m:
+        return False
+    name, body = m.group(1), (m.group(2) or "").strip()
+    short, cands = _cert_product_match(name)
+    if short is None:
+        await update.message.reply_text(
+            "❓ Не узнал препарат «" + esc(name) + "»"
+            + (" — возможно: " + ", ".join(cands) if cands else "") + ".",
+            parse_mode="HTML")
+        return True
+    if not body:
+        cur = db.product_info_get(short)
+        await update.message.reply_text(
+            f"📝 {short}: {cur}" if cur else
+            f"📝 У «{short}» описания нет. Задать: «описание {short}: текст».")
+        return True
+    if body.lower().strip(" .") in ("удалить", "удали", "убрать", "нет"):
+        ok = db.product_info_del(short)
+        await update.message.reply_text(
+            f"🗑 Описание «{short}» удалено." if ok else f"У «{short}» описания и не было.")
+        return True
+    db.product_info_set(short, body[:1500])
+    pid = next((p["id"] for p in prices.PRICE_LIST_DATA
+                if prices._base_name(p["name"]).upper() == short.upper()), None)
+    await update.message.reply_text(
+        f"✅ Описание «{short}» сохранено — его увидит любой, кто отсканирует QR "
+        f"этого препарата." + (f" Посмотреть карточку глазами клиента: /public {pid}"
+                               if pid else ""))
+    return True
+
+
+async def public_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/public <№товара>[-серия] — показать админу публичную карточку QR
+    (то, что видит посторонний), чтобы проверить описание."""
     actor = await get_actor(update)
-    if actor is None:
+    if actor is None or not is_admin(actor):
         return
     arg = (context.args or [""])[0].strip()
     qr = qr_parse_start(arg) if arg else None
+    if not qr:
+        await update.message.reply_text("Пример: /public 76-20261107C или /public 76")
+        return
+    text = qr_public_text(qr[0], qr[1])
+    if text is None:
+        await update.message.reply_text(f"Товара №{qr[0]} нет в прайсе.")
+        return
+    await update.message.reply_text("👁 Так карточку видит посторонний:\n\n" + text,
+                                    parse_mode="HTML")
+    await _send_public_certs(update, prices._base_name(prices.BY_ID[qr[0]]["name"]).upper())
+
+
+async def scans_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/scans [дней] — кто и что сканировал по QR (админ)."""
+    actor = await get_actor(update)
+    if actor is None or not is_admin(actor):
+        return
+    if not await _require_private(update):
+        return
+    days = 30
+    for a in (context.args or []):
+        if a.isdigit():
+            days = max(1, min(365, int(a)))
+    st = db.qr_scan_stats(days)
+    if not st["total"]:
+        await update.message.reply_text(f"📷 За {days} дн. QR никто не сканировал.")
+        return
+    lines = [f"📷 <b>Сканирования QR за {days} дн.</b>",
+             f"Всего: <b>{st['total']}</b> · посторонних (клиенты/фермеры): "
+             f"<b>{st['outsiders']}</b> ({st['uniq_out']} чел.) · "
+             f"сотрудников: {st['uniq_staff']} чел.", "", "<b>По препаратам:</b>"]
+    for r in st["by_product"][:25]:
+        p = prices.BY_ID.get(r["product_id"])
+        nm = (f"{prices._base_name(p['name']).upper()} {p['volume']}" if p
+              else f"№{r['product_id']}")
+        lines.append(f"• {esc(nm)} — {r['n']} (посторонних {r['outsiders'] or 0}, "
+                     f"коробок {r['boxes'] or 0})")
+    if st["by_lot"]:
+        lines += ["", "<b>По сериям:</b>"]
+        for r in st["by_lot"][:15]:
+            p = prices.BY_ID.get(r["product_id"])
+            nm = prices._base_name(p["name"]).upper() if p else f"№{r['product_id']}"
+            lines.append(f"• {esc(nm)} {esc(r['lot'])} — {r['n']} "
+                         f"(посторонних {r['outsiders'] or 0})")
+    if st["by_day"]:
+        lines += ["", "<b>По дням:</b>"]
+        for r in st["by_day"]:
+            d = r["d"][8:10] + "." + r["d"][5:7]
+            lines.append(f"• {d}: {r['n']} (посторонних {r['outsiders'] or 0})")
+    await send_long(update.message, "\n".join(lines))
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    actor = await get_actor(update)
+    arg = (context.args or [""])[0].strip()
+    qr = qr_parse_start(arg) if arg else None
+    if actor is None:
+        # Посторонний по QR с этикетки — публичная карточка препарата
+        # (единственное, что бот говорит незнакомцу; остальное — тишина).
+        if qr and update.effective_chat is not None \
+                and update.effective_chat.type == "private":
+            pid, lot, box = qr
+            text = qr_public_text(pid, lot)
+            if text is None:
+                return
+            db.qr_scan_log(pid, lot, box, update.effective_user.id, False,
+                           update.effective_chat.id)
+            await update.message.reply_text(text, parse_mode="HTML")
+            await _send_public_certs(update, prices._base_name(prices.BY_ID[pid]["name"]).upper())
+        return
     if qr:
         pid, lot, box = qr
         chat_id = update.effective_chat.id
@@ -8012,6 +8200,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await update.message.reply_text(
                 f"⚠️ QR ссылается на товар №{pid}, которого нет в прайсе.")
             return
+        db.qr_scan_log(pid, lot, box, actor["id"], True, chat_id)
         whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)] \
             or db.visible_warehouses(actor)
         # След в истории диалога: следующая реплика «Асан» — про эти товары
@@ -13632,6 +13821,7 @@ STAFF_COMMANDS = [
 ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("money", "Сколько денег в складе: товар + долги + касса"),
     ("check", "Самопроверка учёта: остатки, партии, призраки, кассы"),
+    ("scans", "Сканирования QR: кто, что, сколько"),
     ("quality", "Качество работы сотрудников: переделки, ошибки"),
     ("margin", "Прибыль по закупочным ценам"),
     ("stockcost", "Остатки в закупочных ценах"),
@@ -13847,6 +14037,8 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("backup", backup_cmd))
     app.add_handler(CommandHandler("dbinfo", dbinfo_cmd))
     app.add_handler(CommandHandler("check", check_cmd))
+    app.add_handler(CommandHandler("scans", scans_cmd))
+    app.add_handler(CommandHandler("public", public_cmd))
     app.add_handler(CommandHandler("minstock", minstock_cmd))
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))

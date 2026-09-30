@@ -164,6 +164,22 @@ CREATE TABLE IF NOT EXISTS product_lots(
     ts         TEXT NOT NULL,
     UNIQUE(product_id, expiry, lot)
 );
+CREATE TABLE IF NOT EXISTS qr_scans(
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts         TEXT NOT NULL,
+    product_id INTEGER NOT NULL,
+    lot        TEXT,                             -- серия из QR ('' = без серии)
+    box        INTEGER NOT NULL DEFAULT 0,       -- 1 = QR коробки
+    user_id    INTEGER,
+    staff      INTEGER NOT NULL DEFAULT 0,       -- 1 = сотрудник, 0 = посторонний
+    chat_id    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_qr_scans_ts ON qr_scans(ts);
+CREATE TABLE IF NOT EXISTS product_info(
+    product_name TEXT PRIMARY KEY COLLATE NOCASEU,  -- препарат (без фасовки), как у сертификатов
+    text         TEXT NOT NULL,                     -- описание для публичной карточки QR
+    ts           TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS promises(
     id       INTEGER PRIMARY KEY AUTOINCREMENT,
     ts       TEXT NOT NULL,
@@ -887,6 +903,81 @@ def seed_lots(lots, note: str, flag: str) -> bool:
         lot_add(int(pid), str(expiry), str(lot), note=note)
     set_setting(flag, "1")
     return True
+
+
+def qr_scan_log(product_id: int, lot, box: bool, user_id, staff: bool, chat_id):
+    """Журнал сканирований QR (30.09.2026): кто, что и когда сканировал —
+    сотрудник или посторонний (клиент/фермер). Для /scans."""
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT INTO qr_scans(ts, product_id, lot, box, user_id, staff, chat_id) "
+            "VALUES(?,?,?,?,?,?,?)",
+            (datetime.now(BISHKEK).isoformat(timespec="seconds"), int(product_id),
+             str(lot or ""), 1 if box else 0, user_id, 1 if staff else 0, chat_id))
+
+
+def qr_scan_stats(days: int = 30) -> dict:
+    """Сводка сканов за days дней: всего, посторонних, уникальных
+    посторонних, по товарам (штук/посторонних/коробок), по сериям."""
+    since = (datetime.now(BISHKEK) - timedelta(days=days)).isoformat(timespec="seconds")
+    conn = connect()
+    tot = conn.execute(
+        "SELECT COUNT(*) n, SUM(staff=0) outsiders, "
+        "COUNT(DISTINCT CASE WHEN staff=0 THEN user_id END) uniq_out, "
+        "COUNT(DISTINCT CASE WHEN staff=1 THEN user_id END) uniq_staff "
+        "FROM qr_scans WHERE ts>=?", (since,)).fetchone()
+    by_product = conn.execute(
+        "SELECT product_id, COUNT(*) n, SUM(staff=0) outsiders, SUM(box) boxes "
+        "FROM qr_scans WHERE ts>=? GROUP BY product_id ORDER BY n DESC, product_id",
+        (since,)).fetchall()
+    by_lot = conn.execute(
+        "SELECT product_id, lot, COUNT(*) n, SUM(staff=0) outsiders "
+        "FROM qr_scans WHERE ts>=? AND lot<>'' GROUP BY product_id, lot "
+        "ORDER BY n DESC, product_id LIMIT 30", (since,)).fetchall()
+    by_day = conn.execute(
+        "SELECT substr(ts,1,10) d, COUNT(*) n, SUM(staff=0) outsiders "
+        "FROM qr_scans WHERE ts>=? GROUP BY d ORDER BY d DESC LIMIT 14",
+        (since,)).fetchall()
+    return {"days": days, "total": tot["n"] or 0, "outsiders": tot["outsiders"] or 0,
+            "uniq_out": tot["uniq_out"] or 0, "uniq_staff": tot["uniq_staff"] or 0,
+            "by_product": [dict(r) for r in by_product],
+            "by_lot": [dict(r) for r in by_lot], "by_day": [dict(r) for r in by_day]}
+
+
+def product_info_set(product_name: str, text: str):
+    conn = connect()
+    with _lock, conn:
+        conn.execute(
+            "INSERT INTO product_info(product_name, text, ts) VALUES(?,?,?) "
+            "ON CONFLICT(product_name) DO UPDATE SET text=excluded.text, ts=excluded.ts",
+            (product_name, text, datetime.now(BISHKEK).isoformat(timespec="seconds")))
+
+
+def product_info_get(product_name: str):
+    row = connect().execute(
+        "SELECT text FROM product_info WHERE product_name=?", (product_name,)).fetchone()
+    return row["text"] if row else None
+
+
+def product_info_del(product_name: str) -> bool:
+    conn = connect()
+    with _lock, conn:
+        cur = conn.execute("DELETE FROM product_info WHERE product_name=?", (product_name,))
+        return cur.rowcount > 0
+
+
+def product_info_names() -> list:
+    return [r["product_name"] for r in connect().execute(
+        "SELECT product_name FROM product_info ORDER BY product_name")]
+
+
+def lot_expiry(product_id: int, lot: str):
+    """Срок серии по справочнику (последняя запись) или None."""
+    row = connect().execute(
+        "SELECT expiry FROM product_lots WHERE product_id=? AND lot=? ORDER BY id DESC",
+        (int(product_id), str(lot))).fetchone()
+    return row["expiry"] if row else None
 
 
 def lots_map() -> dict:
