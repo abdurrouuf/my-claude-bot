@@ -4353,6 +4353,7 @@ def test_qr_scan_start():
     import asyncio
     from types import SimpleNamespace
     wh = _fresh_db()
+    bot.QR_SCANS.clear(); bot.chat_histories.clear()
     _load(wh, {104: 300}, {(wh["id"], 104): [("06.2029", 300)]})
     db.lot_add(104, "06.2029", "2606920", note="тест")
     assert bot.qr_deeplink(104, "2606920") == "https://t.me/vetop_helper_bot?start=104-2606920"
@@ -4378,13 +4379,16 @@ def test_qr_scan_start():
     # обычный /start без параметра — приветствие
     asyncio.run(bot.start(upd, SimpleNamespace(args=[])))
     assert "Привет" in replies[-1]
-    # незнакомец — тишина
+    # незнакомец по QR — ПУБЛИЧНАЯ карточка (с 30.09.2026, «1-2» владельца),
+    # без остатков; без QR — тишина (см. test_qr_public_card_and_scans)
     replies.clear()
     stranger = SimpleNamespace(effective_user=SimpleNamespace(id=999999),
                                effective_chat=SimpleNamespace(id=999999, type="private"),
                                message=SimpleNamespace(reply_text=_areply(replies)))
     asyncio.run(bot.start(stranger, SimpleNamespace(args=["104-2606920"])))
-    assert not replies
+    assert len(replies) == 1 and "проверка препарата" in replies[0] and "300" not in replies[0]
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=[])))
+    assert len(replies) == 1
 
     # --- QR КОРОБКИ + накопление сканов (вопросы владельца 30.09.2026) ---
     assert bot.qr_deeplink(76, "20261107C", box=True) == \
@@ -4428,6 +4432,103 @@ def test_qr_scan_start():
     # обычный /start сбрасывает накопленное
     asyncio.run(bot.start(upd, SimpleNamespace(args=[])))
     assert ADMIN not in bot.QR_SCANS
+
+
+def test_qr_public_card_and_scans():
+    """«1-2» владельца 30.09.2026: посторонний по QR получает публичную
+    карточку (серия/срок/подлинность/описание/сертификат/контакты, без
+    остатков и цен), остальное — тишина; сканы считаются (/scans);
+    описание задаётся фразой «описание X: …»; /public показывает админу
+    карточку глазами клиента."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {76: 400}, {(wh["id"], 76): [("11.2029", 400)]})
+    db.lot_add(76, "11.2029", "20261107C", note="тест")
+    db.cert_add("АЛБЕНИВЕР", "FILE_ID_1", "document", "cert.pdf", "поставка")
+    replies, docs = [], []
+    async def reply_document(file_id, **kw):
+        docs.append(file_id)
+    def mk(uid, text_sink):
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=uid, type="private"),
+                               message=SimpleNamespace(reply_text=_areply(text_sink),
+                                                       reply_document=reply_document,
+                                                       text=""))
+    stranger = mk(777001, replies)
+    # 1. посторонний сканирует этикетку — карточка + сертификат
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=["76-20261107C"])))
+    t = replies[-1]
+    assert "проверка препарата" in t and "АЛБЕНИВЕР 100 мл" in t
+    assert "20261107C" in t and "годен до <b>11.2029</b>" in t
+    assert "числится в поставках" in t and "Сертификат" in t and "+996" in t
+    assert "400" not in t and "сом" not in t          # ни остатков, ни цен
+    assert docs == ["FILE_ID_1"]
+    # незнакомая серия — честно
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=["76-XXX"])))
+    assert "не значится" in replies[-1]
+    # просроченная серия
+    db.lot_add(76, "01.2020", "OLD1", note="тест")
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=["76-OLD1"])))
+    assert "ИСТЁК" in replies[-1]
+    # QR коробки постороннему — та же карточка, без «коробка»
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=["76-20261107C-K"])))
+    assert "проверка препарата" in replies[-1] and "КОРОБК" not in replies[-1]
+    # обычный /start без QR постороннему — тишина; чужой товар — тишина
+    n = len(replies)
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=[])))
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=["999-ABC"])))
+    assert len(replies) == n
+    # в группе постороннему — тишина даже по QR
+    grp = SimpleNamespace(effective_user=SimpleNamespace(id=777002),
+                          effective_chat=SimpleNamespace(id=-100500, type="supergroup"),
+                          message=SimpleNamespace(reply_text=_areply(replies),
+                                                  reply_document=reply_document))
+    asyncio.run(bot.start(grp, SimpleNamespace(args=["76-20261107C"])))
+    assert len(replies) == n
+    # 2. описание: задать / показать / удалить (админ, личка)
+    adm_replies = []
+    adm = mk(ADMIN, adm_replies)
+    adm.message.text = "описание Албенивер: суспензия от глистов, доза 1 мл на 10 кг"
+    asyncio.run(bot.handle_message(adm, SimpleNamespace(bot=None, args=[])))
+    assert "сохранено" in adm_replies[-1] and db.product_info_get("АЛБЕНИВЕР")
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=["76-20261107C"])))
+    assert "доза 1 мл на 10 кг" in replies[-1]
+    adm.message.text = "описание Албенивер"
+    asyncio.run(bot.handle_message(adm, SimpleNamespace(bot=None, args=[])))
+    assert "доза 1 мл" in adm_replies[-1]
+    adm.message.text = "описания"
+    asyncio.run(bot.handle_message(adm, SimpleNamespace(bot=None, args=[])))
+    assert "АЛБЕНИВЕР" in adm_replies[-1]
+    # /public — карточка глазами клиента
+    asyncio.run(bot.public_cmd(adm, SimpleNamespace(args=["76-20261107C"])))
+    assert "видит посторонний" in adm_replies[-1] and "доза 1 мл" in adm_replies[-1]
+    adm.message.text = "описание Албенивер: удалить"
+    asyncio.run(bot.handle_message(adm, SimpleNamespace(bot=None, args=[])))
+    assert "удалено" in adm_replies[-1] and db.product_info_get("АЛБЕНИВЕР") is None
+    # незнакомый препарат
+    adm.message.text = "описание Пупкинол: текст"
+    asyncio.run(bot.handle_message(adm, SimpleNamespace(bot=None, args=[])))
+    assert "Не узнал" in adm_replies[-1]
+    # 3. сканы считаются: сотрудник + посторонний; протухший список (>30 мин)
+    # не склеивается со свежим сканом
+    bot.QR_SCANS.clear(); bot.chat_histories.clear()
+    asyncio.run(bot.start(adm, SimpleNamespace(args=["76-20261107C-K"])))
+    bot.QR_SCANS[ADMIN]["ts"] -= bot.QR_SCAN_TTL + 5
+    asyncio.run(bot.start(adm, SimpleNamespace(args=["76-20261107C-K"])))
+    assert "1 к (80 шт)" in bot.chat_histories[ADMIN][0]["content"]
+    assert "2 к" not in bot.chat_histories[ADMIN][0]["content"]
+    st = db.qr_scan_stats(30)
+    assert st["total"] >= 6 and st["outsiders"] >= 5 and st["uniq_out"] == 1
+    assert st["by_product"][0]["product_id"] == 76 and st["by_product"][0]["boxes"] >= 2
+    asyncio.run(bot.scans_cmd(adm, SimpleNamespace(args=["7"])))
+    t = adm_replies[-1]
+    assert "Сканирования QR за 7 дн." in t and "АЛБЕНИВЕР 100 мл" in t and "20261107C" in t
+    # сотруднику /scans не отвечает
+    emp_replies = []
+    emp = mk(6525019701, emp_replies)
+    asyncio.run(bot.scans_cmd(emp, SimpleNamespace(args=[])))
+    assert not emp_replies
 
 
 def test_new_products_105_106_display_order():
