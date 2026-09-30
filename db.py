@@ -875,6 +875,20 @@ def lot_add(product_id: int, expiry: str, lot: str, note: str = None):
              datetime.now(BISHKEK).isoformat(timespec="seconds")))
 
 
+def seed_lots(lots, note: str, flag: str) -> bool:
+    """Одноразовое заселение справочника серий из файла поставки (флаг в
+    settings): серии и сроки известны ДО прихода товара — скан QR на
+    этикетке сразу показывает срок (вопрос владельца 30.09.2026).
+    lots — [(product_id, lot, expiry MM.YYYY, qty), ...]. Дубли (после
+    реального прихода) молча пропускаются UNIQUE-ом."""
+    if get_setting(flag):
+        return False
+    for pid, lot, expiry, *_ in lots:
+        lot_add(int(pid), str(expiry), str(lot), note=note)
+    set_setting(flag, "1")
+    return True
+
+
 def lots_map() -> dict:
     """{(product_id, expiry): 'серия1, серия2'} — для показа в отчётах."""
     out = {}

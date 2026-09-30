@@ -22,9 +22,11 @@ from reportlab.pdfgen import canvas
 import prices
 
 
-def qr_deeplink(product_id, lot=None, bot_name="vetop_helper_bot"):
+def qr_deeplink(product_id, lot=None, bot_name="vetop_helper_bot", box=False):
     """Та же ссылка, что в bot.qr_deeplink (без импорта бота — ему нужны токены)."""
     tail = f"{product_id}-{lot}" if lot else str(product_id)
+    if box:
+        tail += "-K"                       # QR коробки — см. bot.qr_parse_start
     return f"https://t.me/{bot_name}?start={tail}"
 
 OUT = "out_qr"
@@ -107,29 +109,39 @@ def _pdf(path, qr, lines):
     c.save()
 
 
-def make(product_id: int, lot: str | None, expiry: str | None = None):
-    url = qr_deeplink(product_id, lot)
+def make(product_id: int, lot: str | None, expiry: str | None = None,
+         box: bool = False):
+    """box=True — QR на БОЛЬШУЮ коробку: ссылка с хвостом -K, подпись
+    «КОРОБКА N шт» (N — вместимость из прайса); бот подставит целую коробку."""
+    url = qr_deeplink(product_id, lot, box=box)
     name, vol = _title(product_id)
-    base = f"{product_id}" + (f"_{lot}" if lot else "")
+    base = f"{product_id}" + (f"_{lot}" if lot else "") + ("_K" if box else "")
     os.makedirs(OUT, exist_ok=True)
     qr = segno.make(url, error="m")
     lines = [f"{name} {vol}".strip(), f"No.{product_id}" + (f"  Lot {lot}" if lot else "")]
     if expiry:
         lines.append(f"Exp {expiry}")
+    if box:
+        p = prices.BY_ID.get(product_id) or {}
+        n = int(p.get("box") or 0)
+        lines.insert(1, f"КОРОБКА {n} шт" if n > 1 else "КОРОБКА")
     _svg(os.path.join(OUT, base + ".svg"), qr, lines)
     _pdf(os.path.join(OUT, base + ".pdf"), qr, lines)
     print(f"{base}: {lines[0]} → {url}")
 
 
 def main(argv):
+    box = False
+    if argv[:1] == ["--boxes"]:            # QR коробок (снаружи, не вскрывая)
+        box, argv = True, argv[1:]
     if argv[:1] == ["--lots"]:
         mod = importlib.import_module(argv[1])
         for pid, lot, exp, _qty in mod.LOTS:
-            make(pid, lot, exp)
+            make(pid, lot, exp, box=box)
         return
     for a in argv:
         pid, _, lot = a.partition("-")
-        make(int(pid), lot or None)
+        make(int(pid), lot or None, box=box)
 
 
 if __name__ == "__main__":
