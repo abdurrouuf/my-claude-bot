@@ -32,6 +32,56 @@ def qr_deeplink(product_id, lot=None, bot_name="vetop_helper_bot", box=False):
 OUT = "out_qr"
 # Позиции заказа, которых ещё нет в прайсе (владелец добавит): № → (имя, фасовка)
 NEW_NAMES = {105: ("ДОКЦИЛИН 200", "50 мл"), 106: ("ФЛОРФЕН ПЛЮС 300", "50 мл")}
+# Английские названия — как в проформе TQ20260924C (Shimu), чтобы завод понял,
+# на какой препарат клеить код. У «Альбен плюс 100» латинского бренда в
+# проформе нет — только состав.
+EN_NAMES = {
+    69: ("Avertop", "Avermectin solution pour on 0.5%"),
+    70: ("Avertop", "Avermectin solution pour on 0.5%"),
+    71: ("Avertop", "Avermectin solution pour on 0.5%"),
+    72: ("Alben plus 100", "Albendazole 10% Oral Solution"),
+    74: ("Alben plus 100", "Albendazole 10% Oral Solution"),
+    75: ("Alben plus 100", "Albendazole 10% Oral Solution"),
+    76: ("Albeniver", "Albendazole 10% + Ivermectin 0.4% Oral Solution"),
+    77: ("Albeniver", "Albendazole 10% + Ivermectin 0.4% Oral Solution"),
+    78: ("Albeniver", "Albendazole 10% + Ivermectin 0.4% Oral Solution"),
+    79: ("Albeniver", "Albendazole 10% + Ivermectin 0.4% Oral Solution"),
+    105: ("Doxyline 200", "Doxycycline Hyclate 20% Injection"),
+    80: ("Doxyline 200", "Doxycycline Hyclate 20% Injection"),
+    89: ("Closanplus 100 LA", "Closantel Sodium 10% Injection"),
+    90: ("Closanplus 100 LA", "Closantel Sodium 10% Injection"),
+    91: ("Oxyline 300 LA", "Oxytetracycline 30% Injection"),
+    92: ("Oxyline 300 LA", "Oxytetracycline 30% Injection"),
+    93: ("Oxyline 300 LA", "Oxytetracycline 30% Injection"),
+    94: ("Penstrep Plus LA", "Procaine Penicillin G + Dihydrostreptomycin"),
+    95: ("Penstrep Plus LA", "Procaine Penicillin G + Dihydrostreptomycin"),
+    96: ("Penstrep Plus LA", "Procaine Penicillin G + Dihydrostreptomycin"),
+    106: ("Florfen Plus 300", "Florfenicol Injection 30%"),
+    101: ("Florfen Plus 300", "Florfenicol Injection 30%"),
+}
+
+
+def _vol_en(vol: str) -> str:
+    v = vol.replace("(10 фл)", "x 10 bottles").replace("мл", "ml")
+    v = v.replace(" л", " L").replace("кг", "kg").replace(" г", " g").replace("таб", "tab")
+    return v.strip()
+
+
+def _en_lines(product_id, vol, box_n=0):
+    """[(текст, кегль)] — английские строки подписи; пусто, если названия нет."""
+    en = EN_NAMES.get(product_id)
+    if not en:
+        return []
+    brand, comp = en
+    if "фл" in vol:                       # «10 мл (10 фл)» — пачка из 10 флаконов
+        pack = f"{_vol_en(vol.split('(')[0])}, box of 10 bottles"
+    else:
+        pack = f"{_vol_en(vol)}/bottle"
+    out = [(f"{brand} — {pack}", 8), (comp, 6.5)]
+    if box_n > 1:
+        unit = "boxes x 10 bottles" if "фл" in vol else "bottles"
+        out.append((f"CARTON {box_n} {unit}", 8))
+    return out
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 
@@ -56,17 +106,18 @@ def _runs(row):
 
 
 def _svg(path, qr, lines):
+    """lines — [(текст, кегль pt)]. Ширина страницы — по самой длинной строке."""
     m = qr.matrix
     n = len(m)
     cell = 4               # px на модуль
     border = 4 * cell
     qw = n * cell + 2 * border
-    # ширина страницы — по самой длинной строке подписи (≈0.62 px на символ
-    # при 13px), чтобы длинные названия не обрезались
-    tw = int(max(len(l) for l in lines) * 13 * 0.62) + 2 * border
+    px = lambda pt: pt * 4 / 3            # pt → px (SVG 96 dpi)
+    tw = int(max(len(t) * px(sz) * 0.62 for t, sz in lines)) + 2 * border
     w = max(qw, tw)
     ox = (w - qw) // 2
-    h = qw + 18 * len(lines) + 10
+    step = lambda sz: int(px(sz) * 1.45)
+    h = qw + sum(step(sz) for _, sz in lines) + 12
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
            f'viewBox="0 0 {w} {h}">', f'<rect width="{w}" height="{h}" fill="#fff"/>']
     for y, row in enumerate(m):
@@ -74,60 +125,66 @@ def _svg(path, qr, lines):
             out.append(f'<rect x="{ox + border + x0 * cell}" y="{border + y * cell}" '
                        f'width="{(x1 - x0) * cell}" height="{cell}" fill="#000"/>')
     ty = qw + 4
-    for i, line in enumerate(lines):
-        out.append(f'<text x="{w / 2}" y="{ty + 14 + i * 18}" font-family="DejaVu Sans, '
-                   f'Arial, sans-serif" font-size="{13 if i == 0 else 11}" '
-                   f'text-anchor="middle">{line}</text>')
+    for t, sz in lines:
+        ty += step(sz)
+        out.append(f'<text x="{w / 2}" y="{ty}" font-family="DejaVu Sans, '
+                   f'Arial, sans-serif" font-size="{px(sz):.1f}" '
+                   f'text-anchor="middle">{t}</text>')
     out.append("</svg>")
     with open(path, "w", encoding="utf-8") as f:
         f.write("\n".join(out))
 
 
 def _pdf(path, qr, lines):
+    """lines — [(текст, кегль pt)]. Ширина страницы — по самой длинной строке
+    (иначе длинные названия обрезались краем страницы)."""
     pdfmetrics.registerFont(TTFont("DejaVu", FONT))
     m = qr.matrix
     n = len(m)
     cell = 1.0 * mm
     border = 4 * cell
     qsize = n * cell + 2 * border
-    # ширина страницы — по самой длинной строке подписи (иначе длинные
-    # названия обрезались краем страницы)
-    fonts = [9 if i == 0 else 7.5 for i in range(len(lines))]
-    tw = max(pdfmetrics.stringWidth(l, "DejaVu", f) for l, f in zip(lines, fonts)) + 2 * border
+    tw = max(pdfmetrics.stringWidth(t, "DejaVu", sz) for t, sz in lines) + 2 * border
     size = max(qsize, tw)
     ox = (size - qsize) / 2
-    h = qsize + 6 * mm * len(lines) + 3 * mm
+    step = lambda sz: sz * 1.45 / 72 * 25.4 * mm      # интервал строки в мм
+    h = qsize + sum(step(sz) for _, sz in lines) + 4 * mm
     c = canvas.Canvas(path, pagesize=(size, h))
     for y, row in enumerate(m):
         for x0, x1 in _runs(row):
             c.rect(ox + border + x0 * cell, h - border - (y + 1) * cell,
                    (x1 - x0) * cell, cell, stroke=0, fill=1)
-    ty = h - qsize - 4 * mm
-    for i, line in enumerate(lines):
-        c.setFont("DejaVu", fonts[i])
-        c.drawCentredString(size / 2, ty - i * 6 * mm, line)
+    ty = h - qsize - 1 * mm
+    for t, sz in lines:
+        ty -= step(sz)
+        c.setFont("DejaVu", sz)
+        c.drawCentredString(size / 2, ty, t)
     c.save()
 
 
 def make(product_id: int, lot: str | None, expiry: str | None = None,
          box: bool = False):
     """box=True — QR на БОЛЬШУЮ коробку: ссылка с хвостом -K, подпись
-    «КОРОБКА N шт» (N — вместимость из прайса); бот подставит целую коробку."""
+    «КОРОБКА N шт / CARTON N bottles»; бот подставит целую коробку.
+    Под русским названием — английское (из проформы), чтобы завод понял,
+    на какой препарат клеить код."""
     url = qr_deeplink(product_id, lot, box=box)
     name, vol = _title(product_id)
     base = f"{product_id}" + (f"_{lot}" if lot else "") + ("_K" if box else "")
     os.makedirs(OUT, exist_ok=True)
     qr = segno.make(url, error="m")
-    lines = [f"{name} {vol}".strip(), f"No.{product_id}" + (f"  Lot {lot}" if lot else "")]
-    if expiry:
-        lines.append(f"Exp {expiry}")
+    p = prices.BY_ID.get(product_id) or {}
+    box_n = int(p.get("box") or 0)
+    lines = [(f"{name} {vol}".strip(), 9)]
     if box:
-        p = prices.BY_ID.get(product_id) or {}
-        n = int(p.get("box") or 0)
-        lines.insert(1, f"КОРОБКА {n} шт" if n > 1 else "КОРОБКА")
+        lines.append((f"КОРОБКА {box_n} шт" if box_n > 1 else "КОРОБКА", 9))
+    lines += _en_lines(product_id, vol, box_n if box else 0)
+    lines.append((f"No.{product_id}" + (f"  Lot {lot}" if lot else ""), 7.5))
+    if expiry:
+        lines.append((f"Exp {expiry}", 7.5))
     _svg(os.path.join(OUT, base + ".svg"), qr, lines)
     _pdf(os.path.join(OUT, base + ".pdf"), qr, lines)
-    print(f"{base}: {lines[0]} → {url}")
+    print(f"{base}: {lines[0][0]} → {url}")
 
 
 def main(argv):
