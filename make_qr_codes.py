@@ -74,13 +74,17 @@ def _en_lines(product_id, vol, box_n=0):
         return []
     brand, comp = en
     if "фл" in vol:                       # «10 мл (10 фл)» — пачка из 10 флаконов
-        pack = f"{_vol_en(vol.split('(')[0])}, box of 10 bottles"
+        # термины завода (проформа): «box» = коробочка флакона,
+        # «middle box» = 10 флаконов = наша единица прайса
+        pack = f"{_vol_en(vol.split('(')[0])}, middle box of 10 bottles"
     else:
         pack = f"{_vol_en(vol)}/bottle"
     out = [(f"{brand} — {pack}", 8), (comp, 6.5)]
     if box_n > 1:
-        unit = "boxes x 10 bottles" if "фл" in vol else "bottles"
-        out.append((f"CARTON {box_n} {unit}", 8))
+        if "фл" in vol:
+            out.append((f"CARTON {box_n} middle boxes = {box_n * 10} bottles", 8))
+        else:
+            out.append((f"CARTON {box_n} bottles", 8))
     return out
 FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
@@ -177,7 +181,10 @@ def make(product_id: int, lot: str | None, expiry: str | None = None,
     box_n = int(p.get("box") or 0)
     lines = [(f"{name} {vol}".strip(), 9)]
     if box:
-        lines.append((f"КОРОБКА {box_n} шт" if box_n > 1 else "КОРОБКА", 9))
+        if "фл" in vol and box_n > 1:      # единица прайса — упаковка 10 флаконов
+            lines.append((f"КОРОБКА {box_n} уп × 10 фл = {box_n * 10} фл", 9))
+        else:
+            lines.append((f"КОРОБКА {box_n} шт" if box_n > 1 else "КОРОБКА", 9))
     lines += _en_lines(product_id, vol, box_n if box else 0)
     lines.append((f"No.{product_id}" + (f"  Lot {lot}" if lot else ""), 7.5))
     if expiry:
