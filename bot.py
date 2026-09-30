@@ -7872,11 +7872,74 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 # ---------- Команды ----------
 
+# QR-код на этикетке/коробке (заказ Shimu TQ20260924C, 30.09.2026): в коде
+# ссылка t.me/vetop_helper_bot?start=<№ товара>-<серия>. Скан открывает бота
+# с параметром — показываем товар, серию, остатки и подставляем товар в
+# диалог, чтобы дальше хватило «Асан 2 к».
+QR_START_RE = re.compile(r"^p?(\d{1,4})(?:[-_]([A-Za-z0-9]{1,20}))?$")
+
+
+def qr_deeplink(product_id: int, lot: str | None = None,
+                bot_name: str = "vetop_helper_bot") -> str:
+    """Ссылка для QR: товар + (необязательно) серия."""
+    tail = f"{product_id}-{lot}" if lot else str(product_id)
+    return f"https://t.me/{bot_name}?start={tail}"
+
+
+def qr_scan_text(actor, product_id: int, lot: str | None, whs) -> str | None:
+    """Ответ на скан QR: товар, серия (и её срок по справочнику серий),
+    остатки по доступным складам. None — товара нет в прайсе."""
+    p = prices.BY_ID.get(product_id)
+    if p is None:
+        return None
+    title = f"{prices._base_name(p['name']).upper()} {p['volume']}"
+    lines = [f"📷 <b>QR: {esc(title)}</b> (№{p['id']} прайса, "
+             f"{fmt_num(p['price'])} сом)"]
+    if lot:
+        rows = db.connect().execute(
+            "SELECT expiry FROM product_lots WHERE product_id=? AND lot=? "
+            "ORDER BY id DESC", (product_id, lot)).fetchall()
+        if rows:
+            exp = rows[0]["expiry"] or "без срока"
+            lines.append(f"🏷 Серия <b>{esc(lot)}</b> — срок {esc(exp)}")
+        else:
+            lines.append(f"🏷 Серия <b>{esc(lot)}</b> — в справочнике серий её "
+                         f"ещё нет (появится после прихода поставки)")
+    lines.append("")
+    lines.append(where_report_text([product_id], title, whs))
+    lines.append("")
+    lines.append("Товар подставлен — напишите кому и сколько, например: "
+                 "<i>Асан 2 к</i> или <i>Асан 10 шт, приход 5000</i>.")
+    return "\n".join(lines)
+
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
     chat_histories[update.effective_chat.id] = []
+    arg = (context.args or [""])[0].strip()
+    m = QR_START_RE.match(arg) if arg else None
+    if m:
+        pid, lot = int(m.group(1)), m.group(2)
+        whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)] \
+            or db.visible_warehouses(actor)
+        text = qr_scan_text(actor, pid, lot, whs)
+        if text is None:
+            await update.message.reply_text(
+                f"⚠️ QR ссылается на товар №{pid}, которого нет в прайсе.")
+            return
+        p = prices.BY_ID[pid]
+        title = f"{prices._base_name(p['name']).upper()} {p['volume']}"
+        # След в истории диалога: следующая реплика «Асан 2 к» — про этот товар
+        chat_histories[update.effective_chat.id] = [
+            {"role": "user", "content": f"[Отсканирован QR-код товара: {title}"
+                                        + (f", серия {lot}" if lot else "") + "]"},
+            {"role": "assistant", "content": f"Товар {title} выбран. Напишите "
+                                             f"клиента и количество."},
+        ]
+        await update.message.reply_text(text, parse_mode="HTML")
+        return
     own = db.warehouse_of(actor["id"])
     lines = [
         "👋 Привет! Я бот компании <b>ВЕТОП</b> 🐄💊",

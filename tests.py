@@ -4346,6 +4346,47 @@ def test_return_at_sold_price():
     assert p["items"][0]["price"] == 100
 
 
+def test_qr_scan_start():
+    """QR на этикетке (30.09.2026): /start 104-2606920 показывает товар,
+    серию со сроком, остатки и подставляет товар в диалог; чужой номер —
+    вежливый отказ; незнакомцу — тишина."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {104: 300}, {(wh["id"], 104): [("06.2029", 300)]})
+    db.lot_add(104, "06.2029", "2606920", note="тест")
+    assert bot.qr_deeplink(104, "2606920") == "https://t.me/vetop_helper_bot?start=104-2606920"
+    assert bot.qr_deeplink(16) == "https://t.me/vetop_helper_bot?start=16"
+    assert bot.QR_START_RE.match("p104-2606920").groups() == ("104", "2606920")
+    assert bot.QR_START_RE.match("hello") is None
+    replies = []
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=SimpleNamespace(reply_text=_areply(replies)))
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["104-2606920"])))
+    t = replies[-1]
+    assert "QR: ЦЕФТИ DC 10 мл" in t and "2606920" in t and "06.2029" in t
+    assert "Каракол: <b>300 шт</b>" in t and "Товар подставлен" in t
+    h = bot.chat_histories[ADMIN]
+    assert h and "QR" in h[0]["content"] and h[-1]["role"] == "assistant"
+    # серия неизвестна — честно
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["104-XYZ"])))
+    assert "ещё нет" in replies[-1]
+    # товара нет
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["999"])))
+    assert "нет в прайсе" in replies[-1]
+    # обычный /start без параметра — приветствие
+    asyncio.run(bot.start(upd, SimpleNamespace(args=[])))
+    assert "Привет" in replies[-1]
+    # незнакомец — тишина
+    replies.clear()
+    stranger = SimpleNamespace(effective_user=SimpleNamespace(id=999999),
+                               effective_chat=SimpleNamespace(id=999999, type="private"),
+                               message=SimpleNamespace(reply_text=_areply(replies)))
+    asyncio.run(bot.start(stranger, SimpleNamespace(args=["104-2606920"])))
+    assert not replies
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
