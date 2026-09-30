@@ -6,3 +6,5 @@ __pycache__/
 out_qr/
 deliverables/
 *.zip
+out_carton/
+!supply_tq20260924c/**/*.zip
