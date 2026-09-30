@@ -477,6 +477,13 @@ def seed_products(seed: list):
     conn = connect()
     with _lock, conn:
         if conn.execute("SELECT 1 FROM products LIMIT 1").fetchone():
+            # Прайс уже в базе: досеиваем только НОВЫЕ номера из кода
+            # (позиции 105/106 заказа TQ20260924C, 30.09.2026); цены и
+            # правки владельца у существующих не трогаем.
+            conn.executemany(
+                "INSERT OR IGNORE INTO products(id, name, volume, box, price) "
+                "VALUES(?,?,?,?,?)",
+                [(p["id"], p["name"], p["volume"], p["box"], p["price"]) for p in seed])
             return False
         conn.executemany(
             "INSERT INTO products(id, name, volume, box, price) VALUES(?,?,?,?,?)",

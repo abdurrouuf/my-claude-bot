@@ -2568,7 +2568,7 @@ def test_buy_som_registry():
     курс её не меняет; заданную владельцем цену сидирование не затирает."""
     import buy_registry_data as R
     wh = _fresh_db()
-    assert len(R.BUY_SOM) == len(prices.PRICE_LIST_DATA) == 104
+    assert len(R.BUY_SOM) == 104 and len(prices.PRICE_LIST_DATA) == 106
     assert sum(len(v) for v in R.BUY_HISTORY.values()) == 361
     # каждая цена BUY_SOM — цена последней закупки из истории
     for pid, (som, date, doc) in R.BUY_SOM.items():
@@ -2577,7 +2577,7 @@ def test_buy_som_registry():
     assert db.seed_buy_som(R.BUY_SOM) is True
     assert db.seed_buy_som(R.BUY_SOM) is False        # флаг: второй раз мимо
     smap = db.products_buy_som_map()
-    assert len(smap) == 104 and smap[16] == R.BUY_SOM[16][0]
+    assert len(smap) == 104 and smap[16] == R.BUY_SOM[16][0]   # 105/106 без закупа в сомах
     # Себестоимость известна у всех 104 позиций и НЕ зависит от курса
     b1 = bot.buy_som_map()
     db.set_setting("usd_rate", "200")
@@ -4385,6 +4385,34 @@ def test_qr_scan_start():
                                message=SimpleNamespace(reply_text=_areply(replies)))
     asyncio.run(bot.start(stranger, SimpleNamespace(args=["104-2606920"])))
     assert not replies
+
+
+def test_new_products_105_106_display_order():
+    """30.09.2026: Докцилин 200 50 мл (№105, 280) и Флорфен плюс 300 50 мл
+    (№106, 300) — номера постоянные (в QR), но в прайсе стоят рядом со
+    своими 100 мл; в старую базу досеиваются без правки существующих цен."""
+    wh = _fresh_db()
+    ids = [p["id"] for p in prices.PRICE_LIST_DATA]
+    assert ids.index(105) == ids.index(80) - 1          # перед Докцилином 100 мл
+    assert ids.index(106) == ids.index(101) - 1         # перед Флорфеном 100 мл
+    assert prices.BY_ID[105]["price"] == 280 and prices.BY_ID[106]["price"] == 300
+    assert prices.match_product("Докцилин", "50 мл")["id"] == 105
+    assert prices.match_product("Флорфен плюс", "50 мл")["id"] == 106
+    assert prices.match_product("Докцилин", "100 мл")["id"] == 80
+    lines = prices.PRICE_LIST_TEXT.split("\n")
+    assert lines[ids.index(105)].startswith("105.")
+    # старая база без 105/106: досев не трогает цену существующего товара
+    conn = db.connect()
+    conn.execute("DELETE FROM products WHERE id IN (105, 106)")
+    conn.execute("UPDATE products SET price=999 WHERE id=80")
+    conn.commit()
+    assert db.seed_products(prices.SEED_DATA) is False
+    rows = {r["id"]: r for r in db.products_active()}
+    assert 105 in rows and 106 in rows and rows[80]["price"] == 999
+    prices.set_data(db.products_active())
+    assert prices.BY_ID[80]["price"] == 999
+    conn.execute("UPDATE products SET price=450 WHERE id=80"); conn.commit()
+    prices.set_data(db.products_active())
 
 
 def main():
