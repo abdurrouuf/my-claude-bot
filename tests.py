@@ -4357,7 +4357,7 @@ def test_qr_scan_start():
     db.lot_add(104, "06.2029", "2606920", note="тест")
     assert bot.qr_deeplink(104, "2606920") == "https://t.me/vetop_helper_bot?start=104-2606920"
     assert bot.qr_deeplink(16) == "https://t.me/vetop_helper_bot?start=16"
-    assert bot.QR_START_RE.match("p104-2606920").groups() == ("104", "2606920")
+    assert bot.QR_START_RE.match("p104-2606920").groups() == ("104", "2606920", None)
     assert bot.QR_START_RE.match("hello") is None
     replies = []
     upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
@@ -4365,7 +4365,7 @@ def test_qr_scan_start():
                           message=SimpleNamespace(reply_text=_areply(replies)))
     asyncio.run(bot.start(upd, SimpleNamespace(args=["104-2606920"])))
     t = replies[-1]
-    assert "QR: ЦЕФТИ DC 10 мл" in t and "2606920" in t and "06.2029" in t
+    assert "QR: <b>ЦЕФТИ DC 10 мл" in t and "2606920" in t and "06.2029" in t
     assert "Каракол: <b>300 шт</b>" in t and "Товар подставлен" in t
     h = bot.chat_histories[ADMIN]
     assert h and "QR" in h[0]["content"] and h[-1]["role"] == "assistant"
@@ -4385,6 +4385,49 @@ def test_qr_scan_start():
                                message=SimpleNamespace(reply_text=_areply(replies)))
     asyncio.run(bot.start(stranger, SimpleNamespace(args=["104-2606920"])))
     assert not replies
+
+    # --- QR КОРОБКИ + накопление сканов (вопросы владельца 30.09.2026) ---
+    assert bot.qr_deeplink(76, "20261107C", box=True) == \
+        "https://t.me/vetop_helper_bot?start=76-20261107C-K"
+    assert bot.qr_parse_start("76-20261107C-K") == (76, "20261107C", True)
+    assert bot.qr_parse_start("76-20261107C") == (76, "20261107C", False)
+    assert bot.qr_parse_start("76-K") == (76, None, True)
+    assert bot.qr_parse_start("76") == (76, None, False)
+    # сроки серий поставки заселяются ДО прихода — скан показывает срок
+    import tq20260924c_lots_data as L
+    assert (105, "20261111C") in {(r[0], r[1]) for r in L.LOTS}      # Докцилин 50 мл — №105, не №80
+    assert (80, "20261111C") not in {(r[0], r[1]) for r in L.LOTS}
+    assert db.seed_lots(L.LOTS, "тест", flag="lots_test") is True
+    assert db.seed_lots(L.LOTS, "тест", flag="lots_test") is False
+    _load(wh, {76: 400}, {(wh["id"], 76): [("11.2029", 400)]})
+    replies.clear()
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
+    t = replies[-1]
+    assert "QR КОРОБКИ" in t and "АЛБЕНИВЕР 100 мл" in t
+    assert "Целая коробка — <b>80 шт</b>" in t and "срок годности <b>11.2029</b>" in t
+    h = bot.chat_histories[ADMIN]
+    assert h[0]["role"] == "user" and "1 к (80 шт)" in h[0]["content"]
+    # вторая коробка того же товара — копится
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
+    assert "2 к (160 шт)" in bot.chat_histories[ADMIN][0]["content"]
+    assert "Отсканировано:" in replies[-1] and "2 к (160 шт)" in replies[-1]
+    # коробка другого товара — вторая строка списка
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["104-2606920-K"])))
+    seed = bot.chat_histories[ADMIN][0]["content"]
+    assert "2 к (160 шт)" in seed and "ЦЕФТИ DC 10 мл, серия 2606920 — 1 к (288 шт)" in seed
+    # человек что-то написал — следующий скан начинает список заново
+    bot.chat_histories[ADMIN].append({"role": "user", "content": "Асан"})
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
+    seed = bot.chat_histories[ADMIN][0]["content"]
+    assert "1 к (80 шт)" in seed and "ЦЕФТИ" not in seed
+    # вопрос «коробок или штук?» по накопленному списку не задаётся:
+    # модель отдаёт 1 к = 80 шт, в склейке реплик есть «1 к» и «80 шт»
+    data = {"items": [{"name": "Албенивер", "volume": "100 мл", "qty": 80, "box_qty": 1}],
+            "_last_text": "Асан", "_src_text": seed + " Асан"}
+    assert bot._unit_questions(data) == []
+    # обычный /start сбрасывает накопленное
+    asyncio.run(bot.start(upd, SimpleNamespace(args=[])))
+    assert ADMIN not in bot.QR_SCANS
 
 
 def test_new_products_105_106_display_order():

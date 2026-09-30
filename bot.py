@@ -7873,43 +7873,128 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # ---------- Команды ----------
 
 # QR-код на этикетке/коробке (заказ Shimu TQ20260924C, 30.09.2026): в коде
-# ссылка t.me/vetop_helper_bot?start=<№ товара>-<серия>. Скан открывает бота
-# с параметром — показываем товар, серию, остатки и подставляем товар в
-# диалог, чтобы дальше хватило «Асан 2 к».
-QR_START_RE = re.compile(r"^p?(\d{1,4})(?:[-_]([A-Za-z0-9]{1,20}))?$")
+# ссылка t.me/vetop_helper_bot?start=<№ товара>-<серия>[-K]. Скан открывает
+# бота с параметром — показываем товар, серию, остатки и подставляем товар в
+# диалог, чтобы дальше хватило «Асан 2 к». Хвост «-K» — QR на БОЛЬШОЙ
+# КОРОБКЕ (снаружи, не вскрывая): в диалог подставляется целая коробка
+# (box прайса), несколько сканов подряд копятся в один список.
+QR_START_RE = re.compile(
+    r"^p?(\d{1,4})(?:[-_]([A-Za-z0-9]{1,20}?))?(?:[-_]([kK]))?$")
+QR_SCAN_MARK = "[Отсканировано по QR:"
+# Накопленные сканы по чату: {chat_id: {"items": [{pid, lot, boxes}],
+# "hist_len": длина истории на момент последнего скана}} — новый скан
+# добавляется к списку, только если человек ничего не писал между сканами.
+QR_SCANS: dict = {}
+
+
+def qr_parse_start(arg: str):
+    """(product_id, lot|None, box: bool) из параметра /start; None — не QR."""
+    m = QR_START_RE.match(arg or "")
+    if not m:
+        return None
+    pid, lot, k = int(m.group(1)), m.group(2), m.group(3)
+    if lot and not k and lot.upper() == "K":      # «76-K»: коробка без серии
+        lot, k = None, "K"
+    return pid, lot, bool(k)
 
 
 def qr_deeplink(product_id: int, lot: str | None = None,
-                bot_name: str = "vetop_helper_bot") -> str:
-    """Ссылка для QR: товар + (необязательно) серия."""
+                bot_name: str = "vetop_helper_bot", box: bool = False) -> str:
+    """Ссылка для QR: товар + (необязательно) серия; box=True — QR коробки."""
     tail = f"{product_id}-{lot}" if lot else str(product_id)
+    if box:
+        tail += "-K"
     return f"https://t.me/{bot_name}?start={tail}"
 
 
-def qr_scan_text(actor, product_id: int, lot: str | None, whs) -> str | None:
+def _qr_item_text(it: dict) -> str:
+    p = prices.BY_ID.get(it["pid"])
+    title = f"{prices._base_name(p['name']).upper()} {p['volume']}" if p else f"№{it['pid']}"
+    t = title + (f", серия {it['lot']}" if it.get("lot") else "")
+    boxes = int(it.get("boxes") or 0)
+    if boxes:
+        try:
+            box = int(p["box"]) if p else 0
+        except (TypeError, ValueError, KeyError):
+            box = 0
+        t += f" — {boxes} к ({boxes * box} шт)" if box > 1 else f" — {boxes} шт"
+    return t
+
+
+def qr_register_scan(chat_id: int, pid: int, lot: str | None, box: bool) -> list:
+    """Добавить скан к накопленному списку чата (или начать новый, если
+    человек что-то писал после прошлого скана). Возвращает список сканов."""
+    st = QR_SCANS.get(chat_id)
+    hist = chat_histories.get(chat_id) or []
+    if not st or st.get("hist_len") != len(hist) or not hist \
+            or QR_SCAN_MARK not in str(hist[0].get("content") or ""):
+        st = {"items": []}
+    items = st["items"]
+    for it in items:
+        if it["pid"] == pid and (it.get("lot") or "") == (lot or ""):
+            if box:
+                it["boxes"] = int(it.get("boxes") or 0) + 1
+            break
+    else:
+        items.append({"pid": pid, "lot": lot, "boxes": 1 if box else 0})
+    seed_user = QR_SCAN_MARK + " " + "; ".join(_qr_item_text(it) for it in items) + "]"
+    if any(it.get("boxes") for it in items):
+        seed_bot = ("Отсканировано. Напишите клиента — выпишу накладную на " 
+                    "весь отсканированный список (количества по коробкам); "
+                    "либо клиента и другое количество.")
+    else:
+        seed_bot = "Товар выбран. Напишите клиента и количество."
+    chat_histories[chat_id] = [{"role": "user", "content": seed_user},
+                               {"role": "assistant", "content": seed_bot}]
+    st["hist_len"] = len(chat_histories[chat_id])
+    QR_SCANS[chat_id] = st
+    return items
+
+
+def qr_scan_text(actor, product_id: int, lot: str | None, whs,
+                 box: bool = False, scanned: list | None = None) -> str | None:
     """Ответ на скан QR: товар, серия (и её срок по справочнику серий),
-    остатки по доступным складам. None — товара нет в прайсе."""
+    остатки по доступным складам. box — QR коробки (целая коробка в
+    накладную), scanned — накопленный список сканов. None — товара нет."""
     p = prices.BY_ID.get(product_id)
     if p is None:
         return None
     title = f"{prices._base_name(p['name']).upper()} {p['volume']}"
-    lines = [f"📷 <b>QR: {esc(title)}</b> (№{p['id']} прайса, "
+    try:
+        box_n = int(p.get("box") or 0)
+    except (TypeError, ValueError):
+        box_n = 0
+    head = "📦 QR КОРОБКИ" if box else "📷 QR"
+    lines = [f"{head}: <b>{esc(title)}</b> (№{p['id']} прайса, "
              f"{fmt_num(p['price'])} сом)"]
+    if box:
+        lines.append(f"📦 Целая коробка — <b>{box_n} шт</b>" if box_n > 1
+                     else "⚠️ У товара в прайсе не задана вместимость коробки")
     if lot:
         rows = db.connect().execute(
             "SELECT expiry FROM product_lots WHERE product_id=? AND lot=? "
             "ORDER BY id DESC", (product_id, lot)).fetchall()
         if rows:
             exp = rows[0]["expiry"] or "без срока"
-            lines.append(f"🏷 Серия <b>{esc(lot)}</b> — срок {esc(exp)}")
+            lines.append(f"🏷 Серия <b>{esc(lot)}</b> — срок годности <b>{esc(exp)}</b>")
         else:
             lines.append(f"🏷 Серия <b>{esc(lot)}</b> — в справочнике серий её "
                          f"ещё нет (появится после прихода поставки)")
     lines.append("")
     lines.append(where_report_text([product_id], title, whs))
     lines.append("")
-    lines.append("Товар подставлен — напишите кому и сколько, например: "
-                 "<i>Асан 2 к</i> или <i>Асан 10 шт, приход 5000</i>.")
+    if scanned and (len(scanned) > 1 or any(it.get("boxes", 0) > 1 for it in scanned)):
+        lines.append("🧾 <b>Отсканировано:</b>")
+        for it in scanned:
+            lines.append("• " + esc(_qr_item_text(it)))
+        lines.append("")
+    if box or (scanned and any(it.get("boxes") for it in scanned)):
+        lines.append("Сканируйте следующие коробки — они добавятся в список. "
+                     "Потом напишите клиента, например: <i>Асан</i> — выпишу "
+                     "накладную на всё отсканированное (или <i>Асан, 3 к</i>).")
+    else:
+        lines.append("Товар подставлен — напишите кому и сколько, например: "
+                     "<i>Асан 2 к</i> или <i>Асан 10 шт, приход 5000</i>.")
     return "\n".join(lines)
 
 
@@ -7917,29 +8002,25 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     actor = await get_actor(update)
     if actor is None:
         return
-    chat_histories[update.effective_chat.id] = []
     arg = (context.args or [""])[0].strip()
-    m = QR_START_RE.match(arg) if arg else None
-    if m:
-        pid, lot = int(m.group(1)), m.group(2)
-        whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)] \
-            or db.visible_warehouses(actor)
-        text = qr_scan_text(actor, pid, lot, whs)
-        if text is None:
+    qr = qr_parse_start(arg) if arg else None
+    if qr:
+        pid, lot, box = qr
+        chat_id = update.effective_chat.id
+        if pid not in prices.BY_ID:
+            chat_histories[chat_id] = []
             await update.message.reply_text(
                 f"⚠️ QR ссылается на товар №{pid}, которого нет в прайсе.")
             return
-        p = prices.BY_ID[pid]
-        title = f"{prices._base_name(p['name']).upper()} {p['volume']}"
-        # След в истории диалога: следующая реплика «Асан 2 к» — про этот товар
-        chat_histories[update.effective_chat.id] = [
-            {"role": "user", "content": f"[Отсканирован QR-код товара: {title}"
-                                        + (f", серия {lot}" if lot else "") + "]"},
-            {"role": "assistant", "content": f"Товар {title} выбран. Напишите "
-                                             f"клиента и количество."},
-        ]
+        whs = [w for w in db.visible_warehouses(actor) if not is_training_wh(w)] \
+            or db.visible_warehouses(actor)
+        # След в истории диалога: следующая реплика «Асан» — про эти товары
+        scanned = qr_register_scan(chat_id, pid, lot, box)
+        text = qr_scan_text(actor, pid, lot, whs, box=box, scanned=scanned)
         await update.message.reply_text(text, parse_mode="HTML")
         return
+    chat_histories[update.effective_chat.id] = []
+    QR_SCANS.pop(update.effective_chat.id, None)
     own = db.warehouse_of(actor["id"])
     lines = [
         "👋 Привет! Я бот компании <b>ВЕТОП</b> 🐄💊",
@@ -13724,6 +13805,13 @@ if __name__ == "__main__":
     if db.seed_buy_som(buy_registry_data.BUY_SOM):
         log.info("Себестоимость из реестра 1С заселена (%d поз.)",
                  len(buy_registry_data.BUY_SOM))
+    # Серии поставки TQ20260924C известны до прихода — чтобы скан QR на
+    # этикетке сразу показывал срок годности (вопрос владельца 30.09.2026).
+    import tq20260924c_lots_data
+    if db.seed_lots(tq20260924c_lots_data.LOTS, "поставка TQ20260924C (до прихода)",
+                    flag="lots_tq20260924c"):
+        log.info("Серии поставки TQ20260924C заселены (%d)",
+                 len(tq20260924c_lots_data.LOTS))
     prices.set_data(db.products_active())
     _refresh_price_dependents()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
