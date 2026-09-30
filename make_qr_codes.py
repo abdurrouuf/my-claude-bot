@@ -1,51 +1,124 @@
 """Генератор QR-кодов для этикеток и коробок (заказ Shimu TQ20260924C).
 
-Использование:
     python3 make_qr_codes.py 104-2606920 103-2606921 ...
-    python3 make_qr_codes.py --file lots.txt      # строки «№товара серия»
+    python3 make_qr_codes.py --lots tq20260924c_lots_data   # из таблицы серий
 
-Для каждой пары создаёт out_qr/<№>_<серия>.svg и .pdf (вектор): QR со ссылкой
-t.me/vetop_helper_bot?start=<№>-<серия> и подпись — название/фасовка
-по-русски и номер товара с серией латиницей (заводу так проще). Без серии
-(«104») — QR только по товару. Нужна библиотека segno (pip install segno).
+На каждую пару «товар-серия» в out_qr/ создаются <№>_<серия>.svg и .pdf
+(вектор): QR со ссылкой t.me/vetop_helper_bot?start=<№>-<серия> и подпись —
+название/фасовка по-русски, латиницей № товара и серия, срок. Нужна
+библиотека segno (pip install segno). Товар вне прайса (новые №105/№106)
+подписывается из NEW_NAMES.
 """
+import importlib
 import os
 import sys
 
 import segno
+from reportlab.lib.pagesizes import mm
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.pdfgen import canvas
 
 import prices
-from bot import qr_deeplink
+
+
+def qr_deeplink(product_id, lot=None, bot_name="vetop_helper_bot"):
+    """Та же ссылка, что в bot.qr_deeplink (без импорта бота — ему нужны токены)."""
+    tail = f"{product_id}-{lot}" if lot else str(product_id)
+    return f"https://t.me/{bot_name}?start={tail}"
 
 OUT = "out_qr"
+# Позиции заказа, которых ещё нет в прайсе (владелец добавит): № → (имя, фасовка)
+NEW_NAMES = {105: ("ДОКЦИЛИН 200", "50 мл"), 106: ("ФЛОРФЕН ПЛЮС 300", "50 мл")}
+FONT = "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf"
 
 
-def make(product_id: int, lot: str | None):
-    p = prices.BY_ID[product_id]
+def _title(product_id):
+    p = prices.BY_ID.get(product_id)
+    if p:
+        return prices._base_name(p["name"]).upper(), p["volume"]
+    return NEW_NAMES.get(product_id, (f"товар №{product_id}", ""))
+
+
+def _runs(row):
+    """Отрезки [x0, x1) чёрных модулей в строке — рисуем полосами, чтобы при
+    печати/рендере между соседними квадратиками не было белых швов."""
+    out, start = [], None
+    for x, v in enumerate(list(row) + [0]):
+        if v and start is None:
+            start = x
+        elif not v and start is not None:
+            out.append((start, x))
+            start = None
+    return out
+
+
+def _svg(path, qr, lines):
+    m = qr.matrix
+    n = len(m)
+    cell = 4               # px на модуль
+    border = 4 * cell
+    w = n * cell + 2 * border
+    h = w + 18 * len(lines) + 10
+    out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
+           f'viewBox="0 0 {w} {h}">', f'<rect width="{w}" height="{h}" fill="#fff"/>']
+    for y, row in enumerate(m):
+        for x0, x1 in _runs(row):          # слитные полосы — без швов между модулями
+            out.append(f'<rect x="{border + x0 * cell}" y="{border + y * cell}" '
+                       f'width="{(x1 - x0) * cell}" height="{cell}" fill="#000"/>')
+    ty = w + 4
+    for i, line in enumerate(lines):
+        out.append(f'<text x="{w / 2}" y="{ty + 14 + i * 18}" font-family="DejaVu Sans, '
+                   f'Arial, sans-serif" font-size="{13 if i == 0 else 11}" '
+                   f'text-anchor="middle">{line}</text>')
+    out.append("</svg>")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("\n".join(out))
+
+
+def _pdf(path, qr, lines):
+    pdfmetrics.registerFont(TTFont("DejaVu", FONT))
+    m = qr.matrix
+    n = len(m)
+    cell = 1.0 * mm
+    border = 4 * cell
+    size = n * cell + 2 * border
+    h = size + 6 * mm * len(lines) + 3 * mm
+    c = canvas.Canvas(path, pagesize=(size, h))
+    for y, row in enumerate(m):
+        for x0, x1 in _runs(row):
+            c.rect(border + x0 * cell, h - border - (y + 1) * cell,
+                   (x1 - x0) * cell, cell, stroke=0, fill=1)
+    ty = h - size - 4 * mm
+    for i, line in enumerate(lines):
+        c.setFont("DejaVu", 9 if i == 0 else 7.5)
+        c.drawCentredString(size / 2, ty - i * 6 * mm, line)
+    c.save()
+
+
+def make(product_id: int, lot: str | None, expiry: str | None = None):
     url = qr_deeplink(product_id, lot)
+    name, vol = _title(product_id)
     base = f"{product_id}" + (f"_{lot}" if lot else "")
     os.makedirs(OUT, exist_ok=True)
     qr = segno.make(url, error="m")
-    title = f"{prices._base_name(p['name']).upper()} {p['volume']}"
-    qr.save(os.path.join(OUT, base + ".svg"), scale=10, border=2)
-    qr.save(os.path.join(OUT, base + ".pdf"), scale=10, border=2)
-    print(f"{base}: {title}" + (f" · серия {lot}" if lot else "") + f" → {url}")
+    lines = [f"{name} {vol}".strip(), f"No.{product_id}" + (f"  Lot {lot}" if lot else "")]
+    if expiry:
+        lines.append(f"Exp {expiry}")
+    _svg(os.path.join(OUT, base + ".svg"), qr, lines)
+    _pdf(os.path.join(OUT, base + ".pdf"), qr, lines)
+    print(f"{base}: {lines[0]} → {url}")
 
 
 def main(argv):
-    pairs = []
-    if argv[:1] == ["--file"]:
-        with open(argv[1], encoding="utf-8") as f:
-            for line in f:
-                parts = line.replace("-", " ").split()
-                if parts:
-                    pairs.append((int(parts[0]), parts[1] if len(parts) > 1 else None))
-    else:
-        for a in argv:
-            pid, _, lot = a.partition("-")
-            pairs.append((int(pid), lot or None))
-    for pid, lot in pairs:
-        make(pid, lot)
+    if argv[:1] == ["--lots"]:
+        mod = importlib.import_module(argv[1])
+        for pid, lot, exp, _qty in mod.LOTS:
+            make(pid, lot, exp)
+        return
+    for a in argv:
+        pid, _, lot = a.partition("-")
+        make(int(pid), lot or None)
 
 
 if __name__ == "__main__":

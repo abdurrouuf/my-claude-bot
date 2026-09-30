@@ -3,3 +3,6 @@ __pycache__/
 *.db
 *.db-wal
 *.db-shm
+out_qr/
+deliverables/
+*.zip
