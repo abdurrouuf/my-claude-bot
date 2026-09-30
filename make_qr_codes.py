@@ -58,15 +58,20 @@ def _svg(path, qr, lines):
     n = len(m)
     cell = 4               # px на модуль
     border = 4 * cell
-    w = n * cell + 2 * border
-    h = w + 18 * len(lines) + 10
+    qw = n * cell + 2 * border
+    # ширина страницы — по самой длинной строке подписи (≈0.62 px на символ
+    # при 13px), чтобы длинные названия не обрезались
+    tw = int(max(len(l) for l in lines) * 13 * 0.62) + 2 * border
+    w = max(qw, tw)
+    ox = (w - qw) // 2
+    h = qw + 18 * len(lines) + 10
     out = [f'<svg xmlns="http://www.w3.org/2000/svg" width="{w}" height="{h}" '
            f'viewBox="0 0 {w} {h}">', f'<rect width="{w}" height="{h}" fill="#fff"/>']
     for y, row in enumerate(m):
         for x0, x1 in _runs(row):          # слитные полосы — без швов между модулями
-            out.append(f'<rect x="{border + x0 * cell}" y="{border + y * cell}" '
+            out.append(f'<rect x="{ox + border + x0 * cell}" y="{border + y * cell}" '
                        f'width="{(x1 - x0) * cell}" height="{cell}" fill="#000"/>')
-    ty = w + 4
+    ty = qw + 4
     for i, line in enumerate(lines):
         out.append(f'<text x="{w / 2}" y="{ty + 14 + i * 18}" font-family="DejaVu Sans, '
                    f'Arial, sans-serif" font-size="{13 if i == 0 else 11}" '
@@ -82,16 +87,22 @@ def _pdf(path, qr, lines):
     n = len(m)
     cell = 1.0 * mm
     border = 4 * cell
-    size = n * cell + 2 * border
-    h = size + 6 * mm * len(lines) + 3 * mm
+    qsize = n * cell + 2 * border
+    # ширина страницы — по самой длинной строке подписи (иначе длинные
+    # названия обрезались краем страницы)
+    fonts = [9 if i == 0 else 7.5 for i in range(len(lines))]
+    tw = max(pdfmetrics.stringWidth(l, "DejaVu", f) for l, f in zip(lines, fonts)) + 2 * border
+    size = max(qsize, tw)
+    ox = (size - qsize) / 2
+    h = qsize + 6 * mm * len(lines) + 3 * mm
     c = canvas.Canvas(path, pagesize=(size, h))
     for y, row in enumerate(m):
         for x0, x1 in _runs(row):
-            c.rect(border + x0 * cell, h - border - (y + 1) * cell,
+            c.rect(ox + border + x0 * cell, h - border - (y + 1) * cell,
                    (x1 - x0) * cell, cell, stroke=0, fill=1)
-    ty = h - size - 4 * mm
+    ty = h - qsize - 4 * mm
     for i, line in enumerate(lines):
-        c.setFont("DejaVu", 9 if i == 0 else 7.5)
+        c.setFont("DejaVu", fonts[i])
         c.drawCentredString(size / 2, ty - i * 6 * mm, line)
     c.save()
 
