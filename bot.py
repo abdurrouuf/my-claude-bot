@@ -5133,17 +5133,59 @@ def _parse_split(text: str):
     return out or None
 
 
-def _batch_options(p, pid, qty):
+def _reserved_batches(p, upto: int) -> dict:
+    """Сколько штук по партиям уже «заняли» строки выше позиции upto
+    (инцидент 30.09.2026, накладная №948: Альтопен-Форте плюс 1 л шёл двумя
+    строками 72 + 48, на втором вопросе кнопка всё ещё показывала
+    «11.2028 — 72 шт», и вторая строка тоже ушла в старую партию — минус).
+    Явный выбор и «разделить» — как выбрано; FEFO — по порядку партий с
+    учётом уже занятого. Возвращает {product_id: {срок: шт}}."""
+    src_wh = _batch_src_wh(p)
+    reserved = {}
+    if not src_wh:
+        return reserved
+    choices = p.get("batch_choices") or {}
+    for j, it in enumerate(p["items"]):
+        if j >= upto:
+            break
+        pid = it.get("product_id")
+        if not pid:
+            continue
+        r = reserved.setdefault(pid, {})
+        rows = _choice_rows(choices.get(str(j)), it["qty"]) if str(j) in choices else None
+        if rows:
+            for e, qn in rows:
+                r[e] = r.get(e, 0) + qn
+            continue
+        rest = it["qty"]
+        for b in db.product_batches_of(src_wh, pid):
+            take = min(rest, max(b["qty"] - r.get(b["expiry"], 0), 0))
+            if take:
+                r[b["expiry"]] = r.get(b["expiry"], 0) + take
+                rest -= take
+            if not rest:
+                break
+    return reserved
+
+
+def _batch_options(p, pid, qty, reserved=None):
     """Партии товара для кнопок «какую партию?».
 
     Продажа — все партии, что реально лежат на складе (в том числе без
     срока): продавец должен сказать, какую коробку взял. Перемещение и
     списание — только датированные и только если их хватает: без срока
-    такую операцию всё равно не проводим, спросим дату текстом."""
+    такую операцию всё равно не проводим, спросим дату текстом.
+    reserved — {срок: шт}, уже занятое строками выше (_reserved_batches):
+    партия, которую они выбрали целиком, не предлагается."""
     src_wh = _batch_src_wh(p)
     if not src_wh:
         return []
     batches = db.product_batches_of(src_wh, pid)
+    if reserved:
+        batches = [{"expiry": b["expiry"],
+                    "qty": b["qty"] - reserved.get(b["expiry"], 0)}
+                   for b in batches]
+        batches = [b for b in batches if b["qty"] > 0]
     if p.get("kind") in EXPIRY_REQUIRED_KINDS:
         dated = [b for b in batches if b["expiry"]]
         return dated if sum(b["qty"] for b in dated) >= qty else []
@@ -5165,7 +5207,8 @@ def _batch_questions(p):
         pid = it.get("product_id")
         if not pid or str(i) in choices or it.get("expiry"):
             continue
-        batches = _batch_options(p, pid, it["qty"])
+        reserved = _reserved_batches(p, i).get(pid) if i else None
+        batches = _batch_options(p, pid, it["qty"], reserved)
         if len(batches) > 1:
             need.append((i, it, batches))
     return need
@@ -5325,9 +5368,13 @@ async def _ask_batch(q, p, question):
     verb = {"transfer": "Какую партию перемещаете?",
             "writeoff": "Какую партию списываете?"}.get(
                 p["kind"], "Из какой партии продаёте?")
+    note = ""
+    if i and _reserved_batches(p, i).get(it.get("product_id")):
+        note = ("\n⚠️ Остатки партий показаны с учётом строк этого же товара "
+                "выше — из них уже выбрано.")
     await q.edit_message_text(
         f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
-        f"На складе несколько партий с разными сроками. {verb}",
+        f"На складе несколько партий с разными сроками. {verb}{note}",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -6372,8 +6419,34 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # В кнопке закодирован сам срок («~» = партия без срока);
             # сверяем с текущими партиями — устаревший выбор уходит в FEFO.
             exp = "" if choice == BATCH_NO_EXPIRY else choice
-            current = {b["expiry"] for b in db.product_batches_of(
-                _batch_src_wh(p), item.get("product_id") or 0)}
+            pid_ = item.get("product_id") or 0
+            current = {b["expiry"]: b["qty"] for b in db.product_batches_of(
+                _batch_src_wh(p), pid_)}
+            if exp in current:
+                # В партии меньше, чем в строке (с учётом строк выше) —
+                # первое нажатие только предупреждает, второе списывает в
+                # минус осознанно (продавец знает, какую коробку взял).
+                left = current[exp] - (_reserved_batches(p, int(idx))
+                                       .get(pid_, {}).get(exp, 0))
+                warned = p.setdefault("batch_warned", {})
+                if left < item["qty"] and warned.get(idx) != choice:
+                    warned[idx] = choice
+                    label = f"до {exp}" if exp else "без срока"
+                    await q.answer(
+                        f"В партии {label} только {max(left, 0)} шт из "
+                        f"{item['qty']} — остальное уйдёт в минус. Нажмите "
+                        f"ещё раз, чтобы списать так, или выберите «Сначала "
+                        f"старые» / «Разделить по партиям».", show_alert=True)
+                    try:
+                        opts = _batch_options(
+                            p, pid_, item["qty"],
+                            _reserved_batches(p, int(idx)).get(pid_))
+                        if not opts:
+                            opts = db.product_batches_of(_batch_src_wh(p), pid_)
+                        await _ask_batch(q, p, (int(idx), item, opts))
+                    except Exception:
+                        log.exception("Не удалось повторить вопрос о партии")
+                    return
             choices[idx] = (choice if exp in current else "")
         try:
             await _continue_op(q, context, actor, p,
