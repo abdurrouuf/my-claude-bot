@@ -2735,6 +2735,46 @@ def test_client_cmd_single_fuzzy_pick():
     assert any("не найден" in t and "Возможно" in t for t in out["texts"])
 
 
+def test_batch_question_accounts_for_lines_above():
+    """Инцидент 30.09.2026 (накладная №948): один товар двумя строками,
+    первая забрала старую партию целиком, а на втором вопросе кнопка всё
+    ещё показывала её полный остаток — вторая строка ушла в минус.
+    Теперь второй вопрос считает выбор строк выше."""
+    wh = _fresh_db()
+    _load(wh, {16: 672}, {(wh["id"], 16): [("11.2028", 72), ("06.2029", 600)]})
+    db.clients_add_bulk(wh["id"], [("Клиент С", 0)])
+    cid = db.client_exact(wh["id"], "Клиент С")["id"]
+    p = {"kind": "invoice", "user_id": ADMIN, "chat_id": 1, "wh_id": wh["id"],
+         "wh_name": wh["name"], "client_name": "Клиент С", "client_id": cid,
+         "items": [_item(16, 72, 840), _item(16, 48, 840)],
+         "payment": 0.0, "parsed_debt": 0.0, "phone": None}
+    # Без выбора спрашивается первая строка; вторая уже видит, что первая
+    # (FEFO) заберёт старую партию целиком, — ей вопрос не нужен
+    need = bot._batch_questions(p)
+    assert [n[0] for n in need] == [0]
+    # Первая строка выбрала 11.2028 целиком — для второй старой партии
+    # больше нет: вопрос не задаётся, остаток уйдёт FEFO в 06.2029
+    p["batch_choices"] = {"0": "11.2028"}
+    assert bot._reserved_batches(p, 1) == {16: {"11.2028": 72}}
+    opts = bot._batch_options(p, 16, 48, bot._reserved_batches(p, 1)[16])
+    assert [(b["expiry"], b["qty"]) for b in opts] == [("06.2029", 600)]
+    assert bot._batch_questions(p) == []
+    op_id, *_ = bot.commit_invoice(p)
+    assert db.batch_qty(wh["id"], 16, "11.2028") == 0
+    assert db.batch_qty(wh["id"], 16, "06.2029") == 552
+    db.cancel_operation(op_id)
+    # Первая строка FEFO (без явного выбора) — тоже считается занявшей
+    # старую партию: второй вопрос показывает 11.2028 уже без 72
+    p["batch_choices"] = {"0": ""}
+    p["items"] = [_item(16, 50, 840), _item(16, 48, 840)]
+    assert bot._reserved_batches(p, 1) == {16: {"11.2028": 50}}
+    need = bot._batch_questions(p)
+    assert len(need) == 1 and need[0][0] == 1
+    assert [(b["expiry"], b["qty"]) for b in need[0][2]] == \
+        [("11.2028", 22), ("06.2029", 600)]
+    print("  ✓ вопрос о партии учитывает строки выше того же товара")
+
+
 def test_batch_split():
     """Кнопка «Разделить по партиям» (01.09.2026): количество позиции
     делится между партиями текстом («150 до 01.2028, 100 до 04.2028»),
