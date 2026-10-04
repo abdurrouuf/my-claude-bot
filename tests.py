@@ -3287,6 +3287,21 @@ def test_extract_action_lenient():
     assert bot.extract_action('{"action": "invoice", "items": [') is None   # обрыв
 
 
+def test_handover_left_line_names_employee_in_group():
+    """Инкассация в чате склада: «в вашей кассе» непонятно, чья касса
+    (замечание владельца 04.10.2026) — в группе пишем по имени."""
+    assert bot.name_genitive("Данияр") == "Данияра"
+    assert bot.name_genitive("Азамат") == "Азамата"
+    assert bot.name_genitive("Бека") == "Беки"
+    assert bot.name_genitive("Жуми") == "Жуми"
+    assert bot.name_genitive("Данияр Дамла") == "Данияра"
+    g = bot.handover_left_line("Данияр", 33100, group=True)
+    assert g.startswith("В кассе Данияра осталось:")
+    pv = bot.handover_left_line("Данияр", 33100, group=False)
+    assert pv.startswith("В вашей кассе осталось:")
+    print("  ✓ инкассация в группе — остаток по имени сотрудника")
+
+
 def test_admin_handover_for_employee():
     """14.09.2026: админ написал «Азамат сдал кассу: 228'500» — карточка
     показала «Сотрудник: Абдурроууф» (сдача из кассы админа), владелец

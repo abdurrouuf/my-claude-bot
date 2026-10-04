@@ -2667,6 +2667,35 @@ def handover_summary(p) -> str:
     return "\n".join(lines)
 
 
+def handover_left_line(name: str, remaining, group: bool) -> str:
+    """Строка «сколько осталось в кассе» после инкассации.
+
+    В групповом чате (и в карточке у админа) — по имени сотрудника,
+    в личке самому сотруднику — «в вашей кассе»."""
+    who = f"В кассе {esc(name_genitive(name))}" if group else "В вашей кассе"
+    return f"{who} осталось: {money(remaining)}"
+
+
+def name_genitive(name: str) -> str:
+    """Имя в родительном падеже для фраз «в кассе Данияра» — простое правило
+    по последней букве (Данияр → Данияра, Бека → Беки, Жуми → Жуми)."""
+    first = (name or "").split()[0] if (name or "").strip() else ""
+    if not first:
+        return name
+    low = first.lower()
+    if low.endswith("й"):
+        gen = first[:-1] + "я"
+    elif low.endswith("а"):
+        gen = first[:-1] + ("и" if low[-2:-1] in "кгхжчшщ" else "ы")
+    elif low.endswith("я"):
+        gen = first[:-1] + "и"
+    elif low[-1] in "бвгджзклмнпрстфхцчшщ":
+        gen = first + "а"
+    else:
+        gen = first
+    return gen
+
+
 def commit_handover(p):
     u = db.get_user(p["user_id"])
     # Склад операции: чат склада, где написали «сдал» (лента этого склада
@@ -6419,18 +6448,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # повтор и задвоение инкассации (ревизия 14.08.2026).
                 try:
                     remaining = db.cash_on_hand(p["user_id"])
+                    actor_name = db.get_user(p["user_id"])["name"]
                     await q.edit_message_text(
                         f"✅ {esc(summary)} — принято (операция №{op_id}).\n"
-                        f"В его кассе осталось: {money(remaining)}", parse_mode="HTML")
+                        f"{handover_left_line(actor_name, remaining, group=True)}",
+                        parse_mode="HTML")
                     if p.get("approver_id"):
                         try:
+                            # В групповом чате «в вашей кассе» непонятно, чья
+                            # касса (замечание владельца 04.10.2026) — там
+                            # пишем по имени, в личке сотруднику — «в вашей».
+                            in_group = p["chat_id"] < 0
                             await context.bot.send_message(
                                 p["chat_id"],
-                                f"✅ Админ принял выручку {money(p['amount'])} (операция №{op_id}).\n"
-                                f"В вашей кассе осталось: {money(remaining)}", parse_mode="HTML")
+                                f"✅ Админ принял выручку {money(p['amount'])}"
+                                f"{' от ' + esc(actor_name) if in_group else ''}"
+                                f" (операция №{op_id}).\n"
+                                f"{handover_left_line(actor_name, remaining, group=in_group)}",
+                                parse_mode="HTML")
                         except Exception:
                             log.warning("Не удалось уведомить заявителя")
-                    actor_name = db.get_user(p["user_id"])["name"]
                     await feed_operation(context, op_id, actor_name, "💰",
                                          exclude_chat_id=p["chat_id"])
                 except Exception:
