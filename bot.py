@@ -451,6 +451,7 @@ async def _maybe_ask_warehouse(update, actor, key, params=None) -> bool:
 
 
 KNOWN_COMMANDS: set = set()  # заполняется в main() из зарегистрированных команд
+COMMAND_CALLBACKS: dict = {}  # имя команды -> обработчик (для команд, присланных «кодом»)
 
 
 async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -7803,10 +7804,39 @@ def _forwarded_from_bot(message, context) -> bool:
                                         text))
 
 
+async def _code_formatted_command(update, context) -> bool:
+    """«/log Бишкек списания», присланное моноширинным текстом, — выполнить
+    как команду. В группе — только если команда наша (как CommandHandler)."""
+    text = (update.message.text or "").strip()
+    if not text.startswith("/"):
+        return False
+    parts = text.split()
+    cmd, _, target = parts[0][1:].partition("@")
+    cmd = cmd.lower()
+    if target and target.lower() != (getattr(context.bot, "username", "") or "").lower():
+        return False
+    cb = COMMAND_CALLBACKS.get(cmd)
+    if cb is None:
+        return False
+    try:
+        context.args = parts[1:]
+    except AttributeError:
+        pass
+    await cb(update, context)
+    return True
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.message is None or not update.message.text:
         return
     if _forwarded_from_bot(update.message, context):
+        return
+    # Команда, присланная «кодом» (скопирована из чата Claude моноширинным
+    # текстом): Telegram помечает её как code, а не bot_command, и
+    # CommandHandler её не видит — текст уходил в ИИ, который отвечал
+    # «это команда для бота, отправьте напрямую» (04.10.2026, скриншот
+    # владельца с /log Бишкек списания). Разбираем сами.
+    if await _code_formatted_command(update, context):
         return
     # Ответ на вопрос о сроке годности ловим до всех фильтров: голое
     # «11.2028» в чате склада на операцию не похоже и иначе потерялось бы.
@@ -14084,6 +14114,8 @@ if __name__ == "__main__":
     for h in app.handlers.get(0, []):
         if isinstance(h, CommandHandler):
             KNOWN_COMMANDS.update(h.commands)
+            for name in h.commands:
+                COMMAND_CALLBACKS[name] = h.callback
     app.add_handler(MessageHandler(
         filters.COMMAND & filters.UpdateType.MESSAGE, unknown_command))
     app.add_handler(CallbackQueryHandler(on_callback))
