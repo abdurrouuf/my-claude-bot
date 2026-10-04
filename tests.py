@@ -4559,6 +4559,33 @@ def test_new_products_105_106_display_order():
     prices.set_data(db.products_active())
 
 
+
+def test_code_formatted_command():
+    """04.10.2026: команда, скопированная из чата Claude «кодом», приходит без
+    entity bot_command и мимо CommandHandler — handle_message должен сам
+    выполнить её, а не отдавать ИИ."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    bot.COMMAND_CALLBACKS["check"] = bot.check_cmd
+    replies = []
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=SimpleNamespace(reply_text=_areply(replies), text="/check",
+                                                  forward_from=None, forward_sender_name=None,
+                                                  forward_date=None))
+    ctx = SimpleNamespace(bot=SimpleNamespace(username="vetop_helper_bot"), args=[])
+    asyncio.run(bot.handle_message(upd, ctx))
+    assert replies and "Учёт" in replies[-1], replies
+    # чужая команда «@другой_бот» не трогается
+    replies.clear()
+    upd.message.text = "/check@other_bot"
+    assert asyncio.run(bot._code_formatted_command(upd, ctx)) is False
+    # неизвестная команда — не наша забота здесь
+    upd.message.text = "/nosuchcmd 1"
+    assert asyncio.run(bot._code_formatted_command(upd, ctx)) is False
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
@@ -4576,3 +4603,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
