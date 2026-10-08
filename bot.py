@@ -8057,13 +8057,32 @@ def _qr_item_text(it: dict) -> str:
     title = f"{prices._base_name(p['name']).upper()} {p['volume']}" if p else f"№{it['pid']}"
     t = title + (f", серия {it['lot']}" if it.get("lot") else "")
     boxes = int(it.get("boxes") or 0)
+    pieces = int(it.get("pieces") or 0)
+    if not boxes and not pieces:
+        return t
+    try:
+        box = int(p["box"]) if p else 0
+    except (TypeError, ValueError, KeyError):
+        box = 0
+    if box <= 1:                         # вместимость коробки не задана — всё штуками
+        return t + f" — {boxes + pieces} шт"
+    total = boxes * box + pieces
+    if boxes and pieces:
+        return t + f" — {boxes} к + {pieces} шт ({total} шт)"
     if boxes:
-        try:
-            box = int(p["box"]) if p else 0
-        except (TypeError, ValueError, KeyError):
-            box = 0
-        t += f" — {boxes} к ({boxes * box} шт)" if box > 1 else f" — {boxes} шт"
-    return t
+        return t + f" — {boxes} к ({total} шт)"
+    return t + f" — {pieces} шт"
+
+
+def qr_item_qty(it: dict) -> int:
+    """Сколько штук даёт накопленный скан (коробки × вместимость + флаконы)."""
+    p = prices.BY_ID.get(it["pid"])
+    try:
+        box = int(p["box"]) if p else 0
+    except (TypeError, ValueError, KeyError):
+        box = 0
+    boxes, pieces = int(it.get("boxes") or 0), int(it.get("pieces") or 0)
+    return boxes * (box if box > 1 else 1) + pieces
 
 
 def qr_register_scan(chat_id: int, pid: int, lot: str | None, box: bool) -> list:
@@ -8077,20 +8096,21 @@ def qr_register_scan(chat_id: int, pid: int, lot: str | None, box: bool) -> list
         st = {"items": []}
     st["ts"] = time.time()
     items = st["items"]
+    # Скан КОРОБКИ = +1 коробка, скан ФЛАКОНА (этикетки) = +1 шт; флакон и
+    # коробка одного товара складываются («1 к + 1 шт (81 шт)») — инцидент
+    # 08.10.2026: после скана коробки отсканированные флаконы «пропадали».
+    key = "boxes" if box else "pieces"
     for it in items:
         if it["pid"] == pid and (it.get("lot") or "") == (lot or ""):
-            if box:
-                it["boxes"] = int(it.get("boxes") or 0) + 1
+            it[key] = int(it.get(key) or 0) + 1
             break
     else:
-        items.append({"pid": pid, "lot": lot, "boxes": 1 if box else 0})
+        items.append({"pid": pid, "lot": lot, "boxes": 1 if box else 0,
+                      "pieces": 0 if box else 1})
     seed_user = QR_SCAN_MARK + " " + "; ".join(_qr_item_text(it) for it in items) + "]"
-    if any(it.get("boxes") for it in items):
-        seed_bot = ("Отсканировано. Напишите клиента — выпишу накладную на " 
-                    "весь отсканированный список (количества по коробкам); "
-                    "либо клиента и другое количество.")
-    else:
-        seed_bot = "Товар выбран. Напишите клиента и количество."
+    seed_bot = ("Отсканировано. Напишите клиента — выпишу накладную на весь "
+                "отсканированный список (каждый скан флакона = 1 шт, скан "
+                "коробки = целая коробка); либо клиента и другое количество.")
     chat_histories[chat_id] = [{"role": "user", "content": seed_user},
                                {"role": "assistant", "content": seed_bot}]
     st["hist_len"] = len(chat_histories[chat_id])
@@ -8111,12 +8131,14 @@ def qr_scan_text(actor, product_id: int, lot: str | None, whs,
         box_n = int(p.get("box") or 0)
     except (TypeError, ValueError):
         box_n = 0
-    head = "📦 QR КОРОБКИ" if box else "📷 QR"
+    head = "📦 QR КОРОБКИ" if box else "📷 QR ФЛАКОНА"
     lines = [f"{head}: <b>{esc(title)}</b> (№{p['id']} прайса, "
              f"{fmt_num(p['price'])} сом)"]
     if box:
         lines.append(f"📦 Целая коробка — <b>{box_n} шт</b>" if box_n > 1
                      else "⚠️ У товара в прайсе не задана вместимость коробки")
+    else:
+        lines.append("🔢 В список — <b>1 шт</b>")
     if lot:
         rows = db.connect().execute(
             "SELECT expiry FROM product_lots WHERE product_id=? AND lot=? "
@@ -8130,18 +8152,17 @@ def qr_scan_text(actor, product_id: int, lot: str | None, whs,
     lines.append("")
     lines.append(where_report_text([product_id], title, whs))
     lines.append("")
-    if scanned and (len(scanned) > 1 or any(it.get("boxes", 0) > 1 for it in scanned)):
-        lines.append("🧾 <b>Отсканировано:</b>")
+    if scanned:
+        total = sum(qr_item_qty(it) for it in scanned)
+        lines.append(f"🧾 <b>Отсканировано</b> (всего {fmt_num(total)} шт):")
         for it in scanned:
             lines.append("• " + esc(_qr_item_text(it)))
         lines.append("")
-    if box or (scanned and any(it.get("boxes") for it in scanned)):
-        lines.append("Сканируйте следующие коробки — они добавятся в список. "
-                     "Потом напишите клиента, например: <i>Асан</i> — выпишу "
-                     "накладную на всё отсканированное (или <i>Асан, 3 к</i>).")
-    else:
-        lines.append("Товар подставлен — напишите кому и сколько, например: "
-                     "<i>Асан 2 к</i> или <i>Асан 10 шт, приход 5000</i>.")
+    lines.append("Сканируйте дальше — флаконы и коробки добавятся в список "
+                 "(флакон = 1 шт, коробка = целая). Потом напишите клиента, "
+                 "например: <i>Асан</i> — выпишу накладную на всё "
+                 "отсканированное; другое количество — <i>Асан 2 к</i> или "
+                 "<i>Асан 10 шт, приход 5000</i>.")
     return "\n".join(lines)
 
 
