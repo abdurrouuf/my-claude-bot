@@ -4484,6 +4484,30 @@ def test_qr_scan_start():
     data = {"items": [{"name": "Албенивер", "volume": "100 мл", "qty": 80, "box_qty": 1}],
             "_last_text": "Асан", "_src_text": seed + " Асан"}
     assert bot._unit_questions(data) == []
+    # --- число после скана = количество последнего товара («делай» 08.10.2026) ---
+    bot.QR_SCANS.clear(); bot.chat_histories.clear(); replies.clear()
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C"])))      # флакон
+    assert asyncio.run(bot.qr_qty_reply(upd, "15")) is True
+    assert "АЛБЕНИВЕР 100 мл, серия 20261107C — 15 шт" in bot.chat_histories[ADMIN][0]["content"]
+    assert "15 шт" in replies[-1] and "всего 15 шт" in replies[-1]
+    assert asyncio.run(bot.qr_qty_reply(upd, "2 к")) is True              # переписывает, не складывает
+    assert "— 2 к (160 шт)" in bot.chat_histories[ADMIN][0]["content"]
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["104-2606920"])))       # скан после числа — список жив
+    seed = bot.chat_histories[ADMIN][0]["content"]
+    assert "2 к (160 шт)" in seed and "ЦЕФТИ DC 10 мл, серия 2606920 — 1 шт" in seed
+    assert asyncio.run(bot.qr_qty_reply(upd, "3 шт.")) is True             # к ПОСЛЕДНЕМУ товару
+    seed = bot.chat_histories[ADMIN][0]["content"]
+    assert "2 к (160 шт)" in seed and "ЦЕФТИ DC 10 мл, серия 2606920 — 3 шт" in seed
+    assert asyncio.run(bot.qr_qty_reply(upd, "2 пач")) is True             # шприцы: пачка 24
+    assert "ЦЕФТИ DC 10 мл, серия 2606920 — 48 шт" in bot.chat_histories[ADMIN][0]["content"]
+    assert asyncio.run(bot.qr_qty_reply(upd, "Асан 15 шт")) is False        # не голое число — в ИИ
+    assert asyncio.run(bot.qr_qty_reply(upd, "0")) is False
+    bot.chat_histories[ADMIN].append({"role": "user", "content": "Асан"})   # список сброшен текстом
+    assert asyncio.run(bot.qr_qty_reply(upd, "15")) is False
+    grp = SimpleNamespace(effective_user=upd.effective_user,
+                          effective_chat=SimpleNamespace(id=ADMIN, type="supergroup"),
+                          message=upd.message)
+    assert asyncio.run(bot.qr_qty_reply(grp, "15")) is False               # только личка
     # обычный /start сбрасывает накопленное
     asyncio.run(bot.start(upd, SimpleNamespace(args=[])))
     assert ADMIN not in bot.QR_SCANS
