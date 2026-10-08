@@ -7954,6 +7954,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     if await expiry_reply(update, context, update.message.text.strip()):
         return
+    # Число сразу после скана QR («15», «2 к») — количество последнего
+    # отсканированного товара, список сканов не сбрасывается (08.10.2026).
+    if await qr_qty_reply(update, update.message.text.strip()):
+        return
     quiet = False
     if update.effective_chat.type != "private":
         # В группах работаем только в чатах-лентах складов и только с
@@ -8085,16 +8089,98 @@ def qr_item_qty(it: dict) -> int:
     return boxes * (box if box > 1 else 1) + pieces
 
 
+def _qr_scan_state(chat_id: int) -> dict | None:
+    """Живой накопленный список сканов чата: человек ничего не писал после
+    последнего скана (длина истории та же), история начинается с метки
+    скана и прошло меньше QR_SCAN_TTL. Иначе None."""
+    st = QR_SCANS.get(chat_id)
+    hist = chat_histories.get(chat_id) or []
+    if not st or not st.get("items") or st.get("hist_len") != len(hist) \
+            or not hist or QR_SCAN_MARK not in str(hist[0].get("content") or "") \
+            or time.time() - float(st.get("ts") or 0) > QR_SCAN_TTL:
+        return None
+    return st
+
+
+def _qr_reseed(chat_id: int, st: dict) -> None:
+    """Переписать след сканов в истории диалога и запомнить её длину."""
+    items = st["items"]
+    seed_user = QR_SCAN_MARK + " " + "; ".join(_qr_item_text(it) for it in items) + "]"
+    seed_bot = ("Отсканировано. Напишите клиента — выпишу накладную на весь "
+                "отсканированный список (каждый скан флакона = 1 шт, скан "
+                "коробки = целая коробка); либо клиента и другое количество.")
+    chat_histories[chat_id] = [{"role": "user", "content": seed_user},
+                               {"role": "assistant", "content": seed_bot}]
+    st["ts"] = time.time()
+    st["hist_len"] = len(chat_histories[chat_id])
+    QR_SCANS[chat_id] = st
+
+
+# Голое количество сразу после скана: «15», «15 шт», «2 к», «2 кор», «3 пач»
+# — количество ПОСЛЕДНЕГО отсканированного товара (просьба владельца
+# 08.10.2026: «не сканировать же каждый флакон по одному»).
+QR_QTY_RE = re.compile(
+    r"^\s*(\d{1,4})\s*(шт\w*|к|кор\w*|пач\w*|уп\w*)?\.?\s*$", re.IGNORECASE)
+
+
+def qr_set_last_qty(chat_id: int, text: str):
+    """Если список сканов живой и текст — голое количество, записать его
+    последнему отсканированному товару. Возвращает (item, описание) или None."""
+    m = QR_QTY_RE.match(text or "")
+    if not m:
+        return None
+    st = _qr_scan_state(chat_id)
+    if st is None:
+        return None
+    n = int(m.group(1))
+    if n <= 0:
+        return None
+    unit = (m.group(2) or "").lower()
+    it = st["items"][-1]
+    p = prices.BY_ID.get(it["pid"])
+    try:
+        box = int(p["box"]) if p else 0
+    except (TypeError, ValueError, KeyError):
+        box = 0
+    if unit.startswith("к") and box > 1:
+        it["boxes"], it["pieces"] = n, 0
+        how = f"{n} к ({n * box} шт)"
+    elif unit.startswith(("пач", "уп")) and prices.pack_size(it["pid"]) > 1:
+        it["boxes"], it["pieces"] = 0, n * prices.pack_size(it["pid"])
+        how = f"{n} пач ({it['pieces']} шт)"
+    else:
+        it["boxes"], it["pieces"] = 0, n
+        how = f"{n} шт"
+    _qr_reseed(chat_id, st)
+    return it, how
+
+
+async def qr_qty_reply(update: Update, text: str) -> bool:
+    """Личка: число после скана = количество последнего товара в списке.
+    Ловится ДО ИИ, список сканов не сбрасывается."""
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return False
+    chat_id = update.effective_chat.id
+    res = qr_set_last_qty(chat_id, text)
+    if res is None:
+        return False
+    it, how = res
+    st = QR_SCANS[chat_id]
+    total = sum(qr_item_qty(x) for x in st["items"])
+    lines = [f"✏️ {esc(_qr_item_text({**it, 'boxes': 0, 'pieces': 0}))} — <b>{esc(how)}</b>", "",
+             f"🧾 <b>Отсканировано</b> (всего {fmt_num(total)} шт):"]
+    for x in st["items"]:
+        lines.append("• " + esc(_qr_item_text(x)))
+    lines += ["", "Сканируйте дальше или напишите клиента — выпишу накладную "
+                  "на весь список."]
+    await update.message.reply_text("\n".join(lines), parse_mode="HTML")
+    return True
+
+
 def qr_register_scan(chat_id: int, pid: int, lot: str | None, box: bool) -> list:
     """Добавить скан к накопленному списку чата (или начать новый, если
     человек что-то писал после прошлого скана). Возвращает список сканов."""
-    st = QR_SCANS.get(chat_id)
-    hist = chat_histories.get(chat_id) or []
-    if not st or st.get("hist_len") != len(hist) or not hist \
-            or QR_SCAN_MARK not in str(hist[0].get("content") or "") \
-            or time.time() - float(st.get("ts") or 0) > QR_SCAN_TTL:
-        st = {"items": []}
-    st["ts"] = time.time()
+    st = _qr_scan_state(chat_id) or {"items": []}
     items = st["items"]
     # Скан КОРОБКИ = +1 коробка, скан ФЛАКОНА (этикетки) = +1 шт; флакон и
     # коробка одного товара складываются («1 к + 1 шт (81 шт)») — инцидент
@@ -8107,14 +8193,7 @@ def qr_register_scan(chat_id: int, pid: int, lot: str | None, box: bool) -> list
     else:
         items.append({"pid": pid, "lot": lot, "boxes": 1 if box else 0,
                       "pieces": 0 if box else 1})
-    seed_user = QR_SCAN_MARK + " " + "; ".join(_qr_item_text(it) for it in items) + "]"
-    seed_bot = ("Отсканировано. Напишите клиента — выпишу накладную на весь "
-                "отсканированный список (каждый скан флакона = 1 шт, скан "
-                "коробки = целая коробка); либо клиента и другое количество.")
-    chat_histories[chat_id] = [{"role": "user", "content": seed_user},
-                               {"role": "assistant", "content": seed_bot}]
-    st["hist_len"] = len(chat_histories[chat_id])
-    QR_SCANS[chat_id] = st
+    _qr_reseed(chat_id, st)
     return items
 
 
@@ -8159,7 +8238,8 @@ def qr_scan_text(actor, product_id: int, lot: str | None, whs,
             lines.append("• " + esc(_qr_item_text(it)))
         lines.append("")
     lines.append("Сканируйте дальше — флаконы и коробки добавятся в список "
-                 "(флакон = 1 шт, коробка = целая). Потом напишите клиента, "
+                 "(флакон = 1 шт, коробка = целая). Количество этого товара "
+                 "— числом: <i>15</i> или <i>2 к</i>. Потом напишите клиента, "
                  "например: <i>Асан</i> — выпишу накладную на всё "
                  "отсканированное; другое количество — <i>Асан 2 к</i> или "
                  "<i>Асан 10 шт, приход 5000</i>.")
