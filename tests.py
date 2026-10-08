@@ -4421,8 +4421,8 @@ def test_qr_scan_start():
                           message=SimpleNamespace(reply_text=_areply(replies)))
     asyncio.run(bot.start(upd, SimpleNamespace(args=["104-2606920"])))
     t = replies[-1]
-    assert "QR: <b>ЦЕФТИ DC 10 мл" in t and "2606920" in t and "06.2029" in t
-    assert "Каракол: <b>300 шт</b>" in t and "Товар подставлен" in t
+    assert "QR ФЛАКОНА: <b>ЦЕФТИ DC 10 мл" in t and "2606920" in t and "06.2029" in t
+    assert "Каракол: <b>300 шт</b>" in t and "QR ФЛАКОНА" in t and "В список — <b>1 шт</b>" in t
     h = bot.chat_histories[ADMIN]
     assert h and "QR" in h[0]["content"] and h[-1]["role"] == "assistant"
     # серия неизвестна — честно
@@ -4469,7 +4469,7 @@ def test_qr_scan_start():
     # вторая коробка того же товара — копится
     asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
     assert "2 к (160 шт)" in bot.chat_histories[ADMIN][0]["content"]
-    assert "Отсканировано:" in replies[-1] and "2 к (160 шт)" in replies[-1]
+    assert "Отсканировано</b> (всего 160 шт)" in replies[-1] and "2 к (160 шт)" in replies[-1]
     # коробка другого товара — вторая строка списка
     asyncio.run(bot.start(upd, SimpleNamespace(args=["104-2606920-K"])))
     seed = bot.chat_histories[ADMIN][0]["content"]
@@ -4487,6 +4487,24 @@ def test_qr_scan_start():
     # обычный /start сбрасывает накопленное
     asyncio.run(bot.start(upd, SimpleNamespace(args=[])))
     assert ADMIN not in bot.QR_SCANS
+    # --- ФЛАКОН + КОРОБКА одного товара складываются (инцидент 08.10.2026:
+    # владелец отсканировал этикетки флаконов, потом большие коробки тех же
+    # товаров — флаконы из списка пропадали, накладная вышла на 2 коробки) ---
+    bot.QR_SCANS.clear(); bot.chat_histories.clear(); replies.clear()
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C"])))      # флакон
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["104-2606920"])))       # флакон другого
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))    # коробка первого
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C"])))      # ещё флакон
+    seed = bot.chat_histories[ADMIN][0]["content"]
+    assert "АЛБЕНИВЕР 100 мл, серия 20261107C — 1 к + 2 шт (82 шт)" in seed, seed
+    assert "ЦЕФТИ DC 10 мл, серия 2606920 — 1 шт" in seed
+    assert "всего 83 шт" in replies[-1] and "1 к + 2 шт (82 шт)" in replies[-1]
+    items = bot.QR_SCANS[ADMIN]["items"]
+    assert [bot.qr_item_qty(it) for it in items] == [82, 1]
+    data = {"items": [{"name": "Албенивер", "volume": "100 мл", "qty": 82},
+                      {"name": "Цефти DC", "volume": "10 мл", "qty": 1}],
+            "_last_text": "Асан", "_src_text": seed + " Асан"}
+    assert bot._unit_questions(data) == []
 
 
 def test_qr_public_card_and_scans():
