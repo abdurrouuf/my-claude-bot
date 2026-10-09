@@ -4508,6 +4508,66 @@ def test_qr_scan_start():
                           effective_chat=SimpleNamespace(id=ADMIN, type="supergroup"),
                           message=upd.message)
     assert asyncio.run(bot.qr_qty_reply(grp, "15")) is False               # только личка
+    # --- «приход» после сканов = приход извне по списку («делай» 09.10.2026) ---
+    bot.QR_SCANS.clear(); bot.chat_histories.clear(); bot.PENDING.clear(); replies.clear()
+    ctx = SimpleNamespace(bot=None, args=[])
+    adm = db.get_user(ADMIN)
+    assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, "приход")) is False   # сканов нет
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["106-20261121C"])))
+    assert asyncio.run(bot.qr_qty_reply(upd, "15")) is True
+    assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, "Асан")) is False     # не «приход»
+    assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, "приход Кара-Балта")) is True
+    p = [v for v in bot.PENDING.values() if v.get("kind") == "transfer"][-1]
+    assert p["wh_name"] == "Кара-Балта" and p["from_wh_id"] is None
+    got = {(it["product_id"], it["qty"], it.get("expiry"), it.get("lot")) for it in p["items"]}
+    assert got == {(76, 80, "11.2029", "20261107C"), (106, 15, "11.2029", "20261121C")}, got
+    assert "Приход по сканам" in replies[-2] and ADMIN not in bot.QR_SCANS
+    # склад по умолчанию — свой склад админа; список после прихода закрыт
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
+    assert "1 к (80 шт)" in bot.chat_histories[ADMIN][0]["content"] and "ФЛОРФЕН" not in bot.chat_histories[ADMIN][0]["content"]
+    assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, "Приход товара.")) is True
+    p = [v for v in bot.PENDING.values() if v.get("kind") == "transfer"][-1]
+    assert p["wh_name"] == db.warehouse_of(ADMIN)["name"]
+    # незнакомый склад — подсказка, без карточки
+    asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
+    n = len(bot.PENDING)
+    assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, "приход Луна")) is True
+    assert "не найден" in replies[-1] and len(bot.PENDING) == n
+    bot.PENDING.clear(); bot.QR_SCANS.clear(); bot.chat_histories.clear()
+
+
+def test_load_tq20260924c():
+    """/loadtq20260924c — одноразовый приход поставки Shimu TQ20260924C
+    (22 позиции, 122'800 шт, серии и сроки завода), по умолчанию Бишкек;
+    повторный вызов предупреждает о задвоении."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db(); bot.PENDING.clear()
+    import tq20260924c_lots_data as L
+    assert len(L.LOTS) == 22 and sum(r[3] for r in L.LOTS) == 122800
+    replies = []
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=SimpleNamespace(reply_text=_areply(replies)))
+    ctx = SimpleNamespace(bot=None, args=[])
+    asyncio.run(bot.load_tq20260924c_cmd(upd, ctx))
+    assert "22 позиций" in replies[0] and "ВНИМАНИЕ" not in replies[0]
+    p = [v for v in bot.PENDING.values() if v.get("kind") == "transfer"][-1]
+    assert p["wh_name"] == "Бишкек" and len(p["items"]) == 22
+    by = {it["product_id"]: it for it in p["items"]}
+    assert by[69]["expiry"] == "10.2029" and by[69]["lot"] == "20261101C" and by[69]["qty"] == 13600
+    assert by[105]["lot"] == "20261111C" and by[105]["qty"] == 3000
+    # проводим приход «как есть» в журнал с серией — повтор предупреждает
+    wh = db.warehouse_by_name("Бишкек")
+    db.commit_operation(ADMIN, "transfer", wh["id"], None, "приход TQ",
+                        [(wh["id"], 69, 13600)], [],
+                        {"items": [{"product_id": 69, "qty": 13600, "lot": "20261101C"}]})
+    assert bot.supply_arrival_ops(["20261101C"]) and not bot.supply_arrival_ops(["NOPE"])
+    replies.clear()
+    asyncio.run(bot.load_tq20260924c_cmd(upd, SimpleNamespace(bot=None, args=["Каракол"])))
+    assert "ВНИМАНИЕ" in replies[0] and "Каракол" in replies[0]
+    bot.PENDING.clear()
     # обычный /start сбрасывает накопленное
     asyncio.run(bot.start(upd, SimpleNamespace(args=[])))
     assert ADMIN not in bot.QR_SCANS
