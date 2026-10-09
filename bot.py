@@ -7994,6 +7994,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Слушаю! После «Джарвис» напишите операцию, например: "
                 "«Джарвис, Асель приход 5000».")
             return
+    # «приход [Склад]» сразу после сканов QR — приход извне по списку
+    # сканов, без ИИ (09.10.2026).
+    if not quiet and await qr_arrival_reply(update, context, actor, text):
+        return
     # «сертификат …» текстом в личке — не для ИИ: либо подпись к только что
     # присланному файлу (владелец шлёт файл и подпись отдельно, 08.08.2026),
     # либо подсказка про /cert. Бесплатно и без фантазий ИИ.
@@ -8177,6 +8181,73 @@ async def qr_qty_reply(update: Update, text: str) -> bool:
     return True
 
 
+# «приход» / «приход Кара-Балта» сразу после сканов QR — ПРИХОД ИЗВНЕ на
+# склад по отсканированному списку (коробка за коробкой при приёмке
+# контейнера, «делай» владельца 09.10.2026). Серия → срок по справочнику.
+QR_ARRIVAL_RE = re.compile(
+    r"^\s*приход(?:\s+товара)?(?:\s+на)?(?:\s+склад)?(?:\s+(.+?))?\s*[.!]?\s*$",
+    re.IGNORECASE)
+
+
+async def qr_arrival_reply(update: Update, context, actor, text: str) -> bool:
+    """Личка: «приход [Склад]» при живом списке сканов — карточка прихода
+    извне на весь список (права и вопросы о сроке — как у обычного
+    прихода, в start_transfer). Список сканов после этого закрывается."""
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return False
+    m = QR_ARRIVAL_RE.match(text or "")
+    if not m:
+        return False
+    chat_id = update.effective_chat.id
+    st = _qr_scan_state(chat_id)
+    if st is None:
+        return False
+    wh_name = (m.group(1) or "").strip()
+    if wh_name:
+        wh = db.warehouse_by_name(wh_name)
+        if wh is None:
+            await update.message.reply_text(
+                f"Склад «{esc(wh_name)}» не найден. Напишите, например: "
+                f"<i>приход Бишкек</i>.", parse_mode="HTML")
+            return True
+    elif is_admin(actor):
+        wh = db.warehouse_of(actor["id"]) or (db.all_warehouses() or [None])[0]
+    else:
+        ops = db.operable_warehouses(actor)
+        if len(ops) != 1:
+            await update.message.reply_text(
+                "На какой склад приход? Напишите, например: <i>приход Кара-Балта</i>.",
+                parse_mode="HTML")
+            return True
+        wh = ops[0]
+    if wh is None:
+        return False
+    items = []
+    for it in st["items"]:
+        pr = prices.BY_ID.get(it["pid"])
+        qty = qr_item_qty(it)
+        if pr is None or qty <= 0:
+            continue
+        lot = it.get("lot") or None
+        exp = db.lot_expiry(it["pid"], lot) if lot else None
+        items.append({"name": pr["name"], "volume": pr["volume"], "qty": qty,
+                      "box_qty": None, "price": pr["price"],
+                      "expiry": exp, "lot": lot})
+    if not items:
+        return False
+    QR_SCANS.pop(chat_id, None)          # список закрыт — новые сканы с чистого листа
+    total = sum(int(it["qty"]) for it in items)
+    await update.message.reply_text(
+        f"📦 Приход по сканам на склад «{esc(wh['name'])}»: {len(items)} поз., "
+        f"{fmt_num(total)} шт. Серии — в справочник, срок — по серии "
+        f"(если серии нет, спрошу срок с упаковки).", parse_mode="HTML")
+    data = {"action": "transfer", "from_warehouse": None,
+            "to_warehouse": wh["name"], "items": items,
+            "_src_text": text, "_last_text": text}
+    await start_transfer(update, context, actor, data)
+    return True
+
+
 def qr_register_scan(chat_id: int, pid: int, lot: str | None, box: bool) -> list:
     """Добавить скан к накопленному списку чата (или начать новый, если
     человек что-то писал после прошлого скана). Возвращает список сканов."""
@@ -8242,7 +8313,8 @@ def qr_scan_text(actor, product_id: int, lot: str | None, whs,
                  "— числом: <i>15</i> или <i>2 к</i>. Потом напишите клиента, "
                  "например: <i>Асан</i> — выпишу накладную на всё "
                  "отсканированное; другое количество — <i>Асан 2 к</i> или "
-                 "<i>Асан 10 шт, приход 5000</i>.")
+                 "<i>Асан 10 шт, приход 5000</i>. Принимаете товар на склад — "
+                 "напишите <i>приход</i> (или <i>приход Кара-Балта</i>).")
     return "\n".join(lines)
 
 
@@ -13478,6 +13550,67 @@ async def load_f260403_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await start_transfer(update, context, actor, data)
 
 
+async def load_tq20260924c_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/loadtq20260924c [Склад] (админ, одноразовая): приход поставки Shimu
+    TQ20260924C из таблицы серий (22 позиции, 122'800 шт, серии и сроки
+    завода). Обычный «приход извне»: карточка, партии, серии в справочник,
+    PDF в ленту. По умолчанию — Бишкек. Повторный вызов предупреждает,
+    если серии поставки уже есть в проведённом приходе (задвоение)."""
+    actor = await _require_admin(update)
+    if actor is None:
+        return
+    import tq20260924c_lots_data as L
+    wh_name = " ".join(context.args or []).strip() or "Бишкек"
+    wh = db.warehouse_by_name(wh_name)
+    if wh is None:
+        await update.message.reply_text(
+            f"Склад «{esc(wh_name)}» не найден. Склады: "
+            + ", ".join(f"«{esc(w['name'])}»" for w in db.all_warehouses()),
+            parse_mode="HTML")
+        return
+    items = []
+    for pid, lot, exp, qty in L.LOTS:
+        pr = prices.BY_ID.get(pid)
+        if pr is None:
+            await update.message.reply_text(
+                f"⚠️ Товар №{pid} не найден в прайсе — приход не создан.")
+            return
+        items.append({"name": pr["name"], "volume": pr["volume"], "qty": qty,
+                      "box_qty": None, "price": pr["price"],
+                      "expiry": exp, "lot": lot})
+    total = sum(r[3] for r in L.LOTS)
+    done = supply_arrival_ops([r[1] for r in L.LOTS])
+    warn = ""
+    if done:
+        warn = ("\n\n‼️ ВНИМАНИЕ: серии этой поставки УЖЕ есть в проведённом "
+                "приходе (операция №" + ", №".join(str(n) for n in done[:5]) +
+                ") — повторное проведение ЗАДВОИТ остатки. Нажимайте "
+                "«Провести», только если уверены.")
+    await update.message.reply_text(
+        f"📦 Поставка TQ20260924C (Shimu) на склад «{esc(wh['name'])}»: "
+        f"{len(items)} позиций, {fmt_num(total)} шт, сроки и серии завода "
+        f"по каждой позиции. Сейчас покажу карточку прихода — проверьте и "
+        f"нажмите «Провести».{warn}", parse_mode="HTML")
+    data = {"action": "transfer", "from_warehouse": None,
+            "to_warehouse": wh["name"], "items": items}
+    await start_transfer(update, context, actor, data)
+
+
+def supply_arrival_ops(lots: list) -> list:
+    """Номера ПРОВЕДЁННЫХ приходов извне, в составе которых встречаются
+    указанные серии завода (страховка от повторной загрузки поставки)."""
+    out = []
+    conn = db.connect()
+    for lot in lots:
+        rows = conn.execute(
+            "SELECT id FROM operations WHERE type='transfer' AND status='done' "
+            "AND data LIKE ? ORDER BY id", (f'%"lot": "{lot}"%',)).fetchall()
+        for r in rows:
+            if r["id"] not in out:
+                out.append(r["id"])
+    return out
+
+
 def _stock_load_data(wh_name: str):
     entry = STOCK_LOADS.get(wh_name.lower())
     if entry is None:
@@ -14299,6 +14432,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("loadwh", loadwh_cmd))
     app.add_handler(CommandHandler("loadkarakol", loadwh_cmd))
     app.add_handler(CommandHandler("loadf260403", load_f260403_cmd))
+    app.add_handler(CommandHandler("loadtq20260924c", load_tq20260924c_cmd))
     app.add_handler(CommandHandler("resetwh", resetwh_cmd))
     app.add_handler(CommandHandler("expiry", expiry_cmd))
     app.add_handler(CommandHandler("cert", cert_cmd))
