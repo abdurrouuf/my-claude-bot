@@ -390,6 +390,15 @@ def init(admin_id: int, warehouse_names: list, staff: dict):
                          "AND box=24")
             conn.execute("INSERT OR REPLACE INTO settings(key, value) "
                          "VALUES('syringe_box_288', '1')")
+        # Паробакт 70 (№107): предварительные 11'400 / box 1 из PR #281
+        # заменяются ценой владельца 7'500 и коробкой 11 (10.10.2026) —
+        # только если цена ещё предварительная (ручная правка цела).
+        if not conn.execute("SELECT 1 FROM settings WHERE key='parobact_107_v2'"
+                            ).fetchone():
+            conn.execute("UPDATE products SET price=7500, box=11 WHERE id=107 "
+                         "AND price=11400 AND box=1")
+            conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                         "VALUES('parobact_107_v2', '1')")
         # Починка сроков с «двухцифровым» годом из Excel (04.30 -> 1930):
         # настоящих сроков в 19xx не бывает, безопасно переносим в 20xx.
         for table in ("product_batches", "product_expiry"):

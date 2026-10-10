@@ -4759,13 +4759,27 @@ def test_load_askont2639():
     for pid, _n, _l, _e, _q, rub in A.ROWS:
         assert abs(rub * 1.08 - A.BUY_SOM[pid]) < 0.01
         assert R.BUY_SOM[pid][0] == A.BUY_SOM[pid] and R.BUY_SOM[pid][2] == "2639"
-    # №107 в прайсе — сразу после Тонокарда (№68), штучный товар
+    # №107 в прайсе — сразу после Тонокарда (№68): 7'500 сом, коробка 11
     ids = [p["id"] for p in prices.PRICE_LIST_DATA]
     assert ids.index(107) == ids.index(68) + 1
-    assert prices.BY_ID[107]["box"] == 1 and prices.BY_ID[107]["volume"] == "1 кг"
+    assert prices.BY_ID[107]["box"] == 11 and prices.BY_ID[107]["volume"] == "1 кг"
+    assert prices.BY_ID[107]["price"] == 7500
     assert prices.match_product("Паробакт 70", "1 кг")["id"] == 107
-    assert prices.whole_boxes(107, 11) == 11 and bot.box_breakdown(
-        [{"product_id": 107, "qty": 11}])[0] == 11
+    assert prices.whole_boxes(107, 11) == 1 and bot.box_breakdown(
+        [{"product_id": 107, "qty": 10}])[:2] == (0, 10)
+    # старая база с предварительной ценой PR #281 чинится один раз
+    conn = db.connect()
+    conn.execute("UPDATE products SET price=11400, box=1 WHERE id=107")
+    conn.execute("DELETE FROM settings WHERE key='parobact_107_v2'"); conn.commit()
+    db.init(ADMIN, bot.WAREHOUSE_NAMES, bot.STAFF)
+    row = {r["id"]: r for r in db.products_active()}[107]
+    assert row["price"] == 7500 and row["box"] == 11
+    conn.execute("UPDATE products SET price=8000 WHERE id=107")
+    conn.execute("DELETE FROM settings WHERE key='parobact_107_v2'"); conn.commit()
+    db.init(ADMIN, bot.WAREHOUSE_NAMES, bot.STAFF)          # ручная цена цела
+    assert {r["id"]: r for r in db.products_active()}[107]["price"] == 8000
+    conn.execute("UPDATE products SET price=7500 WHERE id=107"); conn.commit()
+    prices.set_data(db.products_active())
     # закуп: реестр 1С дал старую цену, обновление — новую, только один раз
     assert db.seed_buy_som(R.BUY_SOM) is True
     db.product_set_buy(62, som=293.0)                       # «старая» цена
