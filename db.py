@@ -575,6 +575,27 @@ def seed_buy_som(seed: dict, flag: str = "buy_som_registry_2026"):
         return True
 
 
+def seed_buy_som_update(seed: dict, flag: str) -> bool:
+    """Одноразовое ОБНОВЛЕНИЕ себестоимости в сомах по новой приходной
+    накладной (правило владельца 30.08.2026: цена — из ПОСЛЕДНЕЙ закупки).
+    В отличие от seed_buy_som перезаписывает существующую цену: курс и
+    цены назвал сам владелец. seed: {product_id: цена_сом}; флаг в settings
+    — второй старт ничего не трогает (ручные правки после него целы)."""
+    conn = connect()
+    with _lock, conn:
+        if conn.execute("SELECT 1 FROM settings WHERE key=?",
+                        (flag,)).fetchone():
+            return False
+        if conn.execute("SELECT 1 FROM products LIMIT 1").fetchone() is None:
+            return False
+        for pid, som in seed.items():
+            conn.execute("UPDATE products SET buy_som=?, buy_usd=NULL WHERE id=?",
+                         (float(som), pid))
+        conn.execute("INSERT OR REPLACE INTO settings(key, value) "
+                     "VALUES(?, '1')", (flag,))
+        return True
+
+
 def product_set_buy(product_id: int, usd: float = None, som: float = None):
     """Закупочная цена товара: в долларах (пересчитывается по курсу) или
     в сомах (фиксированная, приоритетнее). Заданная сомовая цена сбрасывает

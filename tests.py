@@ -2568,8 +2568,8 @@ def test_buy_som_registry():
     курс её не меняет; заданную владельцем цену сидирование не затирает."""
     import buy_registry_data as R
     wh = _fresh_db()
-    assert len(R.BUY_SOM) == 104 and len(prices.PRICE_LIST_DATA) == 106
-    assert sum(len(v) for v in R.BUY_HISTORY.values()) == 361
+    assert len(R.BUY_SOM) == 105 and len(prices.PRICE_LIST_DATA) == 107
+    assert sum(len(v) for v in R.BUY_HISTORY.values()) == 364   # +3 строки Асконт 2639
     # каждая цена BUY_SOM — цена последней закупки из истории
     for pid, (som, date, doc) in R.BUY_SOM.items():
         last = R.BUY_HISTORY[pid][-1]
@@ -2577,12 +2577,12 @@ def test_buy_som_registry():
     assert db.seed_buy_som(R.BUY_SOM) is True
     assert db.seed_buy_som(R.BUY_SOM) is False        # флаг: второй раз мимо
     smap = db.products_buy_som_map()
-    assert len(smap) == 104 and smap[16] == R.BUY_SOM[16][0]   # 105/106 без закупа в сомах
-    # Себестоимость известна у всех 104 позиций и НЕ зависит от курса
+    assert len(smap) == 105 and smap[16] == R.BUY_SOM[16][0]   # 105/106 без закупа в сомах
+    # Себестоимость известна у всех 105 позиций и НЕ зависит от курса
     b1 = bot.buy_som_map()
     db.set_setting("usd_rate", "200")
     b2 = bot.buy_som_map()
-    assert len(b1) == len(b2) == 104
+    assert len(b1) == len(b2) == 105
     assert b1[16] == b2[16] == R.BUY_SOM[16][0]
     db.set_setting("usd_rate", "87.5")
     # Долларовая цена остаётся запасным путём: товар без сомовой цены
@@ -2625,7 +2625,7 @@ def test_buylog_report():
                           effective_chat=SimpleNamespace(id=1, type="private"),
                           message=Msg())
     asyncio.run(bot.buylog_cmd(upd, SimpleNamespace(args=[])))
-    assert out.get("pdf", b"")[:4] == b"%PDF" and "104" in out["caption"]
+    assert out.get("pdf", b"")[:4] == b"%PDF" and "105" in out["caption"]
     out.clear()
     asyncio.run(bot.buylog_cmd(upd, SimpleNamespace(args=["Дексатоп", "50", "мл"])))
     assert out.get("pdf", b"")[:4] == b"%PDF" and "закупок" in out["caption"]
@@ -4743,6 +4743,66 @@ def test_code_formatted_command():
     assert asyncio.run(bot._code_formatted_command(upd, ctx)) is False
 
 
+def test_load_askont2639():
+    """Поставка Асконт+ № 2639 / спец. 5 (10.10.2026): Паробакт 70 — №107
+    в прайсе после Тонокарда, штучный; закуп по курсу 1,08 перезаписывает
+    цену последней закупки (seed_buy_som_update, один раз); серии
+    заселяются до прихода; /loadaskont2639 строит карточку прихода на
+    три позиции и предупреждает о повторе."""
+    import asyncio
+    from types import SimpleNamespace
+    import askont_spec5_data as A
+    import buy_registry_data as R
+    _fresh_db(); bot.PENDING.clear()
+    assert len(A.LOTS) == 3 and sum(r[3] for r in A.LOTS) == 3011
+    assert A.RUB_RATE == 1.08
+    for pid, _n, _l, _e, _q, rub in A.ROWS:
+        assert abs(rub * 1.08 - A.BUY_SOM[pid]) < 0.01
+        assert R.BUY_SOM[pid][0] == A.BUY_SOM[pid] and R.BUY_SOM[pid][2] == "2639"
+    # №107 в прайсе — сразу после Тонокарда (№68), штучный товар
+    ids = [p["id"] for p in prices.PRICE_LIST_DATA]
+    assert ids.index(107) == ids.index(68) + 1
+    assert prices.BY_ID[107]["box"] == 1 and prices.BY_ID[107]["volume"] == "1 кг"
+    assert prices.match_product("Паробакт 70", "1 кг")["id"] == 107
+    assert prices.whole_boxes(107, 11) == 11 and bot.box_breakdown(
+        [{"product_id": 107, "qty": 11}])[0] == 11
+    # закуп: реестр 1С дал старую цену, обновление — новую, только один раз
+    assert db.seed_buy_som(R.BUY_SOM) is True
+    db.product_set_buy(62, som=293.0)                       # «старая» цена
+    assert db.seed_buy_som_update(A.BUY_SOM, "buy_som_askont_2639") is True
+    smap = db.products_buy_som_map()
+    assert smap[62] == 259.3 and smap[64] == 229.02 and smap[107] == 4557.54
+    db.product_set_buy(62, som=300.0)                       # правка владельца после
+    assert db.seed_buy_som_update(A.BUY_SOM, "buy_som_askont_2639") is False
+    assert db.products_buy_som_map()[62] == 300.0
+    # серии до прихода — скан покажет срок
+    assert db.seed_lots(A.LOTS, "поставка Асконт+ 2639 (до прихода)",
+                        flag="lots_askont_2639") is True
+    assert db.lot_expiry(62, "170626") == "06.2028"
+    assert db.lot_expiry(107, "650526") == "05.2028"
+    # команда прихода
+    replies = []
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=SimpleNamespace(reply_text=_areply(replies)))
+    asyncio.run(bot.load_askont2639_cmd(upd, SimpleNamespace(bot=None, args=[])))
+    assert "Асконт+" in replies[0] and "3 позиций" in replies[0] and "ВНИМАНИЕ" not in replies[0]
+    p = [v for v in bot.PENDING.values() if v.get("kind") == "transfer"][-1]
+    assert p["wh_name"] == "Бишкек" and len(p["items"]) == 3
+    by = {it["product_id"]: it for it in p["items"]}
+    assert by[62]["qty"] == 2500 and by[62]["expiry"] == "06.2028" and by[62]["lot"] == "170626"
+    assert by[64]["qty"] == 500 and by[64]["expiry"] == "02.2028"
+    assert by[107]["qty"] == 11 and by[107]["lot"] == "650526"
+    wh = db.warehouse_by_name("Бишкек")
+    db.commit_operation(ADMIN, "transfer", wh["id"], None, "приход Асконт",
+                        [(wh["id"], 62, 2500)], [],
+                        {"items": [{"product_id": 62, "qty": 2500, "lot": "170626"}]})
+    replies.clear()
+    asyncio.run(bot.load_askont2639_cmd(upd, SimpleNamespace(bot=None, args=["Каракол"])))
+    assert "ВНИМАНИЕ" in replies[0] and "Каракол" in replies[0]
+    bot.PENDING.clear()
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
@@ -4760,4 +4820,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

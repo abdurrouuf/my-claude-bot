@@ -13556,10 +13556,30 @@ async def load_tq20260924c_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     завода). Обычный «приход извне»: карточка, партии, серии в справочник,
     PDF в ленту. По умолчанию — Бишкек. Повторный вызов предупреждает,
     если серии поставки уже есть в проведённом приходе (задвоение)."""
+    import tq20260924c_lots_data as L
+    await _supply_load(update, context, "TQ20260924C (Shimu)", L.LOTS)
+
+
+async def load_askont2639_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/loadaskont2639 [Склад] (админ, одноразовая): приход поставки
+    НПК «Асконт+» по счёту № 2639 / спецификации № 5 от 16.09.2026
+    (Мультивит + Минералы 500, Паробакт 70 №107 — 11 шт, Элеовит 2500;
+    серии и сроки из спецификации). Тот же путь, что /loadtq20260924c."""
+    import askont_spec5_data as A
+    await _supply_load(update, context, "Асконт+ № 2639 (спец. 5 от 16.09.2026)",
+                       A.LOTS)
+
+
+async def _supply_load(update: Update, context: ContextTypes.DEFAULT_TYPE,
+                       label: str, lots: list):
+    """Общий путь одноразовых команд прихода поставки: lots —
+    [(product_id, серия, срок MM.YYYY, кол-во), ...]; склад — аргумент
+    команды, по умолчанию Бишкек; страховка от повторной загрузки по
+    сериям в проведённых приходах."""
     actor = await _require_admin(update)
     if actor is None:
         return
-    import tq20260924c_lots_data as L
+    L = SimpleNamespace(LOTS=lots)
     wh_name = " ".join(context.args or []).strip() or "Бишкек"
     wh = db.warehouse_by_name(wh_name)
     if wh is None:
@@ -13587,7 +13607,7 @@ async def load_tq20260924c_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
                 ") — повторное проведение ЗАДВОИТ остатки. Нажимайте "
                 "«Провести», только если уверены.")
     await update.message.reply_text(
-        f"📦 Поставка TQ20260924C (Shimu) на склад «{esc(wh['name'])}»: "
+        f"📦 Поставка {esc(label)} на склад «{esc(wh['name'])}»: "
         f"{len(items)} позиций, {fmt_num(total)} шт, сроки и серии завода "
         f"по каждой позиции. Сейчас покажу карточку прихода — проверьте и "
         f"нажмите «Провести».{warn}", parse_mode="HTML")
@@ -14376,6 +14396,15 @@ if __name__ == "__main__":
                     flag="lots_tq20260924c"):
         log.info("Серии поставки TQ20260924C заселены (%d)",
                  len(tq20260924c_lots_data.LOTS))
+    # Поставка Асконт+ 2639 / спец. 5 (16.09.2026): закуп в сомах по курсу
+    # 1,08 (владелец, 10.10.2026) — цена последней закупки ПЕРЕЗАПИСЫВАЕТ
+    # старую; серии — в справочник до прихода (/loadaskont2639).
+    import askont_spec5_data
+    if db.seed_buy_som_update(askont_spec5_data.BUY_SOM, "buy_som_askont_2639"):
+        log.info("Закуп Асконт+ 2639 занесён (%d поз.)", len(askont_spec5_data.BUY_SOM))
+    if db.seed_lots(askont_spec5_data.LOTS, "поставка Асконт+ 2639 (до прихода)",
+                    flag="lots_askont_2639"):
+        log.info("Серии поставки Асконт+ 2639 заселены (%d)", len(askont_spec5_data.LOTS))
     prices.set_data(db.products_active())
     _refresh_price_dependents()
     app = ApplicationBuilder().token(TELEGRAM_TOKEN).post_init(_post_init).build()
@@ -14433,6 +14462,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("loadkarakol", loadwh_cmd))
     app.add_handler(CommandHandler("loadf260403", load_f260403_cmd))
     app.add_handler(CommandHandler("loadtq20260924c", load_tq20260924c_cmd))
+    app.add_handler(CommandHandler("loadaskont2639", load_askont2639_cmd))
     app.add_handler(CommandHandler("resetwh", resetwh_cmd))
     app.add_handler(CommandHandler("expiry", expiry_cmd))
     app.add_handler(CommandHandler("cert", cert_cmd))
