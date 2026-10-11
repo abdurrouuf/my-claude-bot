@@ -4817,6 +4817,37 @@ def test_load_askont2639():
     bot.PENDING.clear()
 
 
+def test_product_text_guard():
+    """Подмена товара ИИ (инцидент 11.10.2026): «Альтопен 1 л» в сообщении,
+    модель отдала АЛЬТОПЕН-ФОРТЕ — parse_items возвращает товар по тексту
+    с ценой прайса и предупреждением; слово в тексте есть — не трогается;
+    тот же товар без «плюс» — тишина; без текста (фото) — как раньше."""
+    _fresh_db()
+    txt = "Бахтияр Кочкор\nАлбенивер 1 л 2 к 01/29\nАльтопен 1 л 1 к 11/28"
+    items, w = bot.parse_items(
+        [{"name": "АЛЬТОПЕН-ФОРТЕ", "volume": "1 л", "qty": 12, "price": 1060}],
+        src_text=txt)
+    assert items[0]["product_id"] == 8 and items[0]["price"] == 570
+    assert w and "по тексту" in w[0]
+    # явная цена сохраняется, товар всё равно по тексту
+    items, _w = bot.parse_items(
+        [{"name": "АЛЬТОПЕН-ФОРТЕ", "volume": "1 л", "qty": 12, "price": 500,
+          "price_explicit": True}], src_text=txt)
+    assert items[0]["product_id"] == 8 and items[0]["price"] == 500
+    for text, raw, pid, warned in (
+        ("Альтопен форте 1 л 1 к", "АЛЬТОПЕН-ФОРТЕ", 2, False),       # слово есть
+        ("Альтапен форте 1л 1к", "АЛЬТОПЕН-ФОРТЕ ПЛЮС", 2, True),     # «плюс» не писали
+        ("Пенстреп 10 мл 1 к", "ПЕНСТРЕП ПЛЮС LA", 94, False),        # тот же товар
+        ("", "АЛЬТОПЕН-ФОРТЕ", 2, False),                             # фото — без текста
+        ("Альтопен-Форте плюс 1 л 2 к", "АЛЬТОПЕН-ФОРТЕ ПЛЮС", 5, False),
+    ):
+        vol = "10 мл" if raw.startswith("ПЕНСТРЕП") else "1 л"
+        items, w = bot.parse_items([{"name": raw, "volume": vol, "qty": 1, "price": 1}],
+                                   src_text=text)
+        assert items[0]["product_id"] == pid, (text, raw, items[0]["product_id"])
+        assert any("по тексту" in x for x in w) is warned, (text, w)
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
