@@ -1216,10 +1216,42 @@ async def ask_claude(history: list, actor, draft=False) -> str:
 
 # ---------- Разбор позиций ----------
 
-def parse_items(raw_items: list):
+def _product_by_text(product: dict, volume: str, src_text: str):
+    """Защита от подмены товара ИИ (инцидент 11.10.2026: владелец написал
+    «Альтопен 1 л», модель отдала «АЛЬТОПЕН-ФОРТЕ 1 л» — другой препарат,
+    почти вдвое дороже; match_product по имени от модели этого не видит).
+    Если в коротком имени товара есть слово, которого в тексте сообщения
+    НЕТ («форте», «плюс»), а остальные слова есть, — ищем в прайсе товар
+    только по словам из текста с той же фасовкой. Нашёлся ДРУГОЙ товар —
+    возвращаем его (правка ИИ не по тексту). Иначе None (оставить как есть).
+    Текста нет (фото) — проверка не делается."""
+    text = (src_text or "").lower()
+    if not text.strip() or product is None:
+        return None
+    text_words = re.findall(r"[a-zа-яё0-9]+", text)
+    words = [w.lower() for w in prices._name_words(prices._base_name(product["name"]))]
+    present, missing = [], []
+    for w in words:
+        if len(w) < 4:
+            present.append(w)           # «la», «300», «2» — не различают товар
+            continue
+        ok = any(tw == w or tw[:4] == w[:4] and difflib.SequenceMatcher(
+            None, tw, w).ratio() >= 0.8 for tw in text_words)
+        (present if ok else missing).append(w)
+    if not missing or not any(len(w) >= 4 for w in present):
+        return None
+    alt = prices.match_product(" ".join(present), volume)
+    if alt is None or alt["id"] == product["id"]:
+        return None
+    return alt
+
+
+def parse_items(raw_items: list, src_text: str = ""):
     """Проверяет позиции от Claude и сопоставляет их с прайсом.
 
-    Возвращает (items, warnings) или бросает ValueError с текстом для пользователя.
+    src_text — текст сообщения человека (для защиты от подмены товара
+    моделью, см. _product_by_text). Возвращает (items, warnings) или
+    бросает ValueError с текстом для пользователя.
     """
     items, warnings = [], []
     for it in raw_items:
@@ -1238,6 +1270,17 @@ def parse_items(raw_items: list):
         except (TypeError, ValueError):
             box_qty = None
         product = prices.match_product(name, volume)
+        alt = _product_by_text(product, volume, src_text) if product else None
+        if alt is not None:
+            warnings.append(
+                f"«{product['name']} {product['volume']}» в сообщении не "
+                f"написан — взят «{alt['name']} {alt['volume']}» по тексту; "
+                f"проверьте")
+            log.warning("Подмена товара ИИ: %s -> %s (текст: %r)",
+                        product["name"], alt["name"], src_text[:80])
+            if not it.get("price_explicit") and alt["price"] is not None:
+                price = float(alt["price"])
+            name, product = alt["name"], alt
         if product is None:
             warnings.append(f"«{name} {volume}» не найден в прайсе — остаток по нему не изменится")
         elif difflib.SequenceMatcher(
@@ -1919,7 +1962,8 @@ async def start_invoice(update, context, actor, data, draft=False):
         # проводил бы всё по-настоящему.
         draft = True
     try:
-        items, warnings = parse_items(data.get("items") or [])
+        items, warnings = parse_items(data.get("items") or [],
+                                       src_text=str(data.get("_src_text") or ""))
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
@@ -2438,7 +2482,8 @@ async def start_amend_invoice(update, context, actor, data):
         await update.message.reply_text(err)
         return
     try:
-        new_items, warnings = parse_items(data.get("items") or [])
+        new_items, warnings = parse_items(data.get("items") or [],
+                                       src_text=str(data.get("_src_text") or ""))
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
@@ -2548,7 +2593,8 @@ async def start_replace_invoice(update, context, actor, data):
             "Клиент этой накладной не найден в справочнике — заменить нельзя.")
         return
     try:
-        new_items, warnings = parse_items(data.get("items") or [])
+        new_items, warnings = parse_items(data.get("items") or [],
+                                       src_text=str(data.get("_src_text") or ""))
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
@@ -3146,7 +3192,8 @@ async def start_return(update, context, actor, data):
         await update.message.reply_text("Не понял, от какого клиента возврат.")
         return
     try:
-        items, warnings = parse_items(data.get("items") or [])
+        items, warnings = parse_items(data.get("items") or [],
+                                       src_text=str(data.get("_src_text") or ""))
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
@@ -3886,7 +3933,8 @@ async def start_transfer(update, context, actor, data):
             f"только на свой склад.", parse_mode="HTML")
         return
     try:
-        items, warnings = parse_items(data.get("items") or [])
+        items, warnings = parse_items(data.get("items") or [],
+                                       src_text=str(data.get("_src_text") or ""))
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
@@ -4861,7 +4909,8 @@ async def start_writeoff(update, context, actor, data):
         await update.message.reply_text(TRANSITION_HINT)
         return
     try:
-        items, warnings = parse_items(data.get("items") or [])
+        items, warnings = parse_items(data.get("items") or [],
+                                       src_text=str(data.get("_src_text") or ""))
     except ValueError as e:
         await update.message.reply_text(f"⚠️ {e}")
         return
