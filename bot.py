@@ -142,7 +142,11 @@ def _request_history(chat_id) -> list:
     out = []
     for i, m in enumerate(h):
         c = m["content"]
-        if i < len(h) - 1 and isinstance(c, str) and len(c) > HISTORY_MSG_MAX:
+        if i < len(h) - 1 and isinstance(c, str) and len(c) > HISTORY_MSG_MAX \
+                and not c.startswith(QR_SCAN_MARK):
+            # След сканов QR не режем (ревизия 18.10.2026): 22 коробки
+            # контейнера ≈ 1200 символов, в 700 влезало 14 позиций —
+            # накладная «Асан» после сканов молча теряла строки.
             c = c[:HISTORY_MSG_MAX] + " …[обрезано]"
         out.append({"role": m["role"], "content": c})
     return out
@@ -1115,6 +1119,11 @@ def _json_lenient(reply: str) -> str:
     комментарии // после значений, запятая перед } или ], None/True/False
     по-питоньи, ```-ограды."""
     t = reply.replace("```json", " ").replace("```", " ")
+    if len(t) > 20000:
+        # Разбор по кавычкам квадратичен на несбалансированных кавычках:
+        # 32k символов — 4 с блокировки (аудит 18.10.2026). Такой ответ —
+        # патология модели, строгий разбор уже не прошёл.
+        return t
 
     def _outside(seg: str) -> str:
         seg = re.sub(r"//[^\n]*", "", seg)
@@ -1235,15 +1244,45 @@ def _product_by_text(product: dict, volume: str, src_text: str):
         if len(w) < 4:
             present.append(w)           # «la», «300», «2» — не различают товар
             continue
-        ok = any(tw == w or tw[:4] == w[:4] and difflib.SequenceMatcher(
-            None, tw, w).ratio() >= 0.8 for tw in text_words)
+        # Слово текста считается «тем же» с опечаткой (≥0.8), только если
+        # оно само не слово ДРУГОГО товара прайса: «альтопер» ≈ «альтопен»
+        # (0.875), но Альтопер — отдельный препарат, и при ошибке модели
+        # Альтопер → Альтопен-Форте защита подставляла Альтопен (ревизия
+        # 18.10.2026). «Альтапен» ничьё слово — проходит как опечатка.
+        ok = any(tw == w or (tw[:4] == w[:4] and difflib.SequenceMatcher(
+            None, tw, w).ratio() >= 0.8 and tw not in _other_product_words(w))
+            for tw in text_words)
         (present if ok else missing).append(w)
-    if not missing or not any(len(w) >= 4 for w in present):
+    if not missing:
         return None
+    if not any(len(w) >= 4 for w in present):
+        # Ни одного слова товара в тексте нет («Альтопер 100 мл» → модель
+        # отдала АЛЬТОПЕН-ФОРТЕ): ищем по словам текста, которые сами —
+        # слова прайса; несколько товаров в тексте в один не склеятся
+        # (match_product на такой склейке даст None).
+        present = [tw for tw in text_words
+                   if len(tw) >= 4 and tw in _other_product_words("")]
+        if not present:
+            return None
     alt = prices.match_product(" ".join(present), volume)
     if alt is None or alt["id"] == product["id"]:
         return None
     return alt
+
+
+_PRODUCT_WORDS_CACHE = {}
+
+
+def _other_product_words(w: str) -> set:
+    """Слова (≥4 букв) коротких имён прайса, кроме самого w."""
+    if not _PRODUCT_WORDS_CACHE:
+        words = set()
+        for pr in prices.PRICE_LIST_DATA:
+            for x in prices._name_words(prices._base_name(pr["name"]).lower()):
+                if len(x) >= 4:
+                    words.add(x)
+        _PRODUCT_WORDS_CACHE["all"] = words
+    return _PRODUCT_WORDS_CACHE["all"] - {w}
 
 
 def parse_items(raw_items: list, src_text: str = ""):
@@ -1255,6 +1294,9 @@ def parse_items(raw_items: list, src_text: str = ""):
     """
     items, warnings = [], []
     for it in raw_items:
+        if not isinstance(it, dict):
+            raise ValueError("Не разобрал список позиций — напишите товары "
+                             "построчно: «Товар фасовка — количество».")
         name = str(it.get("name") or "").strip()
         volume = str(it.get("volume") or "").strip()
         try:
@@ -2779,7 +2821,15 @@ def _employee_traceable(src_text: str, emp_name: str) -> bool:
     parts = [w for w in re.findall(r"[^\W\d_]+", str(emp_name).lower()) if len(w) >= 3]
     if not words or not parts:
         return True
-    return any(_word_alike(w, part) for part in parts for w in words)
+    return any(_emp_word_alike(w, part) for part in parts for w in words)
+
+
+def _emp_word_alike(w: str, part: str) -> bool:
+    """Слово текста — это имя сотрудника? Как _word_alike, плюс прозвище-
+    начало имени («Аза» → Азамат, «Дан» → Данияр; ревизия 18.10.2026:
+    «Аза сдал кассу» от админа молча шло в кассу АДМИНА). Для клиентов
+    (_name_traceable) префикс НЕ принимается — там это деньги чужому."""
+    return _word_alike(w, part) or (len(w) >= 3 and part.startswith(w))
 
 
 def _employee_in_text(text: str):
@@ -2791,7 +2841,7 @@ def _employee_in_text(text: str):
         if u["role"] == "admin":
             continue
         nm = str(u["name"]).lower()
-        if any(len(w) >= 3 and _word_alike(w, nm) for w in words) \
+        if any(len(w) >= 3 and _emp_word_alike(w, nm) for w in words) \
                 and not any(x["id"] == u["id"] for x in found):
             found.append(u)
     return found[0] if len(found) == 1 else None
@@ -3026,7 +3076,7 @@ def _return_purchases(p) -> dict:
     return out
 
 
-def _return_purchase_check(requester, p):
+def _return_purchase_check(requester, p, in_group: bool = False):
     """Возврат только того, что клиент реально покупал (предложение
     владельца 18.09.2026: Данияр оформил возврат Дорамека, которого Вика
     по журналу не брала). Сотруднику — отказ; админу — предупреждение
@@ -3034,20 +3084,32 @@ def _return_purchase_check(requester, p):
     Возвращает (текст отказа | None, предупреждения)."""
     hist = _return_purchases(p)
     blocked, warns = [], []
+    # Количество сверяется по ТОВАРУ целиком (ревизия 18.10.2026: «8 шт +
+    # 8 шт» одного товара двумя строками проходило при купленных 15).
+    want, seen = {}, set()
+    for it in p["items"]:
+        if it.get("product_id"):
+            want[it["product_id"]] = want.get(it["product_id"], 0) + (it.get("qty") or 0)
     for it in p["items"]:
         pid = it.get("product_id")
-        if not pid:
+        if not pid or pid in seen:
             continue
+        seen.add(pid)
         h = hist[pid]
         avail = h["sold"] - h["returned"]
         label = f"{it['name']} {it['volume']}"
         if h["sold"] <= 0:
             blocked.append(f"{label} — по журналу клиент его не покупал")
-        elif it["qty"] > avail:
+        elif want[pid] > avail and in_group and not is_admin(requester):
+            # В чате склада без чисел: сумма покупок клиента включает и
+            # накладные владельца, которых лента не показывает (18.10.2026)
+            blocked.append(f"{label} — в возврате {want[pid]} шт, по журналу "
+                           f"клиент столько не покупал")
+        elif want[pid] > avail:
             blocked.append(f"{label} — куплено {h['sold']} шт"
                            + (f", уже возвращено {h['returned']}" if h["returned"] else "")
                            + f"; вернуть можно не больше {max(avail, 0)}, "
-                           f"а в возврате {it['qty']}")
+                           f"а в возврате {want[pid]}")
     if not blocked:
         return None, warns
     if is_admin(requester):
@@ -3058,24 +3120,21 @@ def _return_purchase_check(requester, p):
               "документом, может провести только админ."), warns
 
 
-def _purchase_lines(p) -> list:
-    """Строки «куплено: …» для карточки возврата — админ видит, что и
-    когда клиент брал (просьба владельца 18.09.2026)."""
-    hist = _return_purchases(p)
-    out = []
-    for it in p["items"]:
-        pid = it.get("product_id")
-        if not pid:
-            continue
-        h = hist[pid]
-        if not h["rows"]:
-            out.append(f"   ↳ {esc(it['name'])} {esc(it['volume'])}: покупок в журнале нет")
-            continue
-        parts = [f"{d[8:10]}.{d[5:7]} №{op} — {q} шт" for d, op, q in h["rows"][:4]]
-        more = f" +ещё {len(h['rows']) - 4}" if len(h["rows"]) > 4 else ""
-        ret = f"; уже возвращено {h['returned']}" if h["returned"] else ""
-        out.append(f"   ↳ куплено: {', '.join(parts)}{more}{ret}")
-    return out
+def _purchase_line(hist, it) -> str:
+    """Строка «↳ куплено: …» под позицией карточки возврата — админ видит,
+    что и когда клиент брал (просьба владельца 18.09.2026). С 18.10.2026
+    строка стоит ПОД своей позицией (раньше все шли списком после
+    позиций и при 2+ товарах было не понять, какая к какой)."""
+    pid = it.get("product_id")
+    if not pid:
+        return ""
+    h = hist[pid]
+    if not h["rows"]:
+        return "   ↳ покупок в журнале нет"
+    parts = [f"{d[8:10]}.{d[5:7]} №{op} — {q} шт" for d, op, q in h["rows"][:4]]
+    more = f" +ещё {len(h['rows']) - 4}" if len(h["rows"]) > 4 else ""
+    ret = f"; уже возвращено {h['returned']}" if h["returned"] else ""
+    return f"   ↳ куплено: {', '.join(parts)}{more}{ret}"
 
 
 def return_summary(p) -> str:
@@ -3087,6 +3146,7 @@ def return_summary(p) -> str:
         lines.append(f"✍️ Заявка от: <b>{esc(p['requester_name'])}</b>")
     lines.append("")
     total = 0
+    hist = _return_purchases(p)
     for i, it in enumerate(p["items"], 1):
         sub = it["qty"] * it["price"]
         total += sub
@@ -3096,7 +3156,9 @@ def return_summary(p) -> str:
             special = " (по цене продажи)"
         lines.append(f"{i}. {esc(it['name'])} {esc(it['volume'])} — {box}{it['qty']} шт × "
                      f"{fmt_num(it['price'])}{special} = <b>{money(sub)}</b>")
-    lines += _purchase_lines(p)
+        pl = _purchase_line(hist, it)
+        if pl:
+            lines.append(pl)
     lines.append("")
     lines.append(f"🔙 Сумма возврата: <b>{money(total)}</b>")
     new_debt = c["debt"] - total
@@ -3213,7 +3275,8 @@ async def start_return(update, context, actor, data):
 
     async def _proceed():
         apply_return_prices(payload)
-        refusal, pw = _return_purchase_check(actor, payload)
+        refusal, pw = _return_purchase_check(
+            actor, payload, in_group=update.effective_chat.type != "private")
         if refusal:
             await update.message.reply_text(refusal)
             _note_outcome(update, "возврат НЕ принят — клиент не покупал этот товар "
@@ -3500,7 +3563,12 @@ async def start_payment(update, context, actor, data):
 
     exact = db.client_exact(wh["id"], client_name)
     wh_note = ""
-    if exact is None:
+    # В чате склада — только склад чата (ревизия 18.10.2026): карточка с
+    # долгом клиента ДРУГОГО склада (в т.ч. со скрытыми долгами) уходила бы
+    # в общий чат. В личке — поиск по другим складам, как раньше.
+    in_group = update.effective_chat is not None \
+        and update.effective_chat.type != "private"
+    if exact is None and not in_group:
         # Клиента на названном складе нет, а на ДРУГОМ операбельном складе
         # он есть ровно один (модель взяла склад из истории диалога:
         # 20.09.2026 «Дадажанов Фахридин 120'000» после фраз про Каракол
@@ -3572,6 +3640,13 @@ async def start_payment(update, context, actor, data):
         return
 
     candidates = db.fuzzy_clients(wh["id"], client_name)
+    if not candidates and in_group:
+        await update.message.reply_text(
+            f"❌ Клиент «{esc(client_name)}» не найден на складе «{esc(wh['name'])}». "
+            f"Если он на другом складе — напишите мне в личку.", parse_mode="HTML")
+        _note_outcome(update, f"приход НЕ проведён — клиента «{client_name}» нет "
+                              f"на складе чата «{wh['name']}»")
+        return
     if not candidates:
         # На этом складе похожих нет — ищем по ДРУГИМ операбельным складам
         # сотрудника (инцидент 18.09.2026: «Чолпон Аалиева» на Бишкеке —
@@ -3755,10 +3830,17 @@ def _expiry_attempt_gate(actor, p):
         store[k] = [cnt, now]
         keys.append(k)
         counts.append(cnt)
-        listed = ", ".join(f"{b['expiry'] or 'без срока'} — {b['qty']} шт"
-                           for b in batches)
-        lines.append(f"• {it['name']} {it['volume']}: срока {it['expiry']} "
-                     f"НЕТ. Есть партии: {listed}")
+        if db.can_view_warehouse(actor, src_wh):
+            listed = ", ".join(f"{b['expiry'] or 'без срока'} — {b['qty']} шт"
+                               for b in batches)
+            lines.append(f"• {it['name']} {it['volume']}: срока {it['expiry']} "
+                         f"НЕТ. Есть партии: {listed}")
+        else:
+            # Чужой склад (ревизия 18.10.2026): партии и остатки не
+            # показываем — сотрудник без доступа мог так опрашивать
+            # любой склад по любому товару.
+            lines.append(f"• {it['name']} {it['volume']}: срока {it['expiry']} "
+                         f"НЕТ на складе «{src_name}» (партии уточните у админа)")
     n = min(counts)
     passed = n >= limit
     if passed:
@@ -5206,6 +5288,15 @@ def _reserved_batches(p, upto: int) -> dict:
             for e, qn in rows:
                 r[e] = r.get(e, 0) + qn
             continue
+        # Перемещение/списание с ЯВНЫМ сроком строки списывает именно его
+        # (_fill_src_batches) — учитываем как явный выбор (ревизия
+        # 18.10.2026: иначе кнопка второй строки предлагала уже занятую
+        # партию и выбор давал призрак). Срок из ответа на вопрос бота
+        # (expiry_asked) на источнике не списывается — не считаем.
+        exp = "" if it.get("expiry_asked") else (it.get("expiry") or "")
+        if exp and p.get("kind") in EXPIRY_REQUIRED_KINDS:
+            r[exp] = r.get(exp, 0) + it["qty"]
+            continue
         rest = it["qty"]
         for b in db.product_batches_of(src_wh, pid):
             take = min(rest, max(b["qty"] - r.get(b["expiry"], 0), 0))
@@ -6284,7 +6375,8 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if p["kind"] == "return":
             apply_return_prices(p)
             requester = db.get_user(p["user_id"])
-            refusal, pw = _return_purchase_check(requester, p)
+            refusal, pw = _return_purchase_check(
+                requester, p, in_group=(p.get("chat_id") or 0) < 0)
             if refusal:
                 PENDING.pop(token, None)
                 await q.edit_message_text(refusal)
@@ -8198,7 +8290,7 @@ def qr_set_last_qty(chat_id: int, text: str):
     if unit.startswith("к") and box > 1:
         it["boxes"], it["pieces"] = n, 0
         how = f"{n} к ({n * box} шт)"
-    elif unit.startswith(("пач", "уп")) and prices.pack_size(it["pid"]) > 1:
+    elif unit.startswith(("пач", "уп")) and (prices.pack_size(it["pid"]) or 0) > 1:
         it["boxes"], it["pieces"] = 0, n * prices.pack_size(it["pid"])
         how = f"{n} пач ({it['pieces']} шт)"
     else:
@@ -8253,12 +8345,16 @@ async def qr_arrival_reply(update: Update, context, actor, text: str) -> bool:
         return False
     wh_name = (m.group(1) or "").strip()
     if wh_name:
+        # Хвост — только имя склада. Цифры или длинный хвост («Приход Мира
+        # эже 21840», «приход 5000») — это оплата, отдаём ИИ (ревизия
+        # 18.10.2026: при живом списке сканов такие сообщения глотались
+        # отказом «Склад не найден», а «Приход Каракол 5000» и вовсе
+        # подменялся карточкой прихода отсканированной коробки).
+        if re.search(r"\d", wh_name) or len(wh_name.split()) > 2:
+            return False
         wh = db.warehouse_by_name(wh_name)
         if wh is None:
-            await update.message.reply_text(
-                f"Склад «{esc(wh_name)}» не найден. Напишите, например: "
-                f"<i>приход Бишкек</i>.", parse_mode="HTML")
-            return True
+            return False
     elif is_admin(actor):
         wh = db.warehouse_of(actor["id"]) or (db.all_warehouses() or [None])[0]
     else:
@@ -8449,6 +8545,11 @@ async def desc_text_reply(update, actor, text: str) -> bool:
         return False
     name, body = m.group(1), (m.group(2) or "").strip()
     short, cands = _cert_product_match(name)
+    if short is None and not body:
+        # «описание товара хорошее, Асан приход 5000» — обычная речь, не
+        # команда: отдаём ИИ (ревизия 18.10.2026). Отказ — только при
+        # явном «описание X: текст».
+        return False
     if short is None:
         await update.message.reply_text(
             "❓ Не узнал препарат «" + esc(name) + "»"
@@ -8555,6 +8656,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await _send_public_certs(update, prices._base_name(prices.BY_ID[pid]["name"]).upper())
         return
     if qr:
+        if update.effective_chat is None or update.effective_chat.type != "private":
+            # QR — только в личке (ревизия 18.10.2026): в группе остатки
+            # всех видимых складов ушли бы в общий чат, а след сканов
+            # подменил бы историю чата.
+            return
         pid, lot, box = qr
         chat_id = update.effective_chat.id
         if pid not in prices.BY_ID:
@@ -10868,6 +10974,20 @@ def _sales_pids(q: str):
     same = [pr for pr in prices.PRICE_LIST_DATA if _pnorm(_base_name(pr)) == qn]
     if same:
         return _base_name(same[0]), [p["id"] for p in same]
+    # Слова запроса = НАЧАЛО слов короткого имени — при единственном таком
+    # имени («Докцилин» → ДОКЦИЛИН 200, «Оксилин» → ОКСИЛИН 300 LA; ревизия
+    # 18.10.2026: «/sales Докцилин 50» уходил в путь опечаток и «50»
+    # становился клиентом). Несколько имён («Топ») — не гадаем.
+    qw = [w.replace("ё", "е") for w in prices._name_words(q.lower())]
+    if qw:
+        names = {}
+        for pr in prices.PRICE_LIST_DATA:
+            nw = [w.replace("ё", "е") for w in prices._name_words(_base_name(pr).lower())]
+            if len(nw) > len(qw) and nw[:len(qw)] == qw:
+                names.setdefault(_base_name(pr), []).append(pr["id"])
+        if len(names) == 1:
+            nm, pids = next(iter(names.items()))
+            return nm, pids
     return None
 
 
@@ -10881,7 +11001,7 @@ def _parse_sales_query(text: str):
         prod_part, cli_part = [x.strip() for x in text.split(",", 1)]
     else:
         prod_part, cli_part = text.strip(), ""
-    words = prod_part.split()
+    words = prod_part.split()[:12]   # перебор префиксов × difflib — не квадратить на мусоре
     for cut in range(len(words), 0, -1):
         got = _sales_pids(" ".join(words[:cut]))
         if not got:
@@ -11184,14 +11304,29 @@ def _moves_op_text(op, delta, data, wh_id: int, pid: int) -> str:
     return txt
 
 
-def product_moves_rows(wh_id: int, pid: int):
+def product_moves_rows(wh_id: int, pid: int, hide_admin: bool = False):
     """Строки карточки товара: (дата, №, операция, сотрудник, приход, расход,
     остаток после) + итоги. Бегущий остаток идёт от нуля по проведённым
-    операциям; отменённые показываются, но остаток не меняют."""
+    операциям; отменённые показываются, но остаток не меняют.
+    hide_admin (чат склада, ревизия 18.10.2026): накладные админа по складу
+    со скрытыми долгами в строки не попадают (лента и /report их не
+    показывают — /moves показывал клиентов владельца); остаток и итоги
+    считаются полностью, число скрытых — в tot["hidden"]."""
     rows, bal = [], 0
-    n_in = n_out = n_cancel = 0
+    n_in = n_out = n_cancel = hidden = 0
     sold = returned = written = moved_in = moved_out = arrived = 0
     for op, delta, data in db.product_moves(wh_id, pid):
+        if hide_admin and _feed_muted_op(op["type"], op["user_id"], wh_id):
+            if op["status"] == "done":
+                bal += delta
+                if delta > 0:
+                    n_in += delta
+                else:
+                    n_out += -delta
+                if op["type"] == "invoice":
+                    sold += -delta
+            hidden += 1
+            continue
         try:
             dstr = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y %H:%M")
         except ValueError:
@@ -11227,7 +11362,8 @@ def product_moves_rows(wh_id: int, pid: int):
                      str(bal) if live else "—"])
     return rows, {"bal": bal, "n_in": n_in, "n_out": n_out, "n_cancel": n_cancel,
                   "sold": sold, "returned": returned, "written": written,
-                  "moved_in": moved_in, "moved_out": moved_out, "arrived": arrived}
+                  "moved_in": moved_in, "moved_out": moved_out, "arrived": arrived,
+                  "hidden": hidden}
 
 
 MOVES_MAX_ROWS = 250   # страховка от бесконечного PDF по ходовому товару
@@ -11242,7 +11378,8 @@ async def _moves_report(update, whs, actor, params):
             pr = prices.BY_ID.get(pid)
             if pr is None:
                 continue
-            rows, tot = product_moves_rows(wh["id"], pid)
+            rows, tot = product_moves_rows(wh["id"], pid,
+                                           hide_admin=bool(params.get("hide")))
             if not rows:
                 continue
             cut = ""
@@ -11272,13 +11409,14 @@ async def _moves_report(update, whs, actor, params):
             foot = (f"Приход {tot['n_in']} · расход {tot['n_out']} · "
                     f"ОСТАТОК ПО БОТУ: {now} шт"
                     + (f" · отменённых операций: {tot['n_cancel']}" if tot["n_cancel"] else "")
+                    + (f" · скрыто операций: {tot['hidden']}" if tot.get("hidden") else "")
                     + cut + check.replace("⚠", "ВНИМАНИЕ:"))
             if parts:
                 foot += " · Итого: " + ", ".join(parts)
             sections.append({
                 "title": f"{_base_name(pr)} {pr['volume']} — склад «{wh['name']}»",
                 "headers": ["Дата", "№", "Операция", "Сотрудник", "Приход", "Расход", "Остаток"],
-                "rows": rows, "widths": [24, 10, 58, 24, 19, 19, 20],
+                "rows": rows, "widths": [24, 10, 54, 28, 19, 19, 20],
                 "footer": foot})
             caps.append(f"📈 {_base_name(pr)} {pr['volume']} — «{wh['name']}»: "
                         f"+{tot['n_in']} / −{tot['n_out']}, остаток {now}"
@@ -11350,7 +11488,8 @@ async def moves_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         if await _maybe_ask_warehouse(update, actor, "moves",
                                       {"pids": pids, "label": label}):
             return
-    await _moves_report(update, whs, actor, {"pids": pids, "label": label})
+    await _moves_report(update, whs, actor,
+                        {"pids": pids, "label": label, "hide": in_group})
 
 
 def _where_box_text(pid, qty) -> str:
@@ -11422,9 +11561,14 @@ async def where_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if in_group and not whs_group:
         return
     text = " ".join(context.args or []).strip()
-    label, pids = None, None
+    label, pids, cands = None, None, []
     if text:
-        label, pids, _cli, _c = _parse_sales_query(text)
+        label, pids, _cli, cands = _parse_sales_query(text)
+    if not pids and cands:
+        await update.message.reply_text(
+            f"Не понял препарат «{esc(text)}». Возможно: {esc(', '.join(cands))}.",
+            parse_mode="HTML")
+        return
     if not pids:
         await update.message.reply_text(
             "📍 Где лежит товар: остаток препарата на всех ваших складах, "
@@ -11810,8 +11954,11 @@ async def integrity_loop(app):
 
 
 async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """/check — самопроверка учёта прямо сейчас (админ)."""
+    """/check — самопроверка учёта прямо сейчас (админ, личка — в тексте
+    минусовые кассы сотрудников)."""
     if await _require_admin(update) is None:
+        return
+    if not await _require_private(update):
         return
     text = integrity_report_text(db.integrity_check())
     if not text:
@@ -12067,6 +12214,11 @@ async def buylog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pid = p["id"]
                 break
         if pid is None:
+            # «/buylog Паробакт» у товара с одной фасовкой (18.10.2026)
+            _lbl, pids2, cli2, _c2 = _parse_sales_query(arg)
+            if pids2 and len(pids2) == 1 and not cli2:
+                pid = pids2[0]
+        if pid is None:
             first = arg.split()[0].lower()
             vols = [p2["volume"] for p2 in prices.PRICE_LIST_DATA
                     if p2["name"].split()[0].lower() == first]
@@ -12282,7 +12434,7 @@ async def quality_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "title": "Сводка по сотрудникам",
         "headers": ["Сотрудник", "Операций", "Накладных / сумма",
                     "С оплатой на месте", "Оплат / сумма", "Переделок"],
-        "rows": rows, "widths": [30, 20, 40, 30, 38, 30],
+        "rows": rows, "widths": [30, 20, 40, 30, 32, 30],
         "footer": "«Переделка» — накладная, отменённая и выписанная заново "
                   "(замена); процент — доля от накладных сотрудника. "
                   "/undo — отмены без замены.",

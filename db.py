@@ -832,11 +832,11 @@ def integrity_check():
         j = journal.get((wh, pid), 0)
         if abs(have - j) > 0:
             out.append((wh, pid, f"остаток {have}, по журналу {j} — "
-                                 f"расхождение {have - j:+d}"))
+                                 f"расхождение {int(round(have - j)):+d}"))
         b = batches.get((wh, pid), 0)
         if abs(have - b) > 0:
             out.append((wh, pid, f"остаток {have}, сумма партий {b} — "
-                                 f"партии разъехались на {b - have:+d}"))
+                                 f"партии разъехались на {int(round(b - have)):+d}"))
         if have < 0:
             out.append((wh, pid, f"минусовый остаток {have}"))
     for r in conn.execute(
@@ -939,12 +939,26 @@ def qr_scan_log(product_id: int, lot, box: bool, user_id, staff: bool, chat_id):
     """Журнал сканирований QR (30.09.2026): кто, что и когда сканировал —
     сотрудник или посторонний (клиент/фермер). Для /scans."""
     conn = connect()
+    now = datetime.now(BISHKEK)
     with _lock, conn:
+        if not staff:
+            # Посторонний, долбящий одну ссылку, не засоряет /scans: повтор
+            # той же (человек, товар, серия) чаще раза в 10 минут не пишется
+            # (ревизия 18.10.2026).
+            since = (now - timedelta(minutes=10)).isoformat(timespec="seconds")
+            dup = conn.execute(
+                "SELECT 1 FROM qr_scans WHERE user_id=? AND product_id=? AND lot=? "
+                "AND box=? AND staff=0 AND ts>=? LIMIT 1",
+                (user_id, int(product_id), str(lot or ""), 1 if box else 0,
+                 since)).fetchone()
+            if dup:
+                return False
         conn.execute(
             "INSERT INTO qr_scans(ts, product_id, lot, box, user_id, staff, chat_id) "
             "VALUES(?,?,?,?,?,?,?)",
-            (datetime.now(BISHKEK).isoformat(timespec="seconds"), int(product_id),
+            (now.isoformat(timespec="seconds"), int(product_id),
              str(lot or ""), 1 if box else 0, user_id, 1 if staff else 0, chat_id))
+    return True
 
 
 def qr_scan_stats(days: int = 30) -> dict:

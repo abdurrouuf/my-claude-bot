@@ -530,6 +530,11 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
         qty_text = f"{it['qty']} шт"
         if box_qty:
             qty_text = f"{box_qty} кор<br/>({it['qty']} шт)"
+        else:
+            # Шприцы: целые пачки по 24 — как в карточке и ленте (18.10.2026)
+            packs = prices.whole_packs(it.get("product_id"), it.get("qty"))
+            if packs:
+                qty_text = f"{packs} пач<br/>({it['qty']} шт)"
         table_data.append([
             Paragraph(str(i), cell_style),
             Paragraph(xml_escape(str(it["name"])), cell_style),

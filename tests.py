@@ -4529,11 +4529,16 @@ def test_qr_scan_start():
     assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, "Приход товара.")) is True
     p = [v for v in bot.PENDING.values() if v.get("kind") == "transfer"][-1]
     assert p["wh_name"] == db.warehouse_of(ADMIN)["name"]
-    # незнакомый склад — подсказка, без карточки
+    # незнакомый склад / цифры / длинный хвост — НЕ перехватывается, уходит
+    # в ИИ (ревизия 18.10.2026: «Приход Мира эже 21840» и «приход 5000» при
+    # живом списке сканов глотались отказом «Склад не найден», а «Приход
+    # Каракол 5000» подменялся карточкой прихода отсканированной коробки)
     asyncio.run(bot.start(upd, SimpleNamespace(args=["76-20261107C-K"])))
     n = len(bot.PENDING)
-    assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, "приход Луна")) is True
-    assert "не найден" in replies[-1] and len(bot.PENDING) == n
+    for txt in ("приход Луна", "приход 5000", "Приход Мира эже 21840",
+                "Приход Каракол 5000"):
+        assert asyncio.run(bot.qr_arrival_reply(upd, ctx, adm, txt)) is False, txt
+    assert len(bot.PENDING) == n
     bot.PENDING.clear(); bot.QR_SCANS.clear(); bot.chat_histories.clear()
 
 
@@ -4676,7 +4681,11 @@ def test_qr_public_card_and_scans():
     assert "1 к (80 шт)" in bot.chat_histories[ADMIN][0]["content"]
     assert "2 к" not in bot.chat_histories[ADMIN][0]["content"]
     st = db.qr_scan_stats(30)
-    assert st["total"] >= 6 and st["outsiders"] >= 5 and st["uniq_out"] == 1
+    # посторонний сканировал одну этикетку несколько раз подряд — повтор
+    # той же (товар, серия, коробка) за 10 минут не пишется (18.10.2026)
+    assert st["total"] >= 5 and st["outsiders"] == 4 and st["uniq_out"] == 1
+    assert db.qr_scan_log(76, "20261107C", False, 777001, False, 777001) is False
+    assert st["total"] == db.qr_scan_stats(30)["total"]
     assert st["by_product"][0]["product_id"] == 76 and st["by_product"][0]["boxes"] >= 2
     asyncio.run(bot.scans_cmd(adm, SimpleNamespace(args=["7"])))
     t = adm_replies[-1]
@@ -4846,6 +4855,222 @@ def test_product_text_guard():
                                    src_text=text)
         assert items[0]["product_id"] == pid, (text, raw, items[0]["product_id"])
         assert any("по тексту" in x for x in w) is warned, (text, w)
+
+
+def test_revision_181026():
+    """Большая ревизия 18.10.2026 (4 параллельных аудита кода после PR #239).
+    Закрепляет все исправления: приход в чате склада не уезжает на чужой
+    склад; отказ по сроку не раскрывает партии чужого склада; /start с QR
+    в группе молчит; /moves в чате прячет накладные владельца; «15 уп»
+    после скана не падает; вопрос о партии при перемещении двумя строками
+    учитывает явный срок строки выше; след сканов в истории не режется;
+    «описание …» в речи уходит в ИИ; /sales «Докцилин 50»; прозвище «Аза»;
+    возврат двумя строками сверяется по товару; /history сумма по строкам;
+    самопроверка с дробной дельтой; /buylog с одной фасовкой; /where
+    подсказывает кандидатов; защита товара: «Альтопер» ≠ опечатка Альтопена."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()                                   # Каракол
+    bish = db.warehouse_by_name("Бишкек")
+    kb = db.warehouse_by_name("Кара-Балта")
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1")
+    conn.commit()
+    beka = 5808155644
+    db.clients_add_bulk(bish["id"], [("Сапаркулова Алмагул", 198600)])
+    db.set_setting("hidden_debt_whs", json.dumps([bish["id"]]))
+    db.set_feed_chat(kb["id"], -4242, "чат КБ")
+    replies = []
+
+    class Msg:
+        async def reply_text(self, t, **kw):
+            replies.append((t, kw.get("reply_markup")))
+
+        async def reply_document(self, document=None, caption="", **kw):
+            replies.append((f"[PDF] {caption}", None))
+
+    def upd(uid, chat_id=None, ctype="private"):
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=chat_id or uid, type=ctype),
+                               message=Msg())
+    ctx = SimpleNamespace(bot=None)
+    # 1. Приход в ЧАТЕ Кара-Балты клиенту Бишкека — не уезжает на Бишкек,
+    #    долг чужого (скрытого) склада в группу не попадает
+    bot.PENDING.clear()
+    asyncio.run(bot.start_payment(upd(beka, -4242, "supergroup"), ctx, db.get_user(beka), {
+        "client": "Сапаркулова Алмагул", "warehouse": "Кара-Балта", "amount": 5000,
+        "_src_text": "Сапаркулова Алмагул приход 5000"}))
+    assert not bot.PENDING and "в личку" in replies[-1][0], replies[-1]
+    assert "198" not in replies[-1][0]
+    replies.clear()
+    asyncio.run(bot.start_payment(upd(beka, -4242, "supergroup"), ctx, db.get_user(beka), {
+        "client": "Сапаркулов", "warehouse": "Кара-Балта", "amount": 5000,
+        "_src_text": "Сапаркулов приход 5000"}))
+    assert not bot.PENDING and replies[-1][1] is None, replies[-1]
+    # в личке — как раньше: склад берётся по клиенту
+    replies.clear()
+    asyncio.run(bot.start_payment(upd(beka), ctx, db.get_user(beka), {
+        "client": "Сапаркулова Алмагул", "warehouse": "Кара-Балта", "amount": 5000,
+        "_src_text": "Сапаркулова Алмагул приход 5000"}))
+    assert bot.PENDING and "Склад взят по клиенту" in replies[-1][0]
+    bot.PENDING.clear(); replies.clear()
+
+    # 2. Отказ по несуществующему сроку: Данияр (только Каракол) просит
+    #    перемещение С БИШКЕКА — партии Бишкека ему не показываются
+    _load(bish, {16: 500}, {(bish["id"], 16): [("05.2028", 80), ("11.2029", 420)]})
+    pr = prices.BY_ID[16]
+    asyncio.run(bot.start_transfer(upd(DANIYAR), ctx, db.get_user(DANIYAR), {
+        "to_warehouse": "Каракол", "from_warehouse": "Бишкек",
+        "items": [{"name": pr["name"], "volume": pr["volume"], "qty": 5,
+                   "price": 0, "expiry": "01.2030"}]}))
+    t = replies[-1][0]
+    assert "Не провожу" in t and "420" not in t and "05.2028" not in t, t
+    assert "уточните у админа" in t
+    replies.clear()
+    # админу (видит Бишкек) партии по-прежнему перечисляются
+    asyncio.run(bot.start_transfer(upd(ADMIN), ctx, db.get_user(ADMIN), {
+        "to_warehouse": "Каракол", "from_warehouse": "Бишкек",
+        "items": [{"name": pr["name"], "volume": pr["volume"], "qty": 5,
+                   "price": 0, "expiry": "01.2030"}]}))
+    assert "11.2029 — 420 шт" in replies[-1][0]
+    replies.clear(); bot.PENDING.clear()
+
+    # 3. /start с QR в группе — тишина, история группы не трогается
+    bot.chat_histories.clear(); bot.QR_SCANS.clear()
+    asyncio.run(bot.start(upd(beka, -4242, "supergroup"), SimpleNamespace(args=["76-K"])))
+    assert not replies and -4242 not in bot.chat_histories and -4242 not in bot.QR_SCANS
+
+    # 4. /moves в чате склада прячет накладные админа по скрытому складу
+    db.set_feed_chat(bish["id"], -4343, "чат Бишкека")
+    _invoice(bish, ADMIN, "Кабылбеков Тыныбек", [_item(16, 40, 180)])
+    _invoice(bish, beka, "Клиент Беки", [_item(16, 10, 180)])
+    rows, tot = bot.product_moves_rows(bish["id"], 16, hide_admin=True)
+    texts = " ".join(r[2] for r in rows)
+    assert "Тыныбек" not in texts and "Клиент Беки" in texts
+    assert tot["hidden"] == 1 and tot["bal"] == 450 and tot["sold"] == 50
+    rows_all, _t = bot.product_moves_rows(bish["id"], 16)
+    assert "Тыныбек" in " ".join(r[2] for r in rows_all)
+    # /check только в личке
+    asyncio.run(bot.check_cmd(upd(ADMIN, -4343, "supergroup"), SimpleNamespace(args=[])))
+    assert "в личке" in replies[-1][0]
+    replies.clear()
+
+    # 5. «15 уп» после скана товара без пачек — не падает, пишется как штуки
+    bot.chat_histories.clear(); bot.QR_SCANS.clear()
+    asyncio.run(bot.start(upd(ADMIN), SimpleNamespace(args=["105-20261111C"])))
+    it, how = bot.qr_set_last_qty(ADMIN, "15 уп")
+    assert it["pieces"] == 15 and how == "15 шт"
+    # след сканов в истории не режется окном HISTORY_MSG_MAX
+    bot.chat_histories[ADMIN][0]["content"] = bot.QR_SCAN_MARK + " x" * 900 + "]"
+    bot.chat_histories[ADMIN].append({"role": "user", "content": "Асан"})
+    h = bot._request_history(ADMIN)
+    assert h[0]["content"].startswith(bot.QR_SCAN_MARK) and "обрезано" not in h[0]["content"]
+    assert len(h[0]["content"]) > bot.HISTORY_MSG_MAX
+    bot.chat_histories.clear(); bot.QR_SCANS.clear()
+
+    # 6. Вопрос о партии при перемещении двумя строками: явный срок первой
+    #    строки занимает партию — второй строке эта партия не предлагается
+    _load(wh, {16: 90}, {(wh["id"], 16): [("11.2028", 50), ("06.2029", 40)]})
+    p = {"kind": "transfer", "user_id": ADMIN, "chat_id": ADMIN, "wh_id": kb["id"],
+         "wh_name": kb["name"], "from_wh_id": wh["id"], "from_wh_name": wh["name"],
+         "items": [dict(_item(16, 40, 0), expiry="06.2029"), _item(16, 30, 0)]}
+    assert bot._reserved_batches(p, 1) == {16: {"06.2029": 40}}
+    opts = bot._batch_options(p, 16, 30, bot._reserved_batches(p, 1)[16])
+    assert [(b["expiry"], b["qty"]) for b in opts] == [("11.2028", 50)], opts
+
+    # 7. «описание …» в обычной речи — не перехватывается (уходит в ИИ)
+    assert asyncio.run(bot.desc_text_reply(
+        upd(ADMIN), db.get_user(ADMIN), "описание товара хорошее, Асан приход 5000")) is False
+    assert asyncio.run(bot.desc_text_reply(
+        upd(ADMIN), db.get_user(ADMIN), "описание Пупкинол: текст")) is True
+    replies.clear()
+
+    # 8. /sales «Докцилин 50» — фасовка, а не клиент «50»
+    assert bot._parse_sales_query("Докцилин 50")[1] == [105]
+    assert bot._parse_sales_query("Оксилин 10 мл")[1] == [91]
+    assert bot._parse_sales_query("Докцилин 50 Асан")[2] == "Асан"
+    assert bot._parse_sales_query("Топ")[1] is None            # несколько имён — не гадаем
+    # /where при двусмысленном препарате подсказывает
+    asyncio.run(bot.where_cmd(upd(ADMIN), SimpleNamespace(args=["Цефном"])))
+    assert "Возможно" in replies[-1][0] and "ЦЕФНОМ LC" in replies[-1][0]
+    replies.clear()
+    # опечатка в коротком имени с числовым хвостом
+    assert prices.match_product("Паробак", "1 кг")["id"] == 107
+    assert prices.match_product("Докцелин", "50 мл")["id"] == 105
+    assert prices.match_product("Цефнон", "100 мл") is None   # двусмысленно
+
+    # 9. Прозвище-начало имени сотрудника: «Аза» → Азамат; клиентов не трогает
+    assert bot._employee_traceable("Аза сдал кассу 5000", "Азамат")
+    assert bot._employee_in_text("Аза сдал кассу 5000")["id"] == AZAMAT
+    assert not bot._employee_traceable("Ден Каракол 41500", "Данияр")
+    assert not bot._name_traceable("Ден Каракол 41500", "Данияр Алышбаев")
+
+    # 10. Возврат двумя строками одного товара сверяется по сумме
+    if db.client_exact(wh["id"], "Вика Уманец") is None:
+        db.clients_add_bulk(wh["id"], [("Вика Уманец", 0)])
+    cid = db.client_exact(wh["id"], "Вика Уманец")["id"]
+    _invoice(wh, DANIYAR, "Вика Уманец", [_item(16, 15, 180)], client_id=cid)
+    rp = {"kind": "return", "user_id": DANIYAR, "chat_id": DANIYAR, "wh_id": wh["id"],
+          "wh_name": wh["name"], "client_id": cid, "client_name": "Вика Уманец",
+          "items": [_item(16, 8, 180), _item(16, 8, 180)]}
+    refusal, _w = bot._return_purchase_check(db.get_user(DANIYAR), rp)
+    assert refusal and "в возврате 16" in refusal, refusal
+    refusal_g, _w = bot._return_purchase_check(db.get_user(DANIYAR), rp, in_group=True)
+    assert refusal_g and "куплено 15" not in refusal_g and "столько не покупал" in refusal_g
+    rp["items"] = [_item(16, 8, 180), _item(16, 7, 180)]
+    assert bot._return_purchase_check(db.get_user(DANIYAR), rp)[0] is None
+    # строка «куплено» стоит ПОД своей позицией
+    card = bot.return_summary(rp)
+    lines = card.split("\n")
+    i1 = next(i for i, l in enumerate(lines) if l.startswith("1. "))
+    assert "куплено:" in lines[i1 + 1], lines
+
+    # 11. Защита от подмены товара: «Альтопер» — чужое слово, не опечатка
+    items, w = bot.parse_items([{"name": "АЛЬТОПЕН-ФОРТЕ", "volume": "100 мл",
+                                 "qty": 1, "price": 1}], src_text="Альтопер 100 мл 2 к")
+    assert items[0]["name"].startswith("АЛЬТОПЕР") and w
+    items, w = bot.parse_items([{"name": "АЛЬТОПЕН-ФОРТЕ", "volume": "100 мл",
+                                 "qty": 1, "price": 1}], src_text="Альтапен форте 100 мл")
+    assert items[0]["name"].startswith("АЛЬТОПЕН-ФОРТЕ") and not w
+    try:
+        bot.parse_items(["Албенивер"], src_text="")
+        assert False
+    except ValueError as e:
+        assert "построчно" in str(e)
+
+    # 12. /history: сумма дня — по строкам документа (две цены одного товара)
+    from openpyxl import load_workbook
+    import export_xlsx
+    _invoice(wh, ADMIN, "Вика Уманец", [_item(16, 10, 180), _item(16, 5, 170)],
+             client_id=cid)
+    ws = load_workbook(export_xlsx.build_history())["Продажи по дням"]
+    hdr = [c.value for c in ws[1]]
+    rows16 = [r for r in ws.iter_rows(min_row=2, values_only=True)
+              if r[2] == 16 and r[1] == wh["name"]]
+    assert len(rows16) == 1, rows16
+    row = rows16[0]
+    # сегодня по Караколу продано 15 (Данияр, 180) + 10×180 + 5×170
+    assert row[hdr.index("Чистыми")] == 30 and row[-1] == 15 * 180 + 1800 + 850, row
+
+    # 13. Самопроверка не падает на дробной дельте журнала
+    conn.execute("UPDATE stock SET qty=qty-0.5 WHERE warehouse_id=? AND product_id=16",
+                 (wh["id"],))
+    conn.commit()
+    probs = db.integrity_check()
+    assert any("расхождение" in t for _a, _b, t in probs)
+    conn.execute("UPDATE stock SET qty=qty+0.5 WHERE warehouse_id=? AND product_id=16",
+                 (wh["id"],))
+    conn.commit()
+
+    # 14. /buylog с одной фасовкой
+    asyncio.run(bot.buylog_cmd(upd(ADMIN), SimpleNamespace(args=["Паробакт"])))
+    assert "Не нашёл" not in replies[-1][0], replies[-1][0]
+    # 15. «приход 5000» при живом списке сканов — не перехватывается
+    bot.chat_histories.clear(); bot.QR_SCANS.clear()
+    asyncio.run(bot.start(upd(ADMIN), SimpleNamespace(args=["76-K"])))
+    assert asyncio.run(bot.qr_arrival_reply(upd(ADMIN), ctx, db.get_user(ADMIN), "приход 5000")) is False
+    bot.chat_histories.clear(); bot.QR_SCANS.clear(); bot.PENDING.clear()
+    db.set_setting("hidden_debt_whs", json.dumps([]))
 
 
 def main():

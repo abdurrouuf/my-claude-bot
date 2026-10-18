@@ -226,6 +226,19 @@ def _base_name(name: str) -> str:
     return str(name or "").split("(")[0].strip().lower()
 
 
+def _typo_ratio(base: str, short: str) -> float:
+    """Сходство короткого имени с опечаткой. Имя с числовым/латинским
+    хвостом («ПАРОБАКТ 70», «ДОКЦИЛИН 200») сравнивается и целиком, и
+    без хвоста — «Паробак 1 кг», «Докцелин 50 мл» иначе не находились
+    (ревизия 18.10.2026); порог и отрыв от второго кандидата прежние."""
+    r = difflib.SequenceMatcher(None, base, short).ratio()
+    if not re.search(r"\d", base):
+        core = " ".join(w for w in _name_words(short) if re.search(r"[а-яё]", w))
+        if core and core != short:
+            r = max(r, difflib.SequenceMatcher(None, base, core).ratio())
+    return r
+
+
 def _name_words(s: str) -> list:
     """Слова короткого имени, дефис — тоже разделитель: «альтопен-форте» =
     «альтопен форте», «тривитоп» — начало «тривитоп-ad3e»."""
@@ -293,7 +306,7 @@ def match_product(name: str, volume: str):
     scored = []
     if base and vkey:
         scored = sorted(
-            ((difflib.SequenceMatcher(None, base, _base_name(p["name"])).ratio(), p)
+            ((_typo_ratio(base, _base_name(p["name"])), p)
              for p in same_vol), key=lambda x: -x[0])
     # Берём только уверенного и явного лидера: «Клозатоп» не должен
     # превратиться в «Клозатоп-Форте», а «Топмектин» — в «Топмектин гель».
