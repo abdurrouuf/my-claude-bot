@@ -213,10 +213,18 @@ def build_history(training_wh_ids=None) -> io.BytesIO:
             continue
         # продажи: накладная (минус) и возврат (плюс)
         if t in ("invoice", "return"):
-            price_by_pid = {}
+            # Сумма — по строкам документа (qty × цена каждой строки): один
+            # товар двумя строками с разными ценами считался по последней
+            # (ревизия 18.10.2026). Знак — как у штук: накладная +, возврат −.
+            money_by_pid = {}
             for it in data.get("items") or []:
                 if it.get("product_id"):
-                    price_by_pid[it["product_id"]] = float(it.get("price") or 0)
+                    try:
+                        sub = float(it.get("qty") or 0) * float(it.get("price") or 0)
+                    except (TypeError, ValueError):
+                        sub = 0.0
+                    money_by_pid[it["product_id"]] = money_by_pid.get(it["product_id"], 0.0) + sub
+            wh_cnt = len({w for w, _p, _d in deltas})
             for w, p, d in deltas:
                 q = -d if t == "invoice" else -d      # накладная −d>0; возврат d>0 → −d<0
                 mk, dk = _month_key(ts), _day_key(ts)
@@ -229,7 +237,8 @@ def build_history(training_wh_ids=None) -> io.BytesIO:
                     cur[0] += -d
                 else:
                     cur[1] += d
-                money_d[key] = money_d.get(key, 0.0) + q * price_by_pid.get(p, 0.0)
+                sign = 1.0 if t == "invoice" else -1.0
+                money_d[key] = money_d.get(key, 0.0) + sign * money_by_pid.get(p, 0.0) / max(wh_cnt, 1)
         # все движения
         for w, p, d in deltas:
             others = sorted({x for x, _p, _d in data.get("stock_deltas", []) if x != w})
