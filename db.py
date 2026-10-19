@@ -497,6 +497,15 @@ def api_cache_stats(start_iso: str):
     return row[0], row[1], row[2]
 
 
+def api_output_tokens(start_iso: str) -> int:
+    """Сумма выходных токенов (ответ + размышление модели) с даты — /api
+    показывает её, чтобы был виден эффект усилия ИИ (19.10.2026)."""
+    row = connect().execute(
+        "SELECT COALESCE(SUM(output_tokens), 0) FROM api_usage WHERE ts >= ?",
+        (start_iso,)).fetchone()
+    return int(row[0] or 0)
+
+
 def seed_products(seed: list):
     """Первое заполнение прайса из кода; дальше прайс живёт в базе."""
     conn = connect()

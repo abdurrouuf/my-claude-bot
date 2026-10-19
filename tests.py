@@ -5073,6 +5073,109 @@ def test_revision_181026():
     db.set_setting("hidden_debt_whs", json.dumps([]))
 
 
+def test_catchup_and_effort():
+    """19.10.2026 («делай» владельца, пункты 1–2 после ревизии): (1) догон
+    пропущенных рассылок — бот, перезапущенный после времени рассылки,
+    шлёт её сразу, если за сегодня она ещё не заявлена; второй экземпляр
+    и повторный старт дубля не дают; будущее время — ждёт; (2) усилие ИИ
+    (output_config.effort) передаётся в API, а при отказе API параметр
+    отключается и запрос повторяется без него."""
+    import asyncio
+    from types import SimpleNamespace
+    _fresh_db()
+    calls = []
+
+    async def fn(app):
+        calls.append(app)
+
+    async def run_once(hour, minute, key="t_job", window=None):
+        task = asyncio.ensure_future(bot._daily_loop(
+            None, "тест", key, hour, minute, fn, catchup_hours=window))
+        await asyncio.sleep(0.05)          # догон происходит до первого сна
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    now = datetime.now(bot.BISHKEK)
+    past = now - timedelta(hours=1)
+    # 1а. время прошло час назад, заявки нет — догон
+    asyncio.run(run_once(past.hour, past.minute))
+    assert len(calls) == 1
+    # 1б. повторный старт — заявка за сегодня уже есть, дубля нет
+    asyncio.run(run_once(past.hour, past.minute))
+    assert len(calls) == 1
+    # 1в. время в будущем — ждём, не догоняем
+    fut = now + timedelta(hours=1)
+    if fut.date() == now.date():
+        asyncio.run(run_once(fut.hour, fut.minute, key="t_future"))
+        assert len(calls) == 1
+    # 1г. прошло больше окна догона — не шлём (чтобы ночной деплой не
+    #     рассылал вчерашние вечерние сводки)
+    old = now - timedelta(hours=3)
+    if old.date() == now.date():
+        asyncio.run(run_once(old.hour, old.minute, key="t_old", window=2))
+        assert len(calls) == 1
+        asyncio.run(run_once(old.hour, old.minute, key="t_old2", window=24))
+        assert len(calls) == 2
+    # 2. усилие ИИ
+    seen = []
+
+    class FakeMessages:
+        def __init__(self, reject):
+            self.reject = reject
+
+        async def create(self, **kw):
+            seen.append(kw)
+            if self.reject and "extra_body" in kw:
+                e = Exception("output_config: Extra inputs are not permitted")
+                e.status_code = 400
+                raise e
+            return "resp"
+
+    real = bot.anthropic_client
+    try:
+        bot._EFFORT_OFF["reason"] = ""
+        bot.anthropic_client = SimpleNamespace(messages=FakeMessages(reject=False))
+        assert bot.CLAUDE_EFFORT in ("low", "medium", "high")
+        assert asyncio.run(bot._claude_create(model="m", max_tokens=1, messages=[])) == "resp"
+        assert seen[-1]["extra_body"] == {"output_config": {"effort": bot.CLAUDE_EFFORT}}
+        # API отверг параметр — повтор без него, дальше не передаём
+        seen.clear()
+        bot.anthropic_client = SimpleNamespace(messages=FakeMessages(reject=True))
+        assert asyncio.run(bot._claude_create(model="m", max_tokens=1, messages=[])) == "resp"
+        assert len(seen) == 2 and "extra_body" in seen[0] and "extra_body" not in seen[1]
+        assert bot._EFFORT_OFF["reason"]
+        seen.clear()
+        assert asyncio.run(bot._claude_create(model="m", max_tokens=1, messages=[])) == "resp"
+        assert len(seen) == 1 and "extra_body" not in seen[0]
+        # другая ошибка 400 — пробрасывается как раньше
+        bot._EFFORT_OFF["reason"] = ""
+
+        class Boom:
+            async def create(self, **kw):
+                e = Exception("invalid model")
+                e.status_code = 400
+                raise e
+        bot.anthropic_client = SimpleNamespace(messages=Boom())
+        try:
+            asyncio.run(bot._claude_create(model="m", max_tokens=1, messages=[]))
+            assert False
+        except Exception as e:
+            assert "invalid model" in str(e)
+    finally:
+        bot.anthropic_client = real
+        bot._EFFORT_OFF["reason"] = ""
+    # /api показывает усилие и выходные токены
+    db.record_api_usage("claude-sonnet-5", 100, 250, 0, 0, 0.003)
+    replies = []
+    upd = SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                          effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                          message=SimpleNamespace(reply_text=_areply(replies)))
+    asyncio.run(bot.api_cmd(upd, SimpleNamespace(args=[])))
+    assert "усилие ИИ" in replies[-1] and "Выходных токенов" in replies[-1], replies[-1]
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
