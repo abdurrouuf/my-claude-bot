@@ -1292,11 +1292,14 @@ def _product_by_text(product: dict, volume: str, src_text: str):
         return None
     if not any(len(w) >= 4 for w in present):
         # Ни одного слова товара в тексте нет («Альтопер 100 мл» → модель
-        # отдала АЛЬТОПЕН-ФОРТЕ): ищем по словам текста, которые сами —
-        # слова прайса; несколько товаров в тексте в один не склеятся
-        # (match_product на такой склейке даст None).
+        # отдала АЛЬТОПЕН-ФОРТЕ): ищем по словам текста, ПОХОЖИМ на слово
+        # модели (≥0.6). Инцидент 19.10.2026: «Албтопеер 100 мл» в заказе
+        # из двух строк — брались ЛЮБЫЕ слова прайса из текста, и
+        # «Празимектоп» из первой строки подменил вторую позицию.
         present = [tw for tw in text_words
-                   if len(tw) >= 4 and tw in _other_product_words("")]
+                   if len(tw) >= 4 and any(
+                       difflib.SequenceMatcher(None, tw, w).ratio() >= 0.6
+                       for w in missing)]
         if not present:
             return None
     alt = prices.match_product(" ".join(present), volume)

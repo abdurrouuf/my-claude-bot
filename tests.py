@@ -5032,6 +5032,15 @@ def test_revision_181026():
     items, w = bot.parse_items([{"name": "АЛЬТОПЕН-ФОРТЕ", "volume": "100 мл",
                                  "qty": 1, "price": 1}], src_text="Альтапен форте 100 мл")
     assert items[0]["name"].startswith("АЛЬТОПЕН-ФОРТЕ") and not w
+    # Инцидент 19.10.2026: опечатка «Албтопеер» в заказе из двух строк —
+    # слово ДРУГОЙ строки («Празимектоп») не должно подменять позицию
+    txt = "Черновик\n\nАзамат байке\n\nПразимектоп 1 л - 2 к\nАлбтопеер 100 мл - 2 шт"
+    items, w = bot.parse_items([{"name": "АЛЬТОПЕР", "volume": "100 мл", "qty": 2, "price": 0}],
+                               src_text=txt)
+    assert items[0]["name"].startswith("АЛЬТОПЕР") and not w, (items, w)
+    items, w = bot.parse_items([{"name": "АЛЬТОПЕН", "volume": "100 мл", "qty": 2, "price": 0}],
+                               src_text=txt)
+    assert not items[0]["name"].startswith("ПРАЗИМЕКТОП"), items
     try:
         bot.parse_items(["Албенивер"], src_text="")
         assert False
