@@ -1146,6 +1146,41 @@ def extract_action(reply: str):
     return obj
 
 
+# Усилие ИИ (19.10.2026, «делай» владельца, экономия): у Sonnet 5
+# «размышление» включено по умолчанию и оплачивается как выходные токены.
+# Разбор короткой операции — простая задача, output_config.effort
+# снижает число токенов на размышление. CLAUDE_EFFORT: low | medium |
+# high (пусто — не передавать). Если API отвергнет параметр (старая
+# модель/прокси), бот один раз повторит запрос без него и дальше работает
+# как раньше (_EFFORT_OFF).
+CLAUDE_EFFORT = os.environ.get("CLAUDE_EFFORT", "medium").strip().lower()
+if CLAUDE_EFFORT not in ("", "low", "medium", "high"):
+    CLAUDE_EFFORT = "medium"
+_EFFORT_OFF = {"reason": ""}
+
+
+def _effort_kwargs() -> dict:
+    if not CLAUDE_EFFORT or _EFFORT_OFF["reason"]:
+        return {}
+    return {"extra_body": {"output_config": {"effort": CLAUDE_EFFORT}}}
+
+
+async def _claude_create(**kw):
+    """messages.create с усилием ИИ; непринятый параметр — повтор без него."""
+    extra = _effort_kwargs()
+    try:
+        return await anthropic_client.messages.create(**kw, **extra)
+    except Exception as e:
+        msg = str(e)
+        if extra and ("output_config" in msg or "effort" in msg) \
+                and getattr(e, "status_code", 400) == 400:
+            _EFFORT_OFF["reason"] = msg[:200]
+            log.warning("API не принял усилие ИИ (%s) — дальше без него: %s",
+                        CLAUDE_EFFORT, msg[:200])
+            return await anthropic_client.messages.create(**kw)
+        raise
+
+
 # Цены Anthropic, $ за миллион токенов: (вход, выход).
 # Кэш: чтение = 10% от входа, запись часового кэша = 200% от входа.
 MODEL_PRICES_USD = {
@@ -1213,7 +1248,7 @@ async def _await_with_notice(coro, update, quiet=False):
 
 
 async def ask_claude(history: list, actor, draft=False) -> str:
-    resp = await anthropic_client.messages.create(
+    resp = await _claude_create(
         model=CLAUDE_MODEL,
         max_tokens=CLAUDE_MAX_TOKENS,
         system=system_blocks(actor, draft=draft),
@@ -4240,44 +4275,80 @@ async def promises_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 PROMISE_HOUR = int(os.environ.get("PROMISE_HOUR", "9"))
 
 
-async def promise_reminder_loop(app):
-    """Каждое утро: кому сегодня обещали заплатить (и что просрочено)."""
+# Догон пропущенных рассылок (19.10.2026, «делай» владельца): если бот был
+# в перезапуске ровно в момент рассылки (деплой в 20:00 — вечерняя сводка
+# пропадала на день), при старте каждый цикл смотрит: сегодняшнее время
+# уже прошло, прошло не больше CATCHUP_HOURS, и задача за сегодня ещё не
+# заявлена в job_log (claim_daily_job) — тогда шлёт сразу. Второй
+# экземпляр бота при перекрытии деплоев заявку не получит — дубля нет.
+CATCHUP_HOURS = float(os.environ.get("CATCHUP_HOURS", "6"))
+
+
+async def _daily_loop(app, label: str, key_prefix: str, hour: int, minute: int,
+                      fn, catchup_hours: float = None):
+    """Ежедневная задача в hour:minute по Бишкеку с догоном после
+    перезапуска. fn(app) — тело рассылки; ключ job_log —
+    «key_prefix:ГГГГ-ММ-ДД» (как раньше, старые заявки совместимы)."""
+    window = CATCHUP_HOURS if catchup_hours is None else catchup_hours
+    first = True
     while True:
         now = datetime.now(BISHKEK)
-        target = now.replace(hour=PROMISE_HOUR, minute=0, second=0, microsecond=0)
+        target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+        if first and target <= now and (now - target) <= timedelta(hours=window):
+            first = False
+            try:
+                if db.claim_daily_job(f"{key_prefix}:{now.date().isoformat()}"):
+                    log.info("Догон пропущенной рассылки: %s (%s, план был %s)",
+                             label, key_prefix, target.strftime("%H:%M"))
+                    await fn(app)
+            except Exception:
+                log.exception("Ошибка догона: %s", label)
+        first = False
         if target <= now:
             target += timedelta(days=1)
         await asyncio.sleep((target - now).total_seconds())
         try:
-            today = datetime.now(BISHKEK).date()
-            if not db.claim_daily_job(f"promises:{today.isoformat()}"):
-                continue  # другой экземпляр бота (перекрытие деплоя) уже шлёт
-            rows = db.promises_due(today.isoformat())
-            if not rows:
+            if not db.claim_daily_job(
+                    f"{key_prefix}:{datetime.now(BISHKEK).date().isoformat()}"):
                 continue
-            header = f"📅 <b>Обещания оплаты на {today.strftime('%d.%m.%Y')}</b>"
-            tail = "\nКогда клиент заплатит: «Асан выполнил обещание»"
-            # Админу — всё, каждому сотруднику — записанные им
-            text = "\n".join([header, ""] +
-                             [_promise_line(r, today, with_author=True) for r in rows] + [tail])
-            try:
-                await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
-            except Exception:
-                # Сбой отправки админу не должен срывать рассылку сотрудникам
-                log.warning("Не удалось отправить напоминание об обещаниях админу")
-            by_author = {}
-            for r in rows:
-                if r["user_id"] != ADMIN_ID:
-                    by_author.setdefault(r["user_id"], []).append(r)
-            for uid, items in by_author.items():
-                text = "\n".join([header, ""] +
-                                 [_promise_line(r, today) for r in items] + [tail])
-                try:
-                    await app.bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
-                except Exception:
-                    log.warning("Не удалось отправить напоминание об обещаниях %s", uid)
+            await fn(app)
         except Exception:
-            log.exception("Ошибка напоминания об обещаниях")
+            log.exception("Ошибка: %s", label)
+
+
+async def send_promise_reminders(app):
+    """Утро: кому сегодня обещали заплатить (и что просрочено)."""
+    today = datetime.now(BISHKEK).date()
+    rows = db.promises_due(today.isoformat())
+    if not rows:
+        return
+    header = f"📅 <b>Обещания оплаты на {today.strftime('%d.%m.%Y')}</b>"
+    tail = "\nКогда клиент заплатит: «Асан выполнил обещание»"
+    # Админу — всё, каждому сотруднику — записанные им
+    text = "\n".join([header, ""] +
+                     [_promise_line(r, today, with_author=True) for r in rows] + [tail])
+    try:
+        await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+    except Exception:
+        # Сбой отправки админу не должен срывать рассылку сотрудникам
+        log.warning("Не удалось отправить напоминание об обещаниях админу")
+    by_author = {}
+    for r in rows:
+        if r["user_id"] != ADMIN_ID:
+            by_author.setdefault(r["user_id"], []).append(r)
+    for uid, items in by_author.items():
+        text = "\n".join([header, ""] +
+                         [_promise_line(r, today) for r in items] + [tail])
+        try:
+            await app.bot.send_message(chat_id=uid, text=text, parse_mode="HTML")
+        except Exception:
+            log.warning("Не удалось отправить напоминание об обещаниях %s", uid)
+
+
+async def promise_reminder_loop(app):
+    """Каждое утро в PROMISE_HOUR (с догоном после перезапуска)."""
+    await _daily_loop(app, "напоминание об обещаниях", "promises",
+                      PROMISE_HOUR, 0, send_promise_reminders)
 
 
 async def start_rename_client(update, context, actor, data):
@@ -7684,7 +7755,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # История с обрезкой старых сообщений и гарантией «первым — user»
     messages = _request_history(chat_id) + [{"role": "user", "content": content}]
     try:
-        resp = await _await_with_notice(anthropic_client.messages.create(
+        resp = await _await_with_notice(_claude_create(
             model=CLAUDE_MODEL, max_tokens=CLAUDE_MAX_TOKENS,
             system=system_blocks(actor, draft=draft), messages=messages),
             update)
@@ -10032,23 +10103,16 @@ def build_draft_summary(last_hours: int = None) -> str | None:
     return "\n".join(lines)
 
 
+async def send_draft_summary(app):
+    text = build_draft_summary(last_hours=24)
+    if text:
+        await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
+
+
 async def draft_summary_loop(app):
     """Каждый вечер в DRAFT_SUMMARY_HOUR — сводка по черновикам админу в личку."""
-    while True:
-        now = datetime.now(BISHKEK)
-        target = now.replace(hour=DRAFT_SUMMARY_HOUR, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            if not db.claim_daily_job(
-                    f"drafts:{datetime.now(BISHKEK).date().isoformat()}"):
-                continue
-            text = build_draft_summary(last_hours=24)
-            if text:
-                await app.bot.send_message(chat_id=ADMIN_ID, text=text, parse_mode="HTML")
-        except Exception:
-            log.exception("Ошибка сводки по черновикам")
+    await _daily_loop(app, "сводка черновиков", "drafts", DRAFT_SUMMARY_HOUR, 0,
+                      send_draft_summary)
 
 
 async def pricelog_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -10116,20 +10180,10 @@ async def send_cash_alert(bot):
 
 
 async def cash_alert_loop(app):
-    while True:
-        now = datetime.now(BISHKEK)
-        target = (now.replace(hour=SUMMARY_HOUR, minute=0, second=0,
-                              microsecond=0) - timedelta(minutes=10))
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            if not db.claim_daily_job(
-                    f"cash_alert:{datetime.now(BISHKEK).date().isoformat()}"):
-                continue
-            await send_cash_alert(app.bot)
-        except Exception:
-            log.exception("Ошибка напоминания о кассах")
+    """За 10 минут до вечерней сводки — несданные кассы админу."""
+    t = (datetime(2000, 1, 1, SUMMARY_HOUR, 0) - timedelta(minutes=10))
+    await _daily_loop(app, "напоминание о кассах", "cash_alert", t.hour, t.minute,
+                      lambda a: send_cash_alert(a.bot))
 
 
 API_ALERT_USD = float(os.environ.get("API_ALERT_USD", "3"))
@@ -10168,35 +10222,15 @@ async def send_api_balance_alert(bot) -> bool:
 
 
 async def api_balance_alert_loop(app):
-    while True:
-        now = datetime.now(BISHKEK)
-        target = now.replace(hour=9, minute=5, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            if not db.claim_daily_job(
-                    f"api_alert:{datetime.now(BISHKEK).date().isoformat()}"):
-                continue
-            await send_api_balance_alert(app.bot)
-        except Exception:
-            log.exception("Ошибка тревоги о балансе API")
+    await _daily_loop(app, "тревога о балансе API", "api_alert", 9, 5,
+                      lambda a: send_api_balance_alert(a.bot))
 
 
 async def evening_summary_loop(app):
-    while True:
-        now = datetime.now(BISHKEK)
-        target = now.replace(hour=SUMMARY_HOUR, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            if not db.claim_daily_job(
-                    f"evening:{datetime.now(BISHKEK).date().isoformat()}"):
-                continue
-            await send_evening_summaries(app.bot)
-        except Exception:
-            log.exception("Ошибка вечерней сводки")
+    """Вечерняя сводка складов в SUMMARY_HOUR (с догоном после перезапуска:
+    деплой ровно в 20:00 раньше оставлял чаты без «Итогов дня»)."""
+    await _daily_loop(app, "вечерняя сводка", "evening", SUMMARY_HOUR, 0,
+                      lambda a: send_evening_summaries(a.bot))
 
 
 def find_client_visible(actor, name: str):
@@ -10758,7 +10792,9 @@ async def _forecast_report(update, whs, horizon=None, actor=None, others=None):
 
 
 async def monthly_deadstock_loop(app):
-    """Первого числа каждого месяца в 09:00 — отчёт админу."""
+    """Первого числа каждого месяца в 09:00 — отчёт админу (с догоном
+    после перезапуска в пределах CATCHUP_HOURS)."""
+    first = True
     while True:
         now = datetime.now(BISHKEK)
         if now.month == 12:
@@ -10770,7 +10806,13 @@ async def monthly_deadstock_loop(app):
         first_this = now.replace(day=1, hour=9, minute=0, second=0, microsecond=0)
         if first_this > now:
             target = first_this
-        await asyncio.sleep((target - now).total_seconds())
+        catchup = first and first_this <= now \
+            and (now - first_this) <= timedelta(hours=CATCHUP_HOURS)
+        first = False
+        if catchup:
+            log.info("Догон месячных отчётов после перезапуска")
+        else:
+            await asyncio.sleep((target - now).total_seconds())
         stamp = datetime.now(BISHKEK).strftime("%Y-%m")
         try:
             if db.claim_daily_job(f"deadstock:{stamp}"):
@@ -11936,21 +11978,10 @@ async def send_integrity_alert(bot) -> bool:
 
 async def integrity_loop(app):
     """Каждую ночь после бэкапа — сверка учёта, тревога только при
-    расхождениях (25.09.2026)."""
-    while True:
-        now = datetime.now(BISHKEK)
-        target = now.replace(hour=INTEGRITY_HOUR, minute=INTEGRITY_MINUTE,
-                             second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            if not db.claim_daily_job(
-                    f"integrity:{datetime.now(BISHKEK).date().isoformat()}"):
-                continue
-            await send_integrity_alert(app.bot)
-        except Exception:
-            log.exception("Ошибка самопроверки учёта")
+    расхождениях (25.09.2026). Догон — в любое время того же дня."""
+    await _daily_loop(app, "самопроверка учёта", "integrity", INTEGRITY_HOUR,
+                      INTEGRITY_MINUTE, lambda a: send_integrity_alert(a.bot),
+                      catchup_hours=24)
 
 
 async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -11969,21 +12000,15 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_long(update.message, text)
 
 
+async def _backup_job(app):
+    await send_backup(app.bot)
+    db.pending_cleanup(time.time())   # протухшие снимки заявок
+
+
 async def daily_backup_loop(app):
-    while True:
-        now = datetime.now(BISHKEK)
-        target = now.replace(hour=BACKUP_HOUR, minute=0, second=0, microsecond=0)
-        if target <= now:
-            target += timedelta(days=1)
-        await asyncio.sleep((target - now).total_seconds())
-        try:
-            if not db.claim_daily_job(
-                    f"backup:{datetime.now(BISHKEK).date().isoformat()}"):
-                continue
-            await send_backup(app.bot)
-            db.pending_cleanup(time.time())   # протухшие снимки заявок
-        except Exception:
-            log.exception("Ошибка ежедневного бэкапа")
+    """Ежедневный бэкап базы админу (догон — в любое время того же дня)."""
+    await _daily_loop(app, "ежедневный бэкап", "backup", BACKUP_HOUR, 0,
+                      _backup_job, catchup_hours=24)
 
 
 EXPORT_PERIODS = {
@@ -12776,8 +12801,17 @@ async def api_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "🤖 <b>Расходы на API Anthropic</b>",
         f"Сегодня: <b>${spent_today:.2f}</b> ({n_today} запросов)",
         f"За 30 дней: <b>${spent_month:.2f}</b> ({n_month} запросов)",
-        f"Модель: {esc(CLAUDE_MODEL)}",
+        f"Модель: {esc(CLAUDE_MODEL)}"
+        + (f" · усилие ИИ: {CLAUDE_EFFORT}" if CLAUDE_EFFORT else "")
+        + (" (⚠️ API не принял — работает без него)" if _EFFORT_OFF["reason"] else ""),
     ]
+    # Выходные токены (ответ + размышление) — чтобы видеть эффект усилия ИИ
+    out_tok = db.api_output_tokens((today - timedelta(days=29)).isoformat(timespec="seconds"))
+    if n_month:
+        p_out = MODEL_PRICES_USD.get(CLAUDE_MODEL, (3.0, 15.0))[1]
+        lines.append(f"✍️ Выходных токенов за 30 дней: {fmt_num(out_tok)} "
+                     f"(≈${out_tok * p_out / 1_000_000:.2f}, в среднем "
+                     f"{out_tok // max(n_month, 1)} на запрос)")
     # Здоровье кэша промпта: правила и прайс должны идти по скидке 90%.
     # Если доля кэша упала — какое-то обновление сломало кэширование, и
     # каждый запрос платит полную цену; это видно здесь без разработчика.
@@ -12881,15 +12915,23 @@ async def dbinfo_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def weekly_debt_loop(app):
-    """Каждый понедельник в 10:00 по Бишкеку."""
+    """Каждый понедельник в 10:00 по Бишкеку (с догоном после перезапуска
+    в пределах CATCHUP_HOURS — заявки claim_daily_job дубля не дадут)."""
+    first = True
     while True:
         now = datetime.now(BISHKEK)
         days_ahead = (0 - now.weekday()) % 7
         target = (now + timedelta(days=days_ahead)).replace(
             hour=10, minute=0, second=0, microsecond=0)
+        catchup = first and target <= now \
+            and (now - target) <= timedelta(hours=CATCHUP_HOURS)
+        first = False
         if target <= now:
             target += timedelta(days=7)
-        await asyncio.sleep((target - now).total_seconds())
+        if catchup:
+            log.info("Догон понедельничных рассылок после перезапуска")
+        else:
+            await asyncio.sleep((target - now).total_seconds())
         today = datetime.now(BISHKEK).date().isoformat()
         try:
             if db.claim_daily_job(f"debts:{today}"):
