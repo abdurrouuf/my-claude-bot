@@ -1664,9 +1664,11 @@ def cash_movements_since_zero(user_id: int, cap: int = 100):
 
 
 def client_operations(cid: int):
-    """Все проведённые операции клиента по порядку."""
+    """Все проведённые операции клиента по порядку (день отгрузки, где
+    задан, затем № операции)."""
     return connect().execute(
-        "SELECT * FROM operations WHERE client_id=? AND status='done' ORDER BY id",
+        f"SELECT *, {EFF_TS_SQL} AS eff_ts FROM operations "
+        f"WHERE client_id=? AND status='done' ORDER BY {EFF_TS_SQL}, id",
         (cid,),
     ).fetchall()
 
@@ -1705,7 +1707,7 @@ def debt_growth(since_iso: str) -> dict:
     """
     out = {}
     for r in connect().execute(
-            "SELECT data FROM operations WHERE status='done' AND ts >= ?",
+            f"SELECT data FROM operations WHERE status='done' AND {EFF_TS_SQL} >= ?",
             (since_iso,)):
         try:
             deltas = json.loads(r["data"]).get("debt_deltas") or []
@@ -1731,10 +1733,12 @@ def product_sales(pids, wh_ids, client_ids=None):
     pidset, whset = set(pids), set(wh_ids)
     for op in connect().execute(
             "SELECT o.id, o.ts, o.type, o.warehouse_id, o.client_id, o.data, "
-            "c.name AS client_name FROM operations o "
+            "c.name AS client_name, "
+            + EFF_TS_SQL.replace("data", "o.data").replace(", ts)", ", o.ts)")
+            + " AS eff_ts FROM operations o "
             "LEFT JOIN clients c ON c.id = o.client_id "
             "WHERE o.status='done' AND o.type IN ('invoice','return') "
-            "ORDER BY o.ts DESC, o.id DESC"):
+            "ORDER BY eff_ts DESC, o.id DESC"):
         if op["warehouse_id"] not in whset:
             continue
         if client_ids is not None and op["client_id"] not in client_ids:
@@ -2114,21 +2118,74 @@ def last_invoice_for_client(client_id: int):
         "AND client_id=? ORDER BY id DESC LIMIT 1", (client_id,)).fetchone()
 
 
+# Дата отгрузки (21.10.2026, «делай» владельца): накладную могут выписать
+# позже, чем уехал товар. data.ship_date = «ГГГГ-ММ-ДД». Для отчётов по
+# датам (/report, /sales, /margin, /history, акт сверки) операция считается
+# в день отгрузки — eff_ts; журнал (ts, порядок id), остатки, долг и касса
+# живут по моменту проведения. ship_date без времени → полдень по Бишкеку,
+# чтобы сравнения со строками ISO работали.
+EFF_TS_SQL = ("COALESCE(CASE WHEN json_valid(data) THEN "
+              "json_extract(data, '$.ship_date') END || 'T12:00:00+06:00', ts)")
+
+
+def op_ts(op) -> str:
+    """Дата операции для отчётов: день отгрузки, если задан, иначе ts."""
+    try:
+        if "eff_ts" in op.keys() and op["eff_ts"]:
+            return op["eff_ts"]
+    except AttributeError:
+        pass
+    return op["ts"]
+
+
+def op_ship_date(op):
+    """«ГГГГ-ММ-ДД» из data.ship_date или None."""
+    try:
+        return (json.loads(op["data"]) or {}).get("ship_date") or None
+    except (ValueError, TypeError):
+        return None
+
+
+def op_set_ship_date(op_id: int, ship_date):
+    """Записать/снять дату отгрузки у проведённой накладной. Возвращает
+    строку операции или None (нет/не накладная/отменена)."""
+    conn = connect()
+    with _lock, conn:
+        op = conn.execute("SELECT * FROM operations WHERE id=?", (op_id,)).fetchone()
+        if op is None or op["type"] != "invoice" or op["status"] != "done":
+            return None
+        try:
+            data = json.loads(op["data"]) or {}
+        except (ValueError, TypeError):
+            data = {}
+        if ship_date:
+            data["ship_date"] = ship_date
+        else:
+            data.pop("ship_date", None)
+        conn.execute("UPDATE operations SET data=? WHERE id=?",
+                     (json.dumps(data, ensure_ascii=False), op_id))
+    return conn.execute("SELECT * FROM operations WHERE id=?", (op_id,)).fetchone()
+
+
 def operations_since(start_iso: str, end_iso: str = None):
     """Проведённые операции начиная с даты (ISO), по возрастанию;
-    end_iso — необязательная правая граница (не включается)."""
-    q = "SELECT * FROM operations WHERE status='done' AND ts >= ?"
+    end_iso — необязательная правая граница (не включается). Накладная с
+    датой отгрузки попадает в период по дню ОТГРУЗКИ (eff_ts)."""
+    q = (f"SELECT *, {EFF_TS_SQL} AS eff_ts FROM operations "
+         f"WHERE status='done' AND {EFF_TS_SQL} >= ?")
     params = [start_iso]
     if end_iso:
-        q += " AND ts < ?"
+        q += f" AND {EFF_TS_SQL} < ?"
         params.append(end_iso)
     return connect().execute(q + " ORDER BY id", params).fetchall()
 
 
 def operations_all_since(start_iso: str):
-    """Все операции (включая отменённые) начиная с даты, по возрастанию."""
+    """Все операции (включая отменённые) начиная с даты, по возрастанию
+    (по дню отгрузки, где он задан)."""
     return connect().execute(
-        "SELECT * FROM operations WHERE ts >= ? ORDER BY id", (start_iso,)
+        f"SELECT *, {EFF_TS_SQL} AS eff_ts FROM operations "
+        f"WHERE {EFF_TS_SQL} >= ? ORDER BY id", (start_iso,)
     ).fetchall()
 
 
