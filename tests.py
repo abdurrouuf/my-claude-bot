@@ -5300,6 +5300,98 @@ def test_ship_date():
     bot.PENDING.clear()
 
 
+def test_fix_expiry_batch():
+    """22.10.2026, «могу оптом все прислать?» владельца после 17 призраков
+    Бишкека: несколько строк «исправь срок …» одним сообщением (личка,
+    админ) → одна карточка, одна кнопка, по операции журнала на строку.
+    Одна строка — по-прежнему через ИИ; кривая строка — весь список не
+    принимается; сотруднику — отказ."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()                                   # Каракол
+    dst = db.warehouse_by_name("Кара-Балта")
+    _load(wh, {16: 100, 10: 50, 22: 101},
+          {(wh["id"], 16): [("06.2029", 100)], (wh["id"], 10): [("06.2029", 50)],
+           (wh["id"], 22): [("", 1), ("06.2029", 100)]})
+    # два призрака — перемещения с ошибочным сроком (как инцидент 22.08)
+    for pid, qty in ((16, 30), (10, 5)):
+        pr = prices.BY_ID[pid]
+        p = {"kind": "transfer", "user_id": ADMIN, "chat_id": 1,
+             "wh_id": dst["id"], "wh_name": dst["name"],
+             "from_wh_id": wh["id"], "from_wh_name": wh["name"],
+             "items": [{"name": pr["name"], "volume": pr["volume"], "qty": qty,
+                        "box_qty": None, "product_id": pid, "expiry": "06.2028"}],
+             "warnings": []}
+        bot._fill_src_batches(p)
+        bot.commit_transfer(p)
+    # минус «без срока» — списание из партии с одной штукой (кнопка «Без срока»)
+    db.commit_operation(ADMIN, "writeoff", wh["id"], None, "тест",
+                        [(wh["id"], 22, -50)], [], {},
+                        batch_plan={(wh["id"], 22): [("", 50)]})
+    assert db.batch_qty(wh["id"], 16, "06.2028") == -30
+    assert db.batch_qty(wh["id"], 10, "06.2028") == -5
+    assert db.batch_qty(wh["id"], 22, "") == -49
+    replies, kbs = [], []
+    async def _r(text, **kw):
+        replies.append(text); kbs.append(kw.get("reply_markup"))
+    def upd(uid):
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=uid, type="private"),
+                               message=SimpleNamespace(reply_text=_r))
+    admin, dan = db.get_user(ADMIN), db.get_user(DANIYAR)
+    one = "исправь срок Дексатоп 50 мл на Караколе: 06.2028 на 06.2029"
+    many = (one + "\n"
+            "исправь срок Альтопер 100 мл на караколе: 06.2028 на 06.2029\n"
+            "• исправь срок Мульти-Витатоп 50 мл на Караколе: без срока на 06.2029")
+    # 1. одна строка и обычный текст — не перехватываются (идут в ИИ)
+    assert not asyncio.run(bot.fix_expiry_batch_reply(upd(ADMIN), admin, one))
+    assert not asyncio.run(bot.fix_expiry_batch_reply(upd(ADMIN), admin, "Асан приход 5000\nи ещё"))
+    # 2. сотруднику — отказ
+    assert asyncio.run(bot.fix_expiry_batch_reply(upd(DANIYAR), dan, many))
+    assert "только админ" in replies[-1]
+    # 3. кривая строка — список не принят целиком, карточки нет
+    bot.PENDING.clear()
+    bad = many + "\nисправь срок Нетакого 10 мл на Караколе: 01.2028 на 02.2028"
+    assert asyncio.run(bot.fix_expiry_batch_reply(upd(ADMIN), admin, bad))
+    assert "не принят" in replies[-1] and "Нетакого" in replies[-1]
+    assert not [v for v in bot.PENDING.values() if v.get("kind") == "fix_expiry_multi"]
+    # партии, которой нет, — тоже отказ
+    assert asyncio.run(bot.fix_expiry_batch_reply(
+        upd(ADMIN), admin, many + "\nисправь срок Дексатоп 50 мл на Караколе: 01.2030 на 02.2030"))
+    assert "нет партии 01.2030" in replies[-1]
+    # 4. правильный список — карточка с тремя строками и кнопкой
+    assert asyncio.run(bot.fix_expiry_batch_reply(upd(ADMIN), admin, many))
+    pend = [(t, v) for t, v in bot.PENDING.items() if v.get("kind") == "fix_expiry_multi"]
+    assert len(pend) == 1 and kbs[-1] is not None
+    token, p = pend[0]
+    assert [it["product_id"] for it in p["items"]] == [16, 10, 22]
+    assert [it["have"] for it in p["items"]] == [-30, -5, -49]
+    assert p["items"][2]["old_expiry"] == ""
+    assert "3 поз." in replies[-1] and "без срока" in replies[-1] and "фантом" in replies[-1]
+    # 5. кнопка — три операции журнала, партии и инвариант
+    answers, edits = [], []
+    before = db.connect().execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+    asyncio.run(bot.on_callback(_cb_update(ADMIN, f"ok:{token}", answers, edits),
+                                SimpleNamespace(bot=None)))
+    after = db.connect().execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+    assert after == before + 3, edits
+    assert "Проведено операций: 3" in edits[-1] and edits[-1].count("✅") == 3
+    assert db.batch_qty(wh["id"], 16, "06.2028") == 0 and db.batch_qty(wh["id"], 16, "06.2029") == 70
+    assert db.batch_qty(wh["id"], 10, "06.2028") == 0 and db.batch_qty(wh["id"], 10, "06.2029") == 45
+    assert db.batch_qty(wh["id"], 22, "") == 0 and db.batch_qty(wh["id"], 22, "06.2029") == 51
+    for pid in (16, 10, 22):
+        assert _batch_sum(wh, pid) == _stock(wh, pid)
+    ops = db.connect().execute(
+        "SELECT type, summary FROM operations ORDER BY id DESC LIMIT 3").fetchall()
+    assert all(o["type"] == "fix_expiry" for o in ops)
+    assert any("МУЛЬТИ-ВИТАТОП" in o["summary"] and "без срока" in o["summary"] for o in ops)
+    # 6. повторное нажатие — заявка снята
+    asyncio.run(bot.on_callback(_cb_update(ADMIN, f"ok:{token}", answers, edits),
+                                SimpleNamespace(bot=None)))
+    assert after == db.connect().execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+    bot.PENDING.clear()
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]

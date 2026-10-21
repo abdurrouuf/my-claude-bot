@@ -4785,6 +4785,115 @@ async def start_fix_expiry(update, context, actor, data):
                                     reply_markup=confirm_kb(token))
 
 
+FIX_LINE_RE = re.compile(
+    r"^\s*(?:исправь|исправить)\s+срок\s+(?P<prod>.+?)\s+на\s+(?P<wh>[\w\-]+)\s*:\s*"
+    r"(?P<old>без\s+срока|\d{1,2}[./]\d{2,4})\s+(?:на|→|->)\s+"
+    r"(?P<new>\d{1,2}[./]\d{2,4})\s*\.?\s*$", re.IGNORECASE)
+
+
+def _parse_fix_expiry_lines(text: str):
+    """Список «исправь срок Товар фасовка на Складе: старый на новый» по
+    строке на товар (22.10.2026, «могу оптом все прислать?» владельца после
+    17 призраков Бишкека). Возвращает (items, errors): items — готовые
+    позиции для карточки, errors — строки, которые не разобрались (список
+    принимается целиком или никак, чтобы часть не ушла молча)."""
+    items, errors = [], []
+    for raw in text.splitlines():
+        line = raw.strip(" \t•-")
+        if not line:
+            continue
+        m = FIX_LINE_RE.match(line)
+        if not m:
+            errors.append(f"«{line}» — не похоже на «исправь срок Товар "
+                          f"фасовка на Складе: 06.2028 на 06.2029»")
+            continue
+        wh = db.warehouse_by_name(m.group("wh"))
+        if wh is None:
+            errors.append(f"«{line}» — склад «{m.group('wh')}» не найден")
+            continue
+        label, pids, rest, _c = _parse_sales_query(m.group("prod"))
+        if not pids or rest:
+            errors.append(f"«{line}» — товар «{m.group('prod')}» не найден в прайсе")
+            continue
+        if len(pids) > 1:
+            errors.append(f"«{line}» — у «{m.group('prod')}» несколько фасовок, уточните")
+            continue
+        pr = prices.BY_ID[pids[0]]
+        old_raw = m.group("old")
+        old_exp = "" if "без" in old_raw.lower() else (_norm_expiry(old_raw) or None)
+        new_exp = _norm_expiry(m.group("new"))
+        if old_exp is None or not new_exp:
+            errors.append(f"«{line}» — срок пишите как 06.2028")
+            continue
+        if old_exp == new_exp:
+            errors.append(f"«{line}» — старый и новый срок совпадают")
+            continue
+        have = db.batch_qty(wh["id"], pr["id"], old_exp)
+        if have == 0:
+            errors.append(f"«{line}» — у товара нет партии "
+                          f"{old_exp or 'без срока'} на складе «{wh['name']}»")
+            continue
+        items.append({"wh_id": wh["id"], "wh_name": wh["name"],
+                      "product_id": pr["id"], "name": pr["name"],
+                      "volume": pr["volume"], "old_expiry": old_exp,
+                      "new_expiry": new_exp, "have": have})
+    return items, errors
+
+
+def fix_expiry_multi_summary(p) -> str:
+    lines = [f"📅 <b>Исправление сроков партий — {len(p['items'])} поз.</b>", ""]
+    whs = sorted({it["wh_name"] for it in p["items"]})
+    for wh_name in whs:
+        if len(whs) > 1:
+            lines.append(f"🏬 <b>{esc(wh_name)}</b>")
+        for i, it in enumerate(p["items"], 1):
+            if it["wh_name"] != wh_name:
+                continue
+            short = str(it["name"]).split("(")[0].strip()
+            lines.append(
+                f"{i}. {esc(short)} {esc(it['volume'])}: "
+                f"<b>{esc(it['old_expiry'] or 'без срока')}</b> "
+                f"({fmt_num(it['have'])} шт) → <b>{esc(it['new_expiry'])}</b>")
+        lines.append("")
+    if any(it["have"] < 0 for it in p["items"]):
+        lines.append("⚠️ Минусовые партии — «фантомы» от операций с ошибочным "
+                     "сроком; минус переедет в правильную партию.")
+    lines.append("Остатки складов НЕ меняются — исправляются только записи "
+                 "сроков. Каждая строка станет отдельной операцией журнала "
+                 "(/undo по одной). Провести все?")
+    return "\n".join(lines)
+
+
+async def fix_expiry_batch_reply(update, actor, text: str) -> bool:
+    """Несколько строк «исправь срок …» одним сообщением (личка, админ) —
+    одна карточка, одна кнопка. Одна строка идёт через ИИ как раньше."""
+    chat = update.effective_chat
+    if chat is None or chat.type != "private":
+        return False
+    lines = [l for l in text.splitlines() if l.strip()]
+    if len(lines) < 2 or not all(FIX_LINE_RE.match(l.strip(" \t•-")) for l in lines):
+        return False
+    if not is_admin(actor):
+        await update.message.reply_text("⛔ Срок партии исправляет только админ.")
+        return True
+    items, errors = _parse_fix_expiry_lines(text)
+    if errors:
+        await update.message.reply_text(
+            "⚠️ Список не принят — исправьте строки и отправьте заново:\n"
+            + "\n".join(f"• {esc(e)}" for e in errors[:15]), parse_mode="HTML")
+        return True
+    if len(items) > 40:
+        await update.message.reply_text("За раз — не больше 40 строк.")
+        return True
+    payload = {"kind": "fix_expiry_multi", "user_id": actor["id"],
+               "chat_id": chat.id, "items": items}
+    token = new_pending(payload)
+    await update.message.reply_text(fix_expiry_multi_summary(payload),
+                                    parse_mode="HTML",
+                                    reply_markup=confirm_kb(token))
+    return True
+
+
 async def start_set_buy_price(update, context, actor, data):
     """«Закупочная цена Дексатоп 50мл 0.47» (админ) — в долларах за единицу
     прайса; «... 41 сом» сохраняется прямо в сомах (с 30.08.2026 — как в
@@ -7232,6 +7341,38 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     f"Остаток склада не менялся.\n"
                     f"Проверить: /expiry {esc(p['wh_name'])} · "
                     f"Отменить: /undo {op_id}", parse_mode="HTML")
+            elif p["kind"] == "fix_expiry_multi":
+                if not is_admin(actor):
+                    await q.answer("⛔ Только админ", show_alert=True)
+                    return
+                out, ops, whs = [], [], set()
+                for it in p["items"]:
+                    short = str(it["name"]).split("(")[0].strip()
+                    old_label = it["old_expiry"] or "без срока"
+                    have = db.batch_qty(it["wh_id"], it["product_id"], it["old_expiry"])
+                    if not have:
+                        out.append(f"⚠️ {esc(short)} {esc(it['volume'])}: партия "
+                                   f"{esc(old_label)} уже пуста — пропущено")
+                        continue
+                    summary = (f"Исправление срока: {short} {it['volume']} — "
+                               f"партия {old_label} → {it['new_expiry']} "
+                               f"({fmt_num(have)} шт), склад {it['wh_name']}")
+                    op_id, moved = db.fix_batch_expiry(
+                        p["user_id"], it["wh_id"], it["product_id"],
+                        it["old_expiry"], it["new_expiry"], None, summary)
+                    if op_id is None:
+                        out.append(f"⚠️ {esc(short)} {esc(it['volume'])}: нечего переносить")
+                        continue
+                    ops.append(op_id)
+                    whs.add(it["wh_name"])
+                    out.append(f"✅ {esc(short)} {esc(it['volume'])}: {esc(old_label)} → "
+                               f"{esc(it['new_expiry'])} ({fmt_num(moved)} шт), №{op_id}")
+                tail = (f"\n\nПроведено операций: {len(ops)}"
+                        + (f" (№{ops[0]}–№{ops[-1]})" if len(ops) > 1 else "")
+                        + ". Остатки складов не менялись.\nПроверить: "
+                        + " · ".join(f"/expiry {esc(w)}" for w in sorted(whs))
+                        + "\nОтменить одну: /undo N")
+                await q.edit_message_text("\n".join(out) + tail, parse_mode="HTML")
         except Exception as e:
             log.exception("Ошибка проведения операции")
             # Сообщаем и нажавшему кнопку (иначе админ-подтверждающий не видит
@@ -8343,6 +8484,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     # «накладная №1231 отгружена 13.10» — дата отгрузки готовой накладной
     if not quiet and await ship_date_reply(update, actor, text):
+        return
+    if not quiet and await fix_expiry_batch_reply(update, actor, text):
         return
     if not quiet and CERT_CAPTION_RE.match(text) and len(text.split()) <= 25:
         if await cert_text_reply(update, actor, text):
