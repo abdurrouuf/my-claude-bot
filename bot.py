@@ -27,6 +27,11 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s", level=logging.INFO
 )
 log = logging.getLogger("vetop")
+# httpx на уровне INFO пишет в лог КАЖДЫЙ запрос к Telegram с полным URL,
+# а в URL — токен бота (замечено на скриншоте логов Railway 22.10.2026).
+# Логи Railway видит только владелец, но токен в логах — лишний риск.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
