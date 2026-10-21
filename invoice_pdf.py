@@ -441,7 +441,7 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
                          payment=0, is_payment=False, warehouse_name=None,
                          draft=False, watermark=True, doc_title=None,
                          total_label=None, extra_totals=None,
-                         doc_number=None, box_note=None) -> io.BytesIO:
+                         doc_number=None, box_note=None, ship_date=None) -> io.BytesIO:
     """Красивый PDF: логотип, таблица товаров, итоги.
 
     draft=True не меняет содержимое, только оформление: водяной знак и пометка
@@ -508,6 +508,9 @@ def generate_pdf_invoice(client_name, items, invoice_total, prev_debt=0,
         title += f" № {doc_number}"
     story.append(Paragraph(title, title_style))
     story.append(Paragraph(datetime.now(BISHKEK).strftime("%d.%m.%Y"), sub_style))
+    if ship_date:
+        # Товар уехал раньше, чем выписана накладная (21.10.2026)
+        story.append(Paragraph(f"Отгружено: <b>{xml_escape(str(ship_date))}</b>", sub_style))
     story.append(Paragraph(f"Контрагент: <b>{xml_escape(str(client_name))}</b>", sub_style))
     if warehouse_name:
         story.append(Paragraph(f"Склад: {xml_escape(str(warehouse_name))}", sub_style))

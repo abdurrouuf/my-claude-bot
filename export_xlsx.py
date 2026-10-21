@@ -63,7 +63,9 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
             data = {}
         try:
             dt = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y %H:%M")
-        except ValueError:
+            if data.get("ship_date"):
+                dt += f" (отгр. {data['ship_date'][8:10]}.{data['ship_date'][5:7]})"
+        except (ValueError, TypeError):
             dt = op["ts"]
         user = db.get_user(op["user_id"])
         wh = db.warehouse_by_id(op["warehouse_id"]) if op["warehouse_id"] else None
@@ -206,7 +208,7 @@ def build_history(training_wh_ids=None) -> io.BytesIO:
             data = json.loads(op["data"])
         except (ValueError, TypeError):
             continue
-        t, ts = op["type"], op["ts"]
+        t, ts = op["type"], db.op_ts(op)     # день отгрузки, если задан
         deltas = [(w, p, d) for w, p, d in data.get("stock_deltas", [])
                   if w in whs and d]
         if not deltas:

@@ -9,7 +9,7 @@ import os
 import re
 import secrets
 import time
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from types import SimpleNamespace
 
 from anthropic import AsyncAnthropic
@@ -684,6 +684,8 @@ def _build_static_system() -> str:
                  '"items": [{"name": "точное название из прайса", "volume": "фасовка", "qty": количество_в_штуках, '
                  '"box_qty": количество_коробок_или_null, "price": цена_из_прайса}]}')
     parts.append('- "phone": если сотрудник указал телефон клиента — строкой, иначе null.')
+    parts.append('- Дата в начале («накладная от 13.10:», «отгружено 13.10») — дата отгрузки, '
+                 'бот возьмёт её сам: это не клиент, не количество и не цена.')
     parts.append('- "client": полное имя контрагента, как его назвал сотрудник. У многих клиентов '
                  'в имени есть город или село, где находится их аптека («Асан Токмок», '
                  '«Джумгалбек Кара-Балта») — это ЧАСТЬ ИМЕНИ клиента, включай её в "client".')
@@ -1784,6 +1786,9 @@ def invoice_summary(p) -> str:
         old_debt = p["parsed_debt"]
         extra = f", начальный долг {money(old_debt)}" if old_debt else ""
         lines.append(f"👤 Клиент: <b>{esc(p['client_name'])}</b> — 🆕 новый{extra}")
+    if p.get("ship_date"):
+        lines.append(f"🚚 Отгружено: <b>{ship_date_text(p['ship_date'])}</b> "
+                     f"(в отчётах — этим днём)")
     lines.append("")
     total = 0
     for i, it in enumerate(p["items"], 1):
@@ -1903,6 +1908,8 @@ def commit_invoice(p, replace_op_id=None):
                    "product_id": it.get("product_id")} for it in p["items"]],
         "total": total, "payment": p["payment"], "old_debt": old_debt,
     }
+    if p.get("ship_date"):
+        extra["ship_date"] = p["ship_date"]
     if replace_op_id:
         # Метка «эта накладная заменяет №N» — по ней /quality отличает
         # переделку (сторно + новая) от настоящей отмены (30.08.2026).
@@ -1937,6 +1944,7 @@ async def send_invoice_pdf(context, chat_id, client_label, p, old_debt, total,
         warehouse_name=p["wh_name"], draft=draft, watermark=DRAFT_WATERMARK,
         doc_number=op_id,  # у черновика номера нет — он не операция журнала
         box_note=box_note_text(p["items"]),
+        ship_date=ship_date_text(p.get("ship_date")),
     )
     date_str = datetime.now(BISHKEK).strftime("%d%m%Y")
     marked = draft and DRAFT_WATERMARK
@@ -2086,6 +2094,7 @@ async def start_invoice(update, context, actor, data, draft=False):
         "client_name": client_name, "client_id": None,
         "items": items, "warnings": warnings,
         "payment": payment, "parsed_debt": parsed_debt, "phone": phone,
+        "ship_date": data.get("_ship_date") or None,
     }
 
     in_group = (update.effective_chat is not None
@@ -2426,6 +2435,8 @@ def amend_summary(p, old_total: float) -> str:
     lines = [f"🔁 <b>Замена накладной №{p['old_op_id']}</b> — склад «{esc(p['wh_name'])}»",
              f"👤 Клиент: <b>{esc(c['name'])}</b>",
              f"Старая накладная на {money(old_total)} {what}", ""]
+    if p.get("ship_date"):
+        lines.insert(2, f"🚚 Отгружено: <b>{ship_date_text(p['ship_date'])}</b>")
     for i, it in enumerate(p["items"], 1):
         sub = it["qty"] * it["price"]
         box = box_prefix(it)
@@ -2605,6 +2616,7 @@ async def start_amend_invoice(update, context, actor, data):
         "items": old_items + new_items, "warnings": warnings,
         "payment": float(old.get("payment") or 0), "parsed_debt": 0, "phone": None,
         "old_op_id": op["id"], "old_count": len(old_items),
+        "ship_date": data.get("_ship_date") or old.get("ship_date") or None,
     }
     apply_client_prices(payload)
     token = new_pending(payload)
@@ -2708,6 +2720,7 @@ async def start_replace_invoice(update, context, actor, data):
         "payment": float(old.get("payment") or 0), "parsed_debt": 0, "phone": None,
         "old_op_id": op["id"], "old_count": 0,
         "full_replace": True, "returned_qty": back,
+        "ship_date": data.get("_ship_date") or old.get("ship_date") or None,
     }
     apply_client_prices(payload)
     token = new_pending(payload)
@@ -3751,6 +3764,104 @@ async def start_payment(update, context, actor, data):
 
 
 # ---------- Перемещение / приход товара ----------
+
+# Дата отгрузки в тексте накладной (21.10.2026, «делай» владельца: товар
+# уехал 13.10, накладную выписали 21.10): «накладная от 13.10: …»,
+# «отгружено 13.10.2026», «дата отгрузки 13.10». Разбирается кодом, без ИИ.
+SHIP_DATE_RE = re.compile(
+    r"(?:накладн\w*\s+от|отгру[жз]\w*|дата\s+отгрузки)\s*:?\s*"
+    r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?(?![.\d]*\d{2}:\d{2})",
+    re.IGNORECASE)
+SHIP_DATE_MAX_DAYS = int(os.environ.get("SHIP_DATE_MAX_DAYS", "30"))
+
+
+def _parse_ship_date(text: str):
+    """Ищет дату отгрузки в тексте. Возвращает (iso «ГГГГ-ММ-ДД» | None,
+    предупреждение | ""). Дата не в будущем и не старше SHIP_DATE_MAX_DAYS
+    дней — чтобы опечатка «13.01» не улетела в январь."""
+    m = SHIP_DATE_RE.search(text or "")
+    if not m:
+        return None, ""
+    d, mo, y = int(m.group(1)), int(m.group(2)), m.group(3)
+    today = datetime.now(BISHKEK).date()
+    year = today.year if not y else (int(y) + 2000 if len(y) == 2 else int(y))
+    try:
+        dt = date(year, mo, d)
+    except ValueError:
+        return None, f"⚠️ Дата отгрузки «{m.group(0).strip()}» не разобрана — накладная без неё."
+    if not y and dt > today and today.month == 1 and mo == 12:
+        dt = date(year - 1, mo, d)     # «от 28.12» в январе — прошлый год
+    if dt > today:
+        return None, f"⚠️ Дата отгрузки {dt.strftime('%d.%m.%Y')} в будущем — накладная без неё."
+    if (today - dt).days > SHIP_DATE_MAX_DAYS:
+        return None, (f"⚠️ Дата отгрузки {dt.strftime('%d.%m.%Y')} старше "
+                      f"{SHIP_DATE_MAX_DAYS} дней — накладная без неё. Если дата верна, "
+                      f"проведите накладную и напишите «накладная №N отгружена "
+                      f"{dt.strftime('%d.%m.%Y')}».")
+    return dt.isoformat(), ""
+
+
+def ship_date_text(iso) -> str:
+    """«13.10.2026» из «2026-10-13» (пусто — пустая строка)."""
+    if not iso:
+        return ""
+    try:
+        return date.fromisoformat(str(iso)).strftime("%d.%m.%Y")
+    except ValueError:
+        return str(iso)
+
+
+SHIP_SET_RE = re.compile(
+    r"^\s*накладн\w*\s*№?\s*(\d{1,7})\s+(?:отгру[жз]\w*|от)\s+"
+    r"(\d{1,2})[./](\d{1,2})(?:[./](\d{2,4}))?\s*\.?\s*$", re.IGNORECASE)
+
+
+async def ship_date_reply(update, actor, text: str) -> bool:
+    """«накладная №1231 отгружена 13.10» — задать дату отгрузки уже
+    проведённой накладной (админ; сотрудник — только своей). Без ИИ."""
+    m = SHIP_SET_RE.match(text or "")
+    if not m:
+        return False
+    if update.effective_chat is None or update.effective_chat.type != "private":
+        return False
+    op_id = int(m.group(1))
+    op = db.get_operation(op_id)
+    if op is None or op["type"] != "invoice":
+        await update.message.reply_text(f"Накладной №{op_id} в журнале нет.")
+        return True
+    if op["status"] != "done":
+        await update.message.reply_text(f"Накладная №{op_id} отменена — дату не меняю.")
+        return True
+    if not is_admin(actor) and op["user_id"] != actor["id"]:
+        await update.message.reply_text("Дату отгрузки чужой накладной меняет только админ.")
+        return True
+    iso, warn = _parse_ship_date("отгружено " + text[m.start(2):])
+    if warn and not is_admin(actor):
+        await update.message.reply_text(warn)
+        return True
+    if iso is None and is_admin(actor):
+        # Админу окно 30 дней не указ — он чинит старые накладные осознанно
+        d, mo, y = int(m.group(2)), int(m.group(3)), m.group(4)
+        today = datetime.now(BISHKEK).date()
+        year = today.year if not y else (int(y) + 2000 if len(y) == 2 else int(y))
+        try:
+            dt = date(year, mo, d)
+        except ValueError:
+            await update.message.reply_text(warn or "Не понял дату.")
+            return True
+        if dt > today:
+            await update.message.reply_text(warn)
+            return True
+        iso = dt.isoformat()
+    db.op_set_ship_date(op_id, iso)
+    c = db.client_get(op["client_id"]) if op["client_id"] else None
+    await update.message.reply_text(
+        f"🚚 Накладная №{op_id}" + (f" ({esc(c['name'])})" if c else "")
+        + f": дата отгрузки <b>{ship_date_text(iso)}</b>. В отчётах, /sales и акте "
+          f"сверки она теперь считается этим днём; выписана {op['ts'][8:10]}."
+          f"{op['ts'][5:7]}.{op['ts'][:4]}.", parse_mode="HTML")
+    return True
+
 
 def _norm_expiry(raw) -> str:
     """«11/28», «11.28», «до 12.2027» -> "MM.YYYY"; непонятное -> ""."""
@@ -7399,6 +7510,16 @@ async def dispatch_action(update, context, actor, reply, draft=False, quiet=Fals
         # штук?»: в склейке трёх реплик числа прошлых операций).
         data["_src_text"] = str(src_text or "")
         data["_last_text"] = str(src_text if last_text is None else last_text)
+        if data.get("action") in ("invoice", "amend_invoice", "replace_invoice"):
+            # Дата отгрузки из текста («накладная от 13.10: …») — кодом
+            iso, warn = _parse_ship_date(data["_last_text"])
+            if iso:
+                data["_ship_date"] = iso
+            elif warn and not quiet:
+                try:
+                    await update.message.reply_text(warn)
+                except Exception:
+                    pass
         # «Проведи за Данияра: Валя приход 1490» — операция от имени сотрудника:
         # запишется на него в журнал, деньги лягут в ЕГО кассу. Только админ.
         as_emp = str(data.pop("as_employee", "") or "").strip()
@@ -8219,6 +8340,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # «описание Альтопен: …» — описание для публичной карточки QR (админ,
     # личка; 30.09.2026), тоже без ИИ.
     if not quiet and await desc_text_reply(update, actor, text):
+        return
+    # «накладная №1231 отгружена 13.10» — дата отгрузки готовой накладной
+    if not quiet and await ship_date_reply(update, actor, text):
         return
     if not quiet and CERT_CAPTION_RE.match(text) and len(text.split()) <= 25:
         if await cert_text_reply(update, actor, text):
@@ -10267,14 +10391,16 @@ def client_statement(cid: int):
     balance = start_debt
     for op, data, delta in parsed:
         try:
-            date_str = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y")
+            date_str = datetime.fromisoformat(db.op_ts(op)).strftime("%d.%m.%Y")
         except ValueError:
-            date_str = op["ts"][:10]
+            date_str = db.op_ts(op)[:10]
         balance += delta
         if op["type"] == "invoice":
             plus = data.get("total", 0)
             minus = data.get("payment", 0)
             doc = f"Накладная №{op['id']}"
+            if data.get("ship_date"):
+                doc += f" (выписана {op['ts'][8:10]}.{op['ts'][5:7]})"
         elif op["type"] == "payment":
             plus = 0
             minus = data.get("amount", 0)
@@ -11097,9 +11223,9 @@ def sales_history_report(whs, label, pids, cli_ids=None, cli_label=None,
     for op, it in db.product_sales(pids, set(wh_names), cli_ids):
         qty, price = float(it.get("qty") or 0), float(it.get("price") or 0)
         try:
-            dstr = datetime.fromisoformat(op["ts"]).strftime("%d.%m.%Y")
+            dstr = datetime.fromisoformat(db.op_ts(op)).strftime("%d.%m.%Y")
         except ValueError:
-            dstr = op["ts"][:10]
+            dstr = db.op_ts(op)[:10]
         if newest is None:
             newest = dstr
         oldest = dstr
@@ -13106,6 +13232,8 @@ async def show_log(update: Update, context: ContextTypes.DEFAULT_TYPE):
                             data["old_debt"] + data["total"] - amt)
             if op["status"] != "cancelled":
                 money_sum += amt
+        if data.get("ship_date"):
+            summary = f"{summary} · отгружено {ship_date_text(data['ship_date'])}"
         if op["status"] == "cancelled":
             cancelled += 1
             summary = f"ОТМЕНЕНА · {summary}"

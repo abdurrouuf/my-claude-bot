@@ -5185,6 +5185,121 @@ def test_catchup_and_effort():
     assert "усилие ИИ" in replies[-1] and "Выходных токенов" in replies[-1], replies[-1]
 
 
+def test_ship_date():
+    """21.10.2026, «делай» владельца: товар уехал 13.10, накладную выписали
+    21.10. «накладная от 13.10: …» → дата отгрузки в карточке, PDF и журнале;
+    отчёты по датам (/report, /sales, акт сверки, /history) считают её днём
+    отгрузки, журнал/остатки/долг — моментом проведения; «накладная №N
+    отгружена ДД.ММ» задаёт дату готовой накладной; замена её наследует."""
+    import asyncio
+    from types import SimpleNamespace
+    import pymupdf as fitz
+    wh = _fresh_db()
+    conn = db.connect()
+    conn.execute("UPDATE warehouses SET full_mode=1")
+    conn.commit()
+    _load(wh, {16: 100})
+    db.clients_add_bulk(wh["id"], [("Давран Карасуу", 0)])
+    cid = db.client_exact(wh["id"], "Давран Карасуу")["id"]
+    today = datetime.now(bot.BISHKEK).date()
+    d8 = today - timedelta(days=8)
+    # 1. разбор даты из текста
+    iso, warn = bot._parse_ship_date(f"накладная от {d8.strftime('%d.%m')}: Давран, Дексатоп 50 мл 2 к")
+    assert iso == d8.isoformat() and not warn
+    assert bot._parse_ship_date(f"Отгружено {d8.strftime('%d.%m.%Y')}")[0] == d8.isoformat()
+    assert bot._parse_ship_date("Давран, Дексатоп 50 мл 2 к") == (None, "")
+    assert bot._parse_ship_date("накладная от Асана: Дексатоп 50 мл") == (None, "")
+    fut = today + timedelta(days=2)
+    assert "будущем" in bot._parse_ship_date(f"накладная от {fut.strftime('%d.%m')}: Асан")[1]
+    old = today - timedelta(days=40)
+    assert "старше" in bot._parse_ship_date(f"накладная от {old.strftime('%d.%m.%Y')}: Асан")[1]
+    # 2. карточка и проведение
+    p = {"kind": "invoice", "user_id": ADMIN, "chat_id": ADMIN, "wh_id": wh["id"],
+         "wh_name": wh["name"], "client_name": "Давран Карасуу", "client_id": cid,
+         "items": [_item(16, 10, 180)], "payment": 0.0, "parsed_debt": 0.0,
+         "phone": None, "warnings": [], "ship_date": d8.isoformat()}
+    assert f"Отгружено: <b>{d8.strftime('%d.%m.%Y')}</b>" in bot.invoice_summary(p)
+    op_id, *_ = bot.commit_invoice(p)
+    op = db.get_operation(op_id)
+    assert json.loads(op["data"])["ship_date"] == d8.isoformat()
+    assert op["ts"][:10] == today.isoformat()            # журнал — по проведению
+    # PDF показывает «Отгружено»
+    pdf = invoice_pdf.generate_pdf_invoice("Давран Карасуу", p["items"], 1800,
+                                           ship_date=bot.ship_date_text(p["ship_date"]))
+    txt = "".join(pg.get_text() for pg in fitz.open(stream=pdf.getvalue(), filetype="pdf"))
+    assert f"Отгружено: {d8.strftime('%d.%m.%Y')}" in txt.replace("\n", " ") or "Отгружено" in txt
+    # 3. отчёты по дню отгрузки: за 3 дня накладной нет, за 10 дней — есть
+    start3 = (datetime.now(bot.BISHKEK) - timedelta(days=3)).replace(hour=0, minute=0, second=0, microsecond=0)
+    start10 = (datetime.now(bot.BISHKEK) - timedelta(days=10)).replace(hour=0, minute=0, second=0, microsecond=0)
+    ids3 = [o["id"] for o in db.operations_since(start3.isoformat(timespec="seconds"))]
+    ids10 = [o["id"] for o in db.operations_since(start10.isoformat(timespec="seconds"))]
+    assert op_id not in ids3 and op_id in ids10
+    assert db.op_ts(db.operations_since(start10.isoformat(timespec="seconds"))[-1])[:10] == d8.isoformat()
+    # обычная накладная сегодня — в отчёте за 3 дня
+    (op2, *_), _ = _invoice(wh, ADMIN, "Давран Карасуу", [_item(16, 5, 180)], client_id=cid)
+    assert op2 in [o["id"] for o in db.operations_since(start3.isoformat(timespec="seconds"))]
+    # акт сверки: отгруженная раньше идёт первой с пометкой «выписана»
+    rows, _sd = bot.client_statement(cid)
+    assert rows[0][0] == d8.strftime("%d.%m.%Y") and "выписана" in rows[0][1], rows
+    assert rows[1][1] == f"Накладная №{op2}"
+    # /sales: дата продажи — день отгрузки, новые сверху
+    sales = db.product_sales([16], {wh["id"]})
+    assert sales[0][0]["id"] == op2 and db.op_ts(sales[1][0])[:10] == d8.isoformat()
+    # Excel /history: продажа ложится в день отгрузки
+    import export_xlsx
+    from openpyxl import load_workbook
+    ws = load_workbook(export_xlsx.build_history())["Продажи по дням"]
+    days = {r[0] for r in ws.iter_rows(min_row=2, values_only=True) if r[2] == 16}
+    assert d8.isoformat() in days and today.isoformat() in days
+    # 4. «накладная №N отгружена ДД.ММ» — задать дату готовой накладной
+    replies = []
+    def upd(uid):
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=uid, type="private"),
+                               message=SimpleNamespace(reply_text=_areply(replies)))
+    d5 = today - timedelta(days=5)
+    assert asyncio.run(bot.ship_date_reply(upd(ADMIN), db.get_user(ADMIN),
+                                           f"накладная №{op2} отгружена {d5.strftime('%d.%m')}"))
+    assert db.op_ship_date(db.get_operation(op2)) == d5.isoformat()
+    assert "дата отгрузки" in replies[-1] and d5.strftime("%d.%m.%Y") in replies[-1]
+    # сотрудник — чужую нельзя; не накладная/нет — вежливый отказ
+    assert asyncio.run(bot.ship_date_reply(upd(DANIYAR), db.get_user(DANIYAR),
+                                           f"накладная №{op2} отгружена {d5.strftime('%d.%m')}"))
+    assert "только админ" in replies[-1]
+    assert asyncio.run(bot.ship_date_reply(upd(ADMIN), db.get_user(ADMIN), "накладная №999999 отгружена 01.10"))
+    assert "нет" in replies[-1]
+    assert not asyncio.run(bot.ship_date_reply(upd(ADMIN), db.get_user(ADMIN), "Асан приход 5000"))
+    # админу окно 30 дней не указ (чинит старые осознанно)
+    assert asyncio.run(bot.ship_date_reply(upd(ADMIN), db.get_user(ADMIN),
+                                           f"накладная №{op2} отгружена {old.strftime('%d.%m.%Y')}"))
+    assert db.op_ship_date(db.get_operation(op2)) == old.isoformat()
+    # /log помечает дату отгрузки
+    # 5. замена наследует дату отгрузки
+    p2 = dict(p, items=[_item(16, 12, 180)], ship_date=json.loads(db.get_operation(op_id)["data"])["ship_date"])
+    op3, *_ = bot.commit_invoice(p2, replace_op_id=op_id)
+    assert json.loads(db.get_operation(op3)["data"])["ship_date"] == d8.isoformat()
+    # 6. dispatch_action кладёт _ship_date только для накладных
+    bot.PENDING.clear()
+    action = ('{"action": "invoice", "client": "Давран Карасуу", "warehouse": "Каракол", '
+              '"items": [{"name": "ДЕКСАТОП", "volume": "50 мл", "qty": 2, "price": 180}]}')
+    txt = f"накладная от {d8.strftime('%d.%m')}: Давран Карасуу Каракол, Дексатоп 50 мл 2 шт"
+    asyncio.run(bot.dispatch_action(upd(ADMIN), SimpleNamespace(bot=None), db.get_user(ADMIN),
+                                    action, src_text=txt, last_text=txt))
+    pend = [v for v in bot.PENDING.values() if v.get("kind") == "invoice"]
+    assert pend and pend[-1].get("ship_date") == d8.isoformat(), pend
+    assert f"Отгружено: <b>{d8.strftime('%d.%m.%Y')}</b>" in replies[-1]
+    # не накладная (оплата) — поле не ставится, текст с датой не мешает
+    bot.PENDING.clear()
+    asyncio.run(bot.dispatch_action(upd(ADMIN), SimpleNamespace(bot=None), db.get_user(ADMIN),
+                                    '{"action": "payment", "client": "Давран Карасуу", '
+                                    '"warehouse": "Каракол", "amount": 500}',
+                                    src_text="Давран Карасуу Каракол приход 500",
+                                    last_text="Давран Карасуу Каракол приход 500"))
+    pend = [v for v in bot.PENDING.values() if v.get("kind") == "payment"]
+    assert pend and not pend[-1].get("ship_date"), pend
+    bot.PENDING.clear()
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
