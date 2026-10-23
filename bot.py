@@ -4848,6 +4848,10 @@ def _parse_fix_expiry_lines(text: str):
 def fix_expiry_multi_summary(p) -> str:
     lines = [f"📅 <b>Исправление сроков партий — {len(p['items'])} поз.</b>", ""]
     whs = sorted({it["wh_name"] for it in p["items"]})
+    if len(whs) == 1:
+        # Один склад — пишем его в шапке один раз (просьба владельца
+        # 23.10.2026: «в карточке не указано Бишкек»).
+        lines[0] += f" — склад <b>{esc(whs[0])}</b>"
     for wh_name in whs:
         if len(whs) > 1:
             lines.append(f"🏬 <b>{esc(wh_name)}</b>")
@@ -7350,7 +7354,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 if not is_admin(actor):
                     await q.answer("⛔ Только админ", show_alert=True)
                     return
-                out, ops, whs = [], [], set()
+                all_whs = sorted({it["wh_name"] for it in p["items"]})
+                out = ["📅 <b>Исправление сроков партий — склад "
+                       + esc(", ".join(all_whs)) + "</b>", ""]
+                ops, whs = [], set()
                 for it in p["items"]:
                     short = str(it["name"]).split("(")[0].strip()
                     old_label = it["old_expiry"] or "без срока"

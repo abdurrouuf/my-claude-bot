@@ -5368,6 +5368,7 @@ def test_fix_expiry_batch():
     assert [it["have"] for it in p["items"]] == [-30, -5, -49]
     assert p["items"][2]["old_expiry"] == ""
     assert "3 поз." in replies[-1] and "без срока" in replies[-1] and "фантом" in replies[-1]
+    assert "склад <b>" in replies[-1]  # склад виден в шапке (23.10.2026)
     # 5. кнопка — три операции журнала, партии и инвариант
     answers, edits = [], []
     before = db.connect().execute("SELECT COUNT(*) FROM operations").fetchone()[0]
@@ -5376,6 +5377,7 @@ def test_fix_expiry_batch():
     after = db.connect().execute("SELECT COUNT(*) FROM operations").fetchone()[0]
     assert after == before + 3, edits
     assert "Проведено операций: 3" in edits[-1] and edits[-1].count("✅") == 3
+    assert "— склад " in edits[-1]
     assert db.batch_qty(wh["id"], 16, "06.2028") == 0 and db.batch_qty(wh["id"], 16, "06.2029") == 70
     assert db.batch_qty(wh["id"], 10, "06.2028") == 0 and db.batch_qty(wh["id"], 10, "06.2029") == 45
     assert db.batch_qty(wh["id"], 22, "") == 0 and db.batch_qty(wh["id"], 22, "06.2029") == 51
