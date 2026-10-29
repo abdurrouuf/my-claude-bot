@@ -2775,6 +2775,146 @@ def test_batch_question_accounts_for_lines_above():
     print("  ✓ вопрос о партии учитывает строки выше того же товара")
 
 
+def test_no_ghost_batches():
+    """29.10.2026, «делай» владельца («никаких призраков»): кнопка партии
+    больше не уводит партию в минус — если в партии меньше, чем в строке,
+    берётся вся партия, остаток добирается FEFO из следующих; товара не
+    хватает даже по всем партиям — отказ; «Разделить» текстом не даёт
+    попросить больше, чем лежит в партии; /check ловит минус «без срока»
+    при датированных партиях."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    _load(wh, {16: 30}, {(wh["id"], 16): [("01.2028", 10), ("01.2029", 20)]})
+    db.clients_add_bulk(wh["id"], [("Клиент С", 0)])
+    cid = db.client_exact(wh["id"], "Клиент С")["id"]
+
+    def inv(qty):
+        return {"kind": "invoice", "user_id": ADMIN, "chat_id": ADMIN,
+                "wh_id": wh["id"], "wh_name": wh["name"],
+                "client_name": "Клиент С", "client_id": cid,
+                "items": [_item(16, qty, 840)], "payment": 0.0,
+                "parsed_debt": 0.0, "phone": None}
+    # 1. Партии хватает — обычный выбор срока
+    p = inv(10)
+    assert bot._batch_pick_rows(p, 0, p["items"][0], "01.2028") == ("01.2028", "", None)
+    # 2. Партии НЕ хватает — вся старая + остаток из следующей, без минуса
+    p = inv(30)
+    picked, note, short = bot._batch_pick_rows(p, 0, p["items"][0], "01.2028")
+    assert picked == [["01.2028", 10], ["01.2029", 20]] and short is None
+    assert "только 10 шт из 30" in note and "01.2029 — 20 шт" in note
+    # 3. Не хватает даже по всем партиям — отказ, в минус не уводим
+    p = inv(40)
+    assert bot._batch_pick_rows(p, 0, p["items"][0], "01.2028") == (None, "", 30)
+    # 4. Устаревшая кнопка (такой партии нет) — FEFO, как раньше
+    p = inv(5)
+    assert bot._batch_pick_rows(p, 0, p["items"][0], "12.2030") == ("", "", None)
+    # 5. Строки выше учитываются: первая забрала 10 из 01.2028
+    p = inv(30)
+    p["items"] = [_item(16, 10, 840), _item(16, 15, 840)]
+    p["batch_choices"] = {"0": "01.2028"}
+    picked, note, short = bot._batch_pick_rows(p, 1, p["items"][1], "01.2028")
+    assert picked == [["01.2029", 15]] and "только 0 шт" in note
+    # 6. Кнопка в реальном обработчике: нажали 01.2028 при 30 шт — накладная
+    #    проведена, партии ровно обнулились, призраков нет
+    p = inv(30)
+    token = bot.new_pending(p)
+    answers, edits, sent = [], [], []
+
+    class FakeBot:
+        async def send_message(self, chat_id, text, **kw):
+            sent.append((chat_id, text))
+
+        async def send_document(self, *a, **kw):
+            return None
+    upd = _cb_update(ADMIN, f"pbat:{token}:0:01.2028", answers, edits)
+    asyncio.run(bot.on_callback(upd, SimpleNamespace(bot=FakeBot())))
+    assert answers and "В минус ничего не ушло" in answers[0]
+    assert any("взял их" in t for _, t in sent)
+    assert db.batch_qty(wh["id"], 16, "01.2028") == 0
+    assert db.batch_qty(wh["id"], 16, "01.2029") == 0
+    assert _stock(wh, 16) == 0 and db.integrity_check() == []
+    op = db.connect().execute("SELECT id FROM operations WHERE type='invoice' "
+                              "ORDER BY id DESC LIMIT 1").fetchone()
+    db.cancel_operation(op["id"])
+    assert db.batch_qty(wh["id"], 16, "01.2028") == 10
+    # 7. Нехватка по всем партиям на кнопке — отказ всплывашкой, вопрос
+    #    повторяется, ничего не списано
+    p = inv(40)
+    token = bot.new_pending(p)
+    answers.clear(); edits.clear()
+    upd = _cb_update(ADMIN, f"pbat:{token}:0:01.2028", answers, edits)
+    asyncio.run(bot.on_callback(upd, SimpleNamespace(bot=FakeBot())))
+    assert answers and "только 30 шт из 40" in answers[0]
+    assert edits and "Из какой партии" in edits[-1]
+    assert _stock(wh, 16) == 30
+    # 8. Списание (срок обязателен): «без срока» в добор не идёт
+    _load(wh, {17: 12}, {(wh["id"], 17): [("05.2028", 4), ("", 8)]})
+    pw = {"kind": "writeoff", "user_id": ADMIN, "chat_id": ADMIN,
+          "wh_id": wh["id"], "wh_name": wh["name"], "reason": "бой",
+          "items": [_item(17, 6, 100)]}
+    assert bot._batch_pick_rows(pw, 0, pw["items"][0], "05.2028") == (None, "", 4)
+    # 9. «Разделить» текстом: больше, чем в партии, — отказ
+    p2 = inv(30)
+    p2["awaiting_split"] = "0"
+    token = bot.new_pending(p2)
+    bot.AWAIT_SPLIT[(ADMIN, ADMIN)] = token
+    replies = []
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            replies.append(text)
+
+    def upd2():
+        return SimpleNamespace(effective_user=SimpleNamespace(id=ADMIN),
+                               effective_chat=SimpleNamespace(id=ADMIN, type="private"),
+                               message=Msg())
+    ctx = SimpleNamespace(bot=FakeBot())
+    assert asyncio.run(bot.split_reply(upd2(), ctx, "25 до 01.2028, 5 до 01.2029"))
+    assert "больше, чем есть в партии" in replies[-1] and "только 10 шт" in replies[-1]
+    assert (ADMIN, ADMIN) in bot.AWAIT_SPLIT
+    assert asyncio.run(bot.split_reply(upd2(), ctx, "10 до 01.2028, 20 до 01.2029"))
+    assert (ADMIN, ADMIN) not in bot.AWAIT_SPLIT
+    assert db.batch_qty(wh["id"], 16, "01.2028") == 0 and db.integrity_check() == []
+    # 10. /check: минус «без срока» при датированных партиях — расхождение
+    db.connect().execute(
+        "INSERT INTO product_batches(warehouse_id, product_id, expiry, qty) "
+        "VALUES (?, 18, '06.2029', 50), (?, 18, '', -3)", (wh["id"], wh["id"]))
+    db.connect().execute(
+        "INSERT INTO stock(warehouse_id, product_id, qty) VALUES (?, 18, 47)", (wh["id"],))
+    db.connect().commit()
+    probs = [t for w, pid, t in db.integrity_check() if pid == 18]
+    assert any("минус «без срока» -3" in t and "без срока на 06.2029" in t for t in probs)
+    txt = bot.integrity_report_text(db.integrity_check())
+    assert "без срока" in txt
+    # 11. Перемещение/списание с явным сроком, партии которого не хватает, —
+    #     отказ при создании (две строки с разными сроками или без срока)
+    _load(wh, {19: 30}, {(wh["id"], 19): [("03.2028", 10), ("09.2029", 20)]})
+    pt = {"kind": "transfer", "user_id": ADMIN, "chat_id": ADMIN,
+          "wh_id": 2, "wh_name": "Кара-Балта", "from_wh_id": wh["id"],
+          "from_wh_name": wh["name"], "warnings": [],
+          "items": [dict(_item(19, 30, 0), expiry="03.2028")]}
+    short = bot._short_expiry_items(pt)
+    assert short and short[0][1:] == (10, 30)
+    assert "только 10 шт, а нужно 30" in bot._short_expiry_text(pt, short)
+    pt["items"] = [dict(_item(19, 10, 0), expiry="03.2028"),
+                   dict(_item(19, 20, 0), expiry="09.2029")]
+    assert bot._short_expiry_items(pt) == []
+    pt["items"] = [dict(_item(19, 10, 0), expiry="03.2028"),
+                   dict(_item(19, 5, 0), expiry="03.2028")]    # вторая строка — лишняя
+    assert bot._short_expiry_items(pt)[0][1:] == (0, 5)
+    # на кнопке: партия уменьшилась, пока заявка ждала — не проводим
+    pt["items"] = [dict(_item(19, 30, 0), expiry="03.2028")]
+    answers.clear(); edits.clear()
+    q = _cb_update(ADMIN, "x", answers, edits).callback_query
+    asyncio.run(bot._finish_transfer(q, SimpleNamespace(bot=FakeBot()),
+                                     db.get_user(ADMIN), pt))
+    assert edits and "Не провожу" in edits[-1]
+    assert db.batch_qty(wh["id"], 19, "03.2028") == 10 and _stock(wh, 19) == 30
+    bot.PENDING.clear()
+    print("  ✓ партии больше не уходят в минус: кнопка, разделение, /check")
+
+
 def test_batch_split():
     """Кнопка «Разделить по партиям» (01.09.2026): количество позиции
     делится между партиями текстом («150 до 01.2028, 100 до 04.2028»),

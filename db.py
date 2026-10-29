@@ -815,7 +815,8 @@ def integrity_check():
     Проверки: (1) остаток в таблице stock = сумма stock_deltas проведённых
     операций журнала (stock ведётся приращениями, журнал — источник);
     (2) сумма партий = остаток; (3) минусовые датированные партии
-    (призраки); (4) минусовый остаток; (5) минусовая касса сотрудника."""
+    (призраки); (4) минусовый остаток; (5) минусовая касса сотрудника;
+    (6) минус «без срока» при датированных партиях (29.10.2026)."""
     conn = connect()
     out = []
     journal = {}
@@ -854,6 +855,26 @@ def integrity_check():
         out.append((r["warehouse_id"], r["product_id"],
                     f"призрак: партия {r['expiry']} = {r['qty']} шт "
                     f"(«исправь срок … {r['expiry']} на <верный>»)"))
+    # Минус в партии «без срока», когда у товара есть датированные партии с
+    # остатком (29.10.2026, «делай» владельца): /expiry показывает
+    # датированные партии завышенными — товар списан не из той партии
+    # (17 строк Бишкека 21.10 /check призраком не считал).
+    dated_plus = {}
+    for r in conn.execute("SELECT warehouse_id, product_id, expiry, qty "
+                          "FROM product_batches WHERE qty > 0 AND expiry != ''"):
+        dated_plus.setdefault((r["warehouse_id"], r["product_id"]), []).append(
+            (r["expiry"], r["qty"]))
+    for r in conn.execute(
+            "SELECT warehouse_id, product_id, qty FROM product_batches "
+            "WHERE qty < 0 AND expiry = '' ORDER BY 1, 2"):
+        plus = dated_plus.get((r["warehouse_id"], r["product_id"]))
+        if not plus:
+            continue
+        listed = ", ".join(f"{e} — {q} шт" for e, q in plus)
+        target = plus[-1][0] if len(plus) == 1 else "<верный срок>"
+        out.append((r["warehouse_id"], r["product_id"],
+                    f"минус «без срока» {r['qty']} шт при датированных партиях "
+                    f"({listed}) — «исправь срок … без срока на {target}»"))
     for u in conn.execute("SELECT id, name FROM users WHERE active=1"):
         cash = cash_on_hand(u["id"])
         if cash < -0.5:
