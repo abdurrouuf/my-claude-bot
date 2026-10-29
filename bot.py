@@ -3918,8 +3918,8 @@ def _wrong_expiry_warnings(p):
         else:
             out.append(f"{it['name']} {it['volume']}: в партии {exp} на "
                        f"складе «{src_name}» только {bq} шт из "
-                       f"{it['qty']} — остальное уйдёт минусом. Партии "
-                       f"сейчас: {listed}.")
+                       f"{it['qty']} — в минус партия не уйдёт, такая "
+                       f"операция не проводится. Партии сейчас: {listed}.")
     return out
 
 
@@ -3955,6 +3955,44 @@ def _missing_expiry_items(p):
         if any(b["expiry"] for b in batches):
             out.append((it, batches))
     return out
+
+
+def _short_expiry_items(p):
+    """Позиции с явным сроком, партия которого на складе-источнике ЕСТЬ, но
+    её меньше, чем в строке (с учётом строк выше с тем же сроком). Такое
+    перемещение/списание не проводим (29.10.2026, «никаких призраков»):
+    раньше остаток уходил минусом в датированную партию — это и есть
+    призрак. Срок из ответа на вопрос бота (expiry_asked) не проверяем.
+    Возвращает [(позиция, в партии, нужно), ...]."""
+    src_wh = p.get("wh_id") if p.get("kind") == "writeoff" else p.get("from_wh_id")
+    out = []
+    if not src_wh:
+        return out
+    used = {}
+    for it in p["items"]:
+        exp, pid = it.get("expiry"), it.get("product_id")
+        if not pid or not exp or it.get("expiry_asked"):
+            continue
+        total = db.batch_qty(src_wh, pid, exp)
+        if total <= 0:
+            continue        # партии нет вовсе — это _expiry_attempt_gate
+        have = total - used.get((pid, exp), 0)
+        used[(pid, exp)] = used.get((pid, exp), 0) + it["qty"]
+        if have < it["qty"]:
+            out.append((it, max(have, 0), it["qty"]))
+    return out
+
+
+def _short_expiry_text(p, short) -> str:
+    src_name = p.get("wh_name") if p.get("kind") == "writeoff" \
+        else p.get("from_wh_name")
+    lines = [f"• {esc(it['name'])} {esc(it['volume'])}: в партии {esc(it['expiry'])} "
+             f"на складе «{esc(src_name)}» только {have} шт, а нужно {need}"
+             for it, have, need in short]
+    return ("❌ Не провожу — партии не хватает, в минус партия не уходит "
+            "(призраков больше не делаем):\n" + "\n".join(lines) +
+            "\n\nНапишите две строки с разными сроками (сколько из какой "
+            "партии) или уберите срок — я спрошу партию кнопками.")
 
 
 def _expiry_attempt_gate(actor, p):
@@ -4206,6 +4244,12 @@ async def start_transfer(update, context, actor, data):
         return
     if note:
         payload["warnings"] = [note] + list(payload["warnings"])
+    short = _short_expiry_items(payload)
+    if short:
+        await update.message.reply_text(_short_expiry_text(payload, short),
+                                        parse_mode="HTML")
+        _note_outcome(update, "операция НЕ создана — партии не хватает")
+        return
 
     # Перемещение между складами подтверждает ТОЛЬКО админ.
     if from_wh is not None and not is_admin(actor):
@@ -5324,6 +5368,12 @@ async def start_writeoff(update, context, actor, data):
         return
     if note:
         payload["warnings"] = [note] + list(payload["warnings"])
+    short = _short_expiry_items(payload)
+    if short:
+        await update.message.reply_text(_short_expiry_text(payload, short),
+                                        parse_mode="HTML")
+        _note_outcome(update, "операция НЕ создана — партии не хватает")
+        return
 
     # Товар уходит со склада без денег — проводит только админ.
     if not is_admin(actor):
@@ -5565,6 +5615,57 @@ def _parse_split(text: str):
             return None
         out.append((exp, int(nums[0])))
     return out or None
+
+
+def _batch_pick_rows(p, idx: int, item: dict, exp: str):
+    """Нажата кнопка партии exp для строки item (решение владельца
+    29.10.2026: «никаких призраков» — кнопка партии больше НИКОГДА не
+    уводит партию в минус; правило 25.07 «продавец знает, какую коробку
+    взял» отменено, потому что все призраки трёх складов родились именно
+    из него).
+
+    Возвращает (choice, note, short):
+    • choice — что записать в batch_choices: срок (партии хватает), список
+      [[срок|"~", шт], ...] (партии меньше строки — берём её целиком,
+      остаток добираем «сначала старые» из следующих партий), "" — FEFO
+      (кнопка устарела: такой партии на складе уже нет);
+    • note — текст для всплывашки, когда план разложился по нескольким
+      партиям (пусто — обычный выбор);
+    • short — сколько штук всего доступно, если товара НЕ хватает даже по
+      всем партиям (тогда choice=None, операцию проводить нельзя)."""
+    src_wh = _batch_src_wh(p)
+    pid = item.get("product_id") or 0
+    raw = db.product_batches_of(src_wh, pid)
+    if exp not in {b["expiry"] for b in raw}:
+        return "", "", None
+    reserved = _reserved_batches(p, idx).get(pid, {}) if idx else {}
+    avail = [(b["expiry"], b["qty"] - reserved.get(b["expiry"], 0)) for b in raw]
+    avail = [(e, q) for e, q in avail if q > 0]
+    left = dict(avail).get(exp, 0)
+    qty = int(item["qty"])
+    if left >= qty:
+        return (exp if exp else BATCH_NO_EXPIRY), "", None
+    rows = [(exp, left)] if left > 0 else []
+    rest = qty - left
+    # Перемещение/списание — срок обязателен, партия «без срока» в
+    # добор не идёт (ей всё равно спросили бы дату текстом).
+    pool = [(e, q) for e, q in avail
+            if e != exp and (e or p.get("kind") not in EXPIRY_REQUIRED_KINDS)]
+    for e, q in pool:               # product_batches_of уже даёт FEFO-порядок
+        take = min(rest, q)
+        if take > 0:
+            rows.append((e, take))
+            rest -= take
+        if not rest:
+            break
+    if rest > 0:
+        return None, "", qty - rest
+    label = lambda e: f"до {e}" if e else "без срока"
+    note = (f"В партии {label(exp)} только {left} шт из {qty} — взял их, "
+            f"остальное по сроку: "
+            + ", ".join(f"{label(e)} — {q} шт" for e, q in rows[1 if left > 0 else 0:])
+            + ". В минус ничего не ушло.")
+    return [[e or BATCH_NO_EXPIRY, q] for e, q in rows], note, None
 
 
 def _reserved_batches(p, upto: int) -> dict:
@@ -5817,7 +5918,9 @@ async def _ask_batch(q, p, question):
                 "выше — из них уже выбрано.")
     await q.edit_message_text(
         f"📅 <b>{esc(it['name'])} {esc(it['volume'])} — {it['qty']} шт</b>\n"
-        f"На складе несколько партий с разными сроками. {verb}{note}",
+        f"На складе несколько партий с разными сроками. {verb}{note}\n"
+        f"<i>Если в партии меньше, чем нужно, — возьму её целиком, остальное "
+        f"из следующих по сроку. В минус партии не уходят.</i>",
         parse_mode="HTML", reply_markup=InlineKeyboardMarkup(kb))
 
 
@@ -6103,6 +6206,12 @@ async def _finish_writeoff(q, context, actor, p):
         warn += ("\n\n⚠️ Срок не совпадает с партиями склада:\n• "
                  + "\n• ".join(bad_exp)
                  + "\nЕсли срок ошибочный — «исправь срок ...» или /undo")
+    short = _short_expiry_items(p)
+    if short:
+        await q.edit_message_text(
+            _short_expiry_text(p, short) + "\n(заявка снята — отправьте заново)",
+            parse_mode="HTML")
+        return
     _fill_src_batches(p)
     op_id, summary, total = commit_writeoff(p)
     # Операция уже в базе — сбои уведомлений не должны выглядеть как
@@ -6187,6 +6296,14 @@ async def _finish_transfer(q, context, actor, p):
                      "\n• " + "\n• ".join(bad_exp) +
                      "\nЕсли срок ошибочный — напишите «исправь срок ...» "
                      "или отмените: /undo")
+        short = _short_expiry_items(p)
+        if short:
+            # Партия уменьшилась, пока заявка ждала кнопки, — в минус не
+            # уводим (29.10.2026), операцию не проводим.
+            await q.edit_message_text(
+                _short_expiry_text(p, short) + "\n(заявка снята — отправьте заново)",
+                parse_mode="HTML")
+            return
     _fill_src_batches(p)
     op_id, summary = commit_transfer(p)
     if not p.get("from_wh_id"):
@@ -6848,50 +6965,58 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             return
         PENDING.pop(token, None)
-        await q.answer()
+        # Ответ на callback — ОДИН: либо всплывашка (нехватка/раскладка по
+        # партиям), либо пустой; второй q.answer Telegram отвергает.
         try:
             idx = parts[2]
             item = p["items"][int(idx)]
         except (ValueError, IndexError):
+            await q.answer()
             await q.edit_message_text("⌛ Заявка устарела — отправьте накладную заново.")
             return
         choices = p.setdefault("batch_choices", {})
         choice = parts[3] if len(parts) > 3 else "fefo"
         if choice == "fefo":
+            await q.answer()
             choices[idx] = ""   # пусто = «сначала старые» (FEFO)
         else:
             # В кнопке закодирован сам срок («~» = партия без срока);
             # сверяем с текущими партиями — устаревший выбор уходит в FEFO.
             exp = "" if choice == BATCH_NO_EXPIRY else choice
             pid_ = item.get("product_id") or 0
-            current = {b["expiry"]: b["qty"] for b in db.product_batches_of(
-                _batch_src_wh(p), pid_)}
-            if exp in current:
-                # В партии меньше, чем в строке (с учётом строк выше) —
-                # первое нажатие только предупреждает, второе списывает в
-                # минус осознанно (продавец знает, какую коробку взял).
-                left = current[exp] - (_reserved_batches(p, int(idx))
-                                       .get(pid_, {}).get(exp, 0))
-                warned = p.setdefault("batch_warned", {})
-                if left < item["qty"] and warned.get(idx) != choice:
-                    warned[idx] = choice
-                    label = f"до {exp}" if exp else "без срока"
-                    await q.answer(
-                        f"В партии {label} только {max(left, 0)} шт из "
-                        f"{item['qty']} — остальное уйдёт в минус. Нажмите "
-                        f"ещё раз, чтобы списать так, или выберите «Сначала "
-                        f"старые» / «Разделить по партиям».", show_alert=True)
-                    try:
-                        opts = _batch_options(
-                            p, pid_, item["qty"],
-                            _reserved_batches(p, int(idx)).get(pid_))
-                        if not opts:
-                            opts = db.product_batches_of(_batch_src_wh(p), pid_)
-                        await _ask_batch(q, p, (int(idx), item, opts))
-                    except Exception:
-                        log.exception("Не удалось повторить вопрос о партии")
-                    return
-            choices[idx] = (choice if exp in current else "")
+            picked, note, short = _batch_pick_rows(p, int(idx), item, exp)
+            if picked is None:
+                # Товара не хватает даже по всем партиям — в минус не уводим
+                # (решение владельца 29.10.2026), операцию не проводим.
+                await q.answer(
+                    f"На складе только {short} шт из {item['qty']} по всем "
+                    f"партиям — столько продать нельзя. Уменьшите количество "
+                    f"и отправьте операцию заново.", show_alert=True)
+                try:
+                    opts = _batch_options(
+                        p, pid_, item["qty"],
+                        _reserved_batches(p, int(idx)).get(pid_))
+                    if not opts:
+                        opts = db.product_batches_of(_batch_src_wh(p), pid_)
+                    await _ask_batch(q, p, (int(idx), item, opts))
+                except Exception:
+                    log.exception("Не удалось повторить вопрос о партии")
+                return
+            try:
+                await q.answer(note or None, show_alert=bool(note))
+            except Exception:
+                log.exception("Не удалось ответить на кнопку партии")
+            choices[idx] = picked
+            if note:
+                # Раскладку по партиям дублируем сообщением — всплывашку
+                # легко закрыть не читая, а в карточке её не будет.
+                try:
+                    await context.bot.send_message(
+                        q.message.chat.id,
+                        f"📅 {esc(item['name'])} {esc(item['volume'])}: {esc(note)}",
+                        parse_mode="HTML")
+                except Exception:
+                    log.exception("Не удалось отправить раскладку по партиям")
         try:
             await _continue_op(q, context, actor, p,
                                q.message.chat.id, q.from_user.id)
@@ -7443,8 +7568,11 @@ async def split_reply(update, context, text: str) -> bool:
     rows = _parse_split(text)
     if not rows and AWAIT_EXPIRY.get(key) and EXPIRY_REPLY_RE.match(text or ""):
         return False   # это ответ о сроке годности — его ждёт expiry_reply
-    batches = {b["expiry"]: b["qty"] for b in db.product_batches_of(
-        _batch_src_wh(p), it.get("product_id") or 0)}
+    pid_ = it.get("product_id") or 0
+    reserved_ = _reserved_batches(p, int(idx)).get(pid_, {}) if int(idx) else {}
+    batches = {b["expiry"]: b["qty"] - reserved_.get(b["expiry"], 0)
+               for b in db.product_batches_of(_batch_src_wh(p), pid_)}
+    batches = {e: q_ for e, q_ in batches.items() if q_ > 0}
     problem = None
     if not rows:
         problem = "не понял"
@@ -7453,6 +7581,11 @@ async def split_reply(update, context, text: str) -> bool:
     elif any(e not in batches for e, _ in rows):
         bad = [e or "без срока" for e, _ in rows if e not in batches]
         problem = f"на складе нет партии {', '.join(bad)}"
+    elif any(q_ > batches[e] for e, q_ in rows):
+        # Партия в минус не уходит (решение владельца 29.10.2026)
+        bad = [f"{('до ' + e) if e else 'без срока'} — только {batches[e]} шт, "
+               f"просите {q_}" for e, q_ in rows if q_ > batches[e]]
+        problem = "больше, чем есть в партии: " + "; ".join(bad)
     elif sum(q_ for _, q_ in rows) != it["qty"]:
         problem = (f"в сумме {sum(q_ for _, q_ in rows)} шт, а нужно "
                    f"{it['qty']} шт")
@@ -12279,7 +12412,7 @@ async def check_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not text:
         await update.message.reply_text(
             "✅ Учёт сходится: остатки = журнал, партии = остатки, "
-            "призраков и минусовых касс нет.")
+            "призраков, минусов «без срока» и минусовых касс нет.")
         return
     await send_long(update.message, text)
 
