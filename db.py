@@ -1501,6 +1501,53 @@ def client_exact_strict(wh_id: int, text: str):
     return client_get(ids.pop())
 
 
+def client_name_taken(wh_id: int, text: str):
+    """Занято ли имя на складе ПО-НАСТОЯЩЕМУ: точное совпадение имени или
+    псевдонима либо те же слова в другом порядке. Опечаточное сходство
+    (difflib) здесь НЕ считается (07.11.2026, инцидент «Жумакеев /
+    Джумакеев»): переименование клиента в имя, лишь похожее на имя
+    двойника, должно проходить — админ видит карточку и решает сам.
+    Возвращает клиента или None."""
+    t = (text or "").strip()
+    if not t:
+        return None
+    c = client_exact_strict(wh_id, t)
+    if c is not None:
+        return c
+    key = _name_key(t)
+    conn = connect()
+    ids = {r["id"] for r in conn.execute(
+        "SELECT id, name FROM clients WHERE warehouse_id=?", (wh_id,))
+        if _name_key(r["name"]) == key}
+    ids |= {r["client_id"] for r in conn.execute(
+        "SELECT a.client_id, a.alias FROM client_aliases a JOIN clients c "
+        "ON c.id=a.client_id WHERE c.warehouse_id=?", (wh_id,))
+        if _name_key(r["alias"]) == key}
+    return client_get(ids.pop()) if len(ids) == 1 else None
+
+
+def delete_client_alias(wh_ids: list, alias: str):
+    """Удалить псевдоним клиента на видимых складах (07.11.2026). Возвращает
+    список (client_id, имя клиента, склад) удалённых записей (обычно одна)."""
+    a = (alias or "").strip()
+    if not a or not wh_ids:
+        return []
+    marks = ",".join("?" * len(wh_ids))
+    conn = connect()
+    rows = conn.execute(
+        f"SELECT a.client_id, c.name, w.name wh FROM client_aliases a "
+        f"JOIN clients c ON c.id=a.client_id JOIN warehouses w ON w.id=c.warehouse_id "
+        f"WHERE c.warehouse_id IN ({marks}) AND a.alias=? COLLATE NOCASEU",
+        (*wh_ids, a)).fetchall()
+    if not rows:
+        return []
+    with _lock, conn:
+        conn.execute(
+            f"DELETE FROM client_aliases WHERE alias=? COLLATE NOCASEU AND client_id IN "
+            f"(SELECT id FROM clients WHERE warehouse_id IN ({marks}))", (a, *wh_ids))
+    return [(r["client_id"], r["name"], r["wh"]) for r in rows]
+
+
 def rename_client(client_id: int, new_name: str, keep_old_alias: bool = True):
     """Переименование контрагента (17.08.2026, просьба владельца).
 

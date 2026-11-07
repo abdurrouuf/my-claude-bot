@@ -4588,13 +4588,24 @@ async def start_rename_client(update, context, actor, data):
         return
     # Новое имя не должно быть занято на этом складе (имена и псевдонимы) —
     # иначе получится два клиента под одним именем.
-    other = db.client_exact(wh["id"], new_name)
+    # Занятость — по ТОЧНОМУ имени/псевдониму и перестановке слов; просто
+    # похожее имя (double «Жумакеев Шайлообек» при новом «Джумакеев
+    # Шайлообек», 07.11.2026) не блокирует, но показывается в карточке.
+    other = db.client_name_taken(wh["id"], new_name)
     if other is not None and other["id"] != c["id"]:
         await update.message.reply_text(
             f"⚠️ Имя «{esc(new_name)}» на складе «{esc(wh['name'])}» уже занято "
             f"клиентом «{esc(other['name'])}» — переименование отменено.",
             parse_mode="HTML")
         return
+    alike = db.client_exact(wh["id"], new_name)
+    alike_note = ""
+    if alike is not None and alike["id"] != c["id"]:
+        alike_note = (f"⚠️ На складе есть ПОХОЖИЙ клиент «{esc(alike['name'])}» "
+                      f"(долг {money(alike['debt'])}) — не двойник ли? Если да, "
+                      f"после переименования переименуйте и его (например, в "
+                      f"«… дубль») и удалите лишний псевдоним: "
+                      f"«удали псевдоним Имя».\n")
     payload = {"kind": "rename_client", "user_id": actor["id"],
                "chat_id": update.effective_chat.id, "client_id": c["id"],
                "old_name": c["name"], "new_name": new_name,
@@ -4603,7 +4614,7 @@ async def start_rename_client(update, context, actor, data):
     swap_note = ("⚠️ <b>Понял наоборот</b>: первое имя не нашлось, второе есть "
                  "в базе — проверьте направление!\n" if swapped else "")
     await update.message.reply_text(
-        swap_note +
+        swap_note + alike_note +
         f"✏️ <b>Переименование клиента</b> — склад «{esc(wh['name'])}»\n\n"
         f"«{esc(c['name'])}» → <b>«{esc(new_name)}»</b>\n"
         f"Текущий долг: {money(c['debt'])} — долг, история операций, телефон и "
@@ -7383,7 +7394,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 c_now = db.client_get(p["client_id"])
                 wh_row = (db.warehouse_by_id(p["wh_id"]) if p.get("wh_id")
                           else db.warehouse_by_name(p["wh_name"]))
-                other = db.client_exact(wh_row["id"], p["new_name"]) if wh_row else None
+                other = db.client_name_taken(wh_row["id"], p["new_name"]) if wh_row else None
                 if c_now is None:
                     await q.edit_message_text("⚠️ Клиент уже не существует.")
                 elif other is not None and other["id"] != p["client_id"]:
@@ -8627,6 +8638,8 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # личка; 30.09.2026), тоже без ИИ.
     if not quiet and await desc_text_reply(update, actor, text):
         return
+    if not quiet and await alias_del_reply(update, actor, text):
+        return
     # «накладная №1231 отгружена 13.10» — дата отгрузки готовой накладной
     if not quiet and await ship_date_reply(update, actor, text):
         return
@@ -9015,6 +9028,35 @@ async def _send_public_certs(update, short: str):
 # «описание Альтопен: удалить» — убрать; «описания» — список.
 DESC_RE = re.compile(r"^\s*описани[ея]\s+(?:препарата\s+)?([^:\n]+?)\s*(?::\s*(.+))?$",
                      re.IGNORECASE | re.DOTALL)
+
+
+ALIAS_DEL_RE = re.compile(
+    r"^(?:удали(?:ть)?|убери|убрать|сними|снять)\s+псевдоним\s+(.+?)\s*$",
+    re.IGNORECASE | re.DOTALL)
+
+
+async def alias_del_reply(update, actor, text: str) -> bool:
+    """«удали псевдоним Жумакеев Шайлообек» (админ, личка, без ИИ; 07.11.2026):
+    псевдоним ищется точно (без учёта регистра) по видимым складам. Нужно,
+    когда старое имя переименованного двойника мешает занять его другому
+    клиенту. True — сообщение обработано."""
+    m = ALIAS_DEL_RE.match((text or "").strip())
+    if not m or not is_admin(actor) or update.effective_chat.type != "private":
+        return False
+    alias = m.group(1).strip(" «»\"'.")
+    whs = [w["id"] for w in db.visible_warehouses(actor)]
+    gone = db.delete_client_alias(whs, alias)
+    if not gone:
+        await update.message.reply_text(
+            f"Псевдонима «{esc(alias)}» ни у кого нет. Псевдонимы клиента видны "
+            f"в карточке: /client Имя.", parse_mode="HTML")
+        return True
+    _KNOWN_CLIENTS_CACHE["ts"] = 0.0
+    await update.message.reply_text(
+        "✅ Псевдоним удалён: " + "; ".join(
+            f"«{esc(alias)}» у клиента «{esc(n)}» ({esc(w)})" for _, n, w in gone)
+        + ". Вернуть: «Имя — он же Псевдоним».", parse_mode="HTML")
+    return True
 
 
 async def desc_text_reply(update, actor, text: str) -> bool:
