@@ -2915,6 +2915,73 @@ def test_no_ghost_batches():
     print("  ✓ партии больше не уходят в минус: кнопка, разделение, /check")
 
 
+def test_rename_lookalike_and_alias_delete():
+    """07.11.2026, инцидент «Жумакеев / Джумакеев»: Бека завёл двойника
+    «Жумакеев Шайлообек», старый клиент «Шайлоо Беловодское» должен стать
+    «Джумакеев Шайлообек». Занятость при переименовании — только точное
+    имя/псевдоним и перестановка слов (похожее имя не блокирует, но
+    показывается в карточке); «удали псевдоним X» снимает псевдоним."""
+    import asyncio
+    from types import SimpleNamespace
+    wh = _fresh_db()
+    db.clients_add_bulk(wh["id"], [("Шайлоо Беловодское", 0),
+                                   ("Жумакеев Шайлообек", 0),
+                                   ("Кубан Чооров", 100)])
+    old = db.client_exact(wh["id"], "Шайлоо Беловодское")
+    dbl = db.client_exact(wh["id"], "Жумакеев Шайлообек")
+    admin = db.get_user(ADMIN)
+    sent = []
+
+    async def reply(text, **kw):
+        sent.append(text)
+    upd = SimpleNamespace(message=SimpleNamespace(reply_text=reply),
+                          effective_chat=SimpleNamespace(id=1, type="private"))
+
+    def start(client, new_name):
+        asyncio.run(bot.start_rename_client(upd, None, admin, {
+            "action": "rename_client", "client": client, "new_name": new_name}))
+        return sent[-1]
+
+    def press():
+        token = next(iter(bot.PENDING))
+        q = SimpleNamespace(data=f"ok:{token}", from_user=SimpleNamespace(id=ADMIN),
+                            message=SimpleNamespace(chat=SimpleNamespace(id=1)),
+                            answer=_noop_async, edit_message_text=reply)
+        asyncio.run(bot.on_callback(SimpleNamespace(
+            callback_query=q, effective_user=SimpleNamespace(id=ADMIN)),
+            SimpleNamespace(bot=None)))
+        return sent[-1]
+    # строгая занятость: перестановка слов — занято; похожее — нет
+    assert db.client_name_taken(wh["id"], "Чооров Кубан")["name"] == "Кубан Чооров"
+    assert db.client_name_taken(wh["id"], "Джумакеев Шайлообек") is None
+    assert db.client_exact(wh["id"], "Джумакеев Шайлообек")["id"] == dbl["id"]  # нечётко — двойник
+    out = start("Шайлоо Беловодское", "Чооров Кубан")
+    assert "уже занято" in out
+    # похожее имя двойника не блокирует, но карточка предупреждает
+    out = start("Шайлоо Беловодское", "Джумакеев Шайлообек")
+    assert "Переименование клиента" in out and "ПОХОЖИЙ клиент «Жумакеев Шайлообек»" in out
+    assert "Переименовано" in press()
+    assert db.client_get(old["id"])["name"] == "Джумакеев Шайлообек"
+    assert db.client_exact_strict(wh["id"], "Джумакеев Шайлообек")["id"] == old["id"]
+    assert db.client_exact(wh["id"], "Шайлоо Беловодское")["id"] == old["id"]   # псевдоним
+    # двойника — в «дубль», его старое имя остаётся псевдонимом → удаляем
+    out = start("Жумакеев Шайлообек", "Жумакеев дубль")
+    assert "Переименование клиента" in out
+    press()
+    assert "Жумакеев Шайлообек" in db.client_aliases_list(dbl["id"])
+    asyncio.run(bot.alias_del_reply(upd, admin, "удали псевдоним Жумакеев Шайлообек"))
+    assert "Псевдоним удалён" in sent[-1] and "Жумакеев дубль" in sent[-1]
+    assert "Жумакеев Шайлообек" not in db.client_aliases_list(dbl["id"])
+    asyncio.run(bot.alias_del_reply(upd, admin, "удали псевдоним Жумакеев Шайлообек"))
+    assert "ни у кого нет" in sent[-1]
+    # сотруднику и в группе — не команда (уйдёт в ИИ)
+    dan = db.get_user(DANIYAR)
+    assert not asyncio.run(bot.alias_del_reply(upd, dan, "удали псевдоним Жумакеев дубль"))
+    assert "Жумакеев Шайлообек" not in db.client_aliases_list(dbl["id"])
+    bot.PENDING.clear()
+    print("  ✓ переименование в похожее имя + удаление псевдонима")
+
+
 def test_batch_split():
     """Кнопка «Разделить по партиям» (01.09.2026): количество позиции
     делится между партиями текстом («150 до 01.2028, 100 до 04.2028»),
