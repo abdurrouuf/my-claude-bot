@@ -3999,6 +3999,92 @@ def test_moves_report():
     assert "остаток 72" in out["cap"] and wh["name"] in out["cap"]
 
 
+def test_to1c_export():
+    # /to1c — Excel для переноса в 1С (10.11.2026): расходные накладные
+    # построчно, поступления в кассу, сверка долгов
+    import asyncio
+    from types import SimpleNamespace
+    from openpyxl import load_workbook
+    import export_xlsx
+    wh = _fresh_db()
+    _load(wh, {16: 500, 20: 300})
+    # один товар двумя строками по одной цене (разные партии) -> одна строка
+    (op1, *_), _ = _invoice(wh, ADMIN, "Тыныбек Талас",
+                            [_item(20, 72, 940), _item(20, 48, 940),
+                             _item(16, 100, 160)], payment=30000)
+    (op2, *_), _ = _invoice(wh, ADMIN, "Асан", [_item(16, 5, 180)])
+    (op3, *_), _ = _invoice(wh, ADMIN, "Болот", [_item(16, 1, 180)])
+    db.cancel_operation(op3)                       # отменённая не выгружается
+    cid = db.client_exact(wh["id"], "Тыныбек Талас")["id"]
+    bot.commit_payment({"client_id": cid, "amount": 50000, "user_id": ADMIN,
+                        "wh_id": wh["id"], "wh_name": wh["name"]})
+    buf, n = export_xlsx.build_1c("2000-01-01")
+    assert n["inv"] == 2 and n["inv_sum"] == 120 * 940 + 100 * 160 + 5 * 180
+    assert n["pay"] == 2 and n["pay_sum"] == 80000
+    wb = load_workbook(buf)
+    assert wb.sheetnames == ["Расходные накладные", "Поступления в кассу",
+                             "Возвраты", "Списания", "Перемещения", "Сверка долгов"]
+    rows = list(wb["Расходные накладные"].iter_rows(min_row=2, values_only=True))
+    r = next(x for x in rows if x[1] == op1 and x[4] == "КЛОЗАТОП")
+    assert r[5] == "1 л" and r[6] == 120 and r[7] == 940 and r[8] == 112800
+    assert sum(1 for x in rows if x[1] == op1 and x[3]) == 2      # 2 строки, не 3
+    tot = next(x for x in rows if x[4] == f"Итого по накладной №{op1}")
+    assert tot[8] == 128800
+    assert not any(x[1] == op3 for x in rows)
+    assert rows[-1][4] == "ВСЕГО" and rows[-1][8] == n["inv_sum"]
+    pays = list(wb["Поступления в кассу"].iter_rows(min_row=2, values_only=True))
+    assert any(x[4] == 30000 and f"№{op1}" in x[6] for x in pays)
+    assert any(x[4] == 50000 and x[6] == "отдельная оплата" for x in pays)
+    debts = list(wb["Сверка долгов"].iter_rows(min_row=2, values_only=True))
+    d = next(x for x in debts if x[1] == "Тыныбек Талас")
+    assert d[2] == 128800 - 80000 and d[3] is None and str(d[4]).startswith("=IF(")
+    # только один клиент
+    _buf, n1 = export_xlsx.build_1c("2000-01-01", client_id=cid)
+    assert n1["inv"] == 1 and n1["pay"] == 2
+    # календарный месяц в будущем — пусто
+    _buf, n0 = export_xlsx.build_1c("2000-01-01", end_iso="2000-02-01")
+    assert n0["inv"] == 0 and n0["pay"] == 0
+
+    out = {}
+
+    class Msg:
+        async def reply_text(self, text, **kw):
+            out["text"] = text
+
+        async def reply_document(self, document=None, caption=None, **kw):
+            out["doc"], out["cap"] = document.input_file_content, caption
+            out["name"] = document.filename
+
+    class Bot:
+        async def send_chat_action(self, **kw):
+            pass
+
+    def upd(uid, chat="private"):
+        return SimpleNamespace(effective_user=SimpleNamespace(id=uid),
+                               effective_chat=SimpleNamespace(id=1, type=chat),
+                               message=Msg())
+
+    run = lambda u, a: asyncio.run(bot.to1c_cmd(u, SimpleNamespace(args=a, bot=Bot())))
+    run(upd(ADMIN), ["Тыныбек", "Талас", "все"])
+    assert out["doc"][:2] == b"PK" and "Тыныбек Талас" in out["cap"]
+    assert "накладных: 1 на 128'800" in out["cap"], out["cap"]
+    assert out["name"].endswith(".xlsx")
+    out.clear()
+    run(upd(ADMIN), ["Каракол", "неделя"])
+    assert "склад Каракол" in out["cap"] and "накладных: 2" in out["cap"]
+    out.clear()
+    run(upd(ADMIN), ["01.2020"])                   # пустой месяц — текст
+    assert "doc" not in out and "документов нет" in out["text"]
+    out.clear()
+    run(upd(ADMIN), ["Неведомый", "Зверь"])
+    assert "doc" not in out and "не склад и не клиент" in out["text"]
+    out.clear()
+    run(upd(DANIYAR), [])                          # сотруднику — отказ
+    assert "doc" not in out
+    assert bot._onec_period("90", datetime.now(bot.BISHKEK))[2] == "за 90 дн."
+    assert bot._onec_period("13.2026", datetime.now(bot.BISHKEK)) is None
+
+
 def test_history_xlsx():
     # /history — Excel по всем товарам: продажи по месяцам/дням, движения,
     # остатки (18.09.2026, для планирования закупок)

@@ -172,6 +172,196 @@ def build_export(start_iso: str, period_label: str) -> io.BytesIO:
     return buffer
 
 
+# ---------- /to1c — выгрузка для переноса в 1С ----------
+# Просьба владельца 10.11.2026: он вручную переносит накладные бота в 1С
+# и сверяет по одной. Файл повторяет документы 1С: расходные накладные
+# построчно (номенклатура / характеристика / количество / цена / сумма),
+# поступления в кассу, возвраты, списания, перемещения и лист сверки
+# долгов с пустой колонкой «Долг в 1С».
+
+def _d1c(ts: str) -> str:
+    try:
+        return datetime.fromisoformat(ts).strftime("%d.%m.%Y")
+    except (ValueError, TypeError):
+        return str(ts or "")[:10]
+
+
+def _item_names(it, prods):
+    """(номенклатура, характеристика) как в 1С: имя без состава в скобках
+    и фасовка отдельной колонкой."""
+    pr = prods.get(it.get("product_id"))
+    name = pr["name"] if pr else str(it.get("name") or "")
+    vol = pr["volume"] if pr else str(it.get("volume") or "")
+    return _txt(name.split("(")[0].strip()), vol
+
+
+def _merged_items(items):
+    """Строки документа; один товар по одной цене, разбитый ботом на две
+    строки (разные партии), в 1С вносится одной строкой."""
+    out, idx = [], {}
+    for it in items or []:
+        try:
+            qty, price = float(it.get("qty") or 0), float(it.get("price") or 0)
+        except (TypeError, ValueError):
+            continue
+        key = (it.get("product_id") or (it.get("name"), it.get("volume")), price)
+        if key in idx:
+            out[idx[key]]["qty"] += qty
+        else:
+            idx[key] = len(out)
+            out.append({**it, "qty": qty, "price": price})
+    return out
+
+
+def _bold_row(ws, cols):
+    for c in cols:
+        ws.cell(row=ws.max_row, column=c).font = Font(bold=True)
+
+
+def build_1c(start_iso: str, end_iso: str = None, wh_ids=None,
+             client_id: int = None, skip_wh_ids=None):
+    """Excel для переноса в 1С. wh_ids — только эти склады (None = все,
+    кроме skip_wh_ids); client_id — только документы этого клиента.
+    Возвращает (файл, счётчики по листам)."""
+    skip = set(skip_wh_ids or ())
+    whs = {w["id"]: w["name"] for w in db.all_warehouses() if w["id"] not in skip}
+    if wh_ids is not None:
+        whs = {k: v for k, v in whs.items() if k in set(wh_ids)}
+    users = {u["id"]: u["name"] for u in db.list_users(active_only=False)}
+    prods = {p["id"]: p for p in prices.PRICE_LIST_DATA}
+    cl_cache = {}
+
+    def cname(cid):
+        if cid not in cl_cache:
+            c = db.client_get(cid) if cid else None
+            cl_cache[cid] = c["name"] if c else "—"
+        return cl_cache[cid]
+
+    wb = Workbook()
+    ws_inv = wb.active
+    ws_inv.title = "Расходные накладные"
+    doc_cols = ["Дата", "№ бота", "Склад", "Покупатель", "Номенклатура",
+                "Характеристика", "Количество", "Цена", "Сумма"]
+    doc_w = [12, 9, 13, 28, 30, 16, 12, 11, 14]
+    _sheet_header(ws_inv, doc_cols, doc_w)
+    ws_pay = wb.create_sheet("Поступления в кассу")
+    _sheet_header(ws_pay, ["Дата", "№ бота", "Склад", "Покупатель", "Сумма",
+                           "Принял", "Примечание"], [12, 9, 13, 28, 14, 14, 30])
+    ws_ret = wb.create_sheet("Возвраты")
+    _sheet_header(ws_ret, doc_cols, doc_w)
+    ws_wo = wb.create_sheet("Списания")
+    _sheet_header(ws_wo, ["Дата", "№ бота", "Склад", "Номенклатура",
+                          "Характеристика", "Количество", "Причина"],
+                  [12, 9, 13, 30, 16, 12, 34])
+    ws_tr = wb.create_sheet("Перемещения")
+    _sheet_header(ws_tr, ["Дата", "№ бота", "Откуда", "Куда", "Номенклатура",
+                          "Характеристика", "Количество"],
+                  [12, 9, 22, 14, 30, 16, 12])
+
+    n = {"inv": 0, "inv_sum": 0.0, "pay": 0, "pay_sum": 0.0, "ret": 0,
+         "ret_sum": 0.0, "wo": 0, "tr": 0}
+
+    def doc_rows(ws, op, data, label):
+        total = 0.0
+        d, who = _d1c(db.op_ts(op)), _txt(cname(op["client_id"]))
+        for it in _merged_items(data.get("items")):
+            nm, vol = _item_names(it, prods)
+            sub = it["qty"] * it["price"]
+            total += sub
+            ws.append([d, op["id"], whs[op["warehouse_id"]], who, nm, vol,
+                       it["qty"], it["price"], sub])
+        ws.append([d, op["id"], "", "", f"{label} №{op['id']}", "", "", "", total])
+        _bold_row(ws, (5, 9))
+        ws.append([])
+        return total
+
+    for op in db.operations_since(start_iso, end_iso):
+        try:
+            data = json.loads(op["data"])
+        except (ValueError, TypeError):
+            continue
+        t = op["type"]
+        if client_id is not None and op["client_id"] != client_id:
+            continue
+        if t == "transfer":
+            deltas = data.get("stock_deltas") or []
+            touched = {w for w, _p, _d in deltas}
+            if not (touched & set(whs)):
+                continue
+            src = sorted({w for w, _p, dl in deltas if dl < 0})
+            src_name = ", ".join((db.warehouse_by_id(w) or {"name": f"склад {w}"})["name"]
+                                 for w in src) or "поставка (приход извне)"
+            dst = db.warehouse_by_id(op["warehouse_id"])
+            for it in data.get("items") or []:
+                nm, vol = _item_names(it, prods)
+                ws_tr.append([_d1c(db.op_ts(op)), op["id"], src_name,
+                              dst["name"] if dst else "", nm, vol, it.get("qty")])
+            n["tr"] += 1
+            continue
+        if op["warehouse_id"] not in whs:
+            continue
+        if t == "invoice":
+            n["inv"] += 1
+            n["inv_sum"] += doc_rows(ws_inv, op, data, "Итого по накладной")
+            pay = float(data.get("payment") or 0)
+            if pay > 0:
+                ws_pay.append([_d1c(db.op_ts(op)), op["id"], whs[op["warehouse_id"]],
+                               _txt(cname(op["client_id"])), pay,
+                               users.get(op["user_id"], ""),
+                               f"оплата при накладной №{op['id']}"])
+                n["pay"] += 1
+                n["pay_sum"] += pay
+        elif t == "payment":
+            amt = float(data.get("amount") or 0)
+            ws_pay.append([_d1c(db.op_ts(op)), op["id"], whs[op["warehouse_id"]],
+                           _txt(cname(op["client_id"])), amt,
+                           users.get(op["user_id"], ""), "отдельная оплата"])
+            n["pay"] += 1
+            n["pay_sum"] += amt
+        elif t == "return":
+            n["ret"] += 1
+            n["ret_sum"] += doc_rows(ws_ret, op, data, "Итого по возврату")
+        elif t == "writeoff":
+            reason = (data.get("reason") or "").strip()
+            for it in data.get("items") or []:
+                nm, vol = _item_names(it, prods)
+                ws_wo.append([_d1c(db.op_ts(op)), op["id"], whs[op["warehouse_id"]],
+                              nm, vol, it.get("qty"), _txt(reason)])
+            n["wo"] += 1
+
+    for ws, lab, col, key in ((ws_inv, 5, 9, "inv_sum"), (ws_pay, 4, 5, "pay_sum"),
+                              (ws_ret, 5, 9, "ret_sum")):
+        row = [""] * col
+        row[lab - 1], row[col - 1] = "ВСЕГО", n[key]
+        ws.append(row)
+        _bold_row(ws, (lab, col))
+
+    # --- Сверка долгов: колонку «Долг в 1С» владелец заполняет сам ---
+    ws = wb.create_sheet("Сверка долгов")
+    _sheet_header(ws, ["Склад", "Покупатель", "Долг в боте (сейчас)",
+                       "Долг в 1С (впишите)", "Разница (бот − 1С)"],
+                  [13, 30, 20, 20, 20])
+    debt_total = 0.0
+    for wid, wname in whs.items():
+        for c in db.clients_of(wid):
+            if client_id is not None and c["id"] != client_id:
+                continue
+            if not c["debt"] and client_id is None:
+                continue
+            r = ws.max_row + 1
+            ws.append([wname, _txt(c["name"]), c["debt"], None,
+                       f'=IF(D{r}="","",C{r}-D{r})'])
+            debt_total += c["debt"]
+    ws.append(["", "ИТОГО", debt_total])
+    _bold_row(ws, (2, 3))
+    n["debt_sum"] = debt_total
+
+    buf = io.BytesIO()
+    wb.save(buf)
+    buf.seek(0)
+    return buf, n
+
+
 # ---------- /history — движение и продажи ВСЕХ товаров по датам ----------
 # Просьба владельца 18.09.2026: «все движения, все препараты, по дням, по
 # месяцам — сколько продалось в августе, в сентябре… чтобы знать, что и

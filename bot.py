@@ -12502,6 +12502,123 @@ async def export_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         caption=f"📊 Экспорт {label}: операции, долги, остатки, кассы")
 
 
+ONEC_MONTH_RE = re.compile(r"^(\d{1,2})[./](\d{4})$")
+
+
+def _onec_period(word: str, now):
+    """Период выгрузки для 1С: слово (день/неделя/месяц/все), число дней
+    («90») или календарный месяц «09.2026». -> (start, end|None, подпись)."""
+    w = word.lower()
+    m = ONEC_MONTH_RE.match(w)
+    if m and 1 <= int(m.group(1)) <= 12:
+        mo, yr = int(m.group(1)), int(m.group(2))
+        start = now.replace(year=yr, month=mo, day=1, hour=0, minute=0,
+                            second=0, microsecond=0)
+        end = (start.replace(year=yr + 1, month=1) if mo == 12
+               else start.replace(month=mo + 1))
+        return start, end, f"за {mo:02d}.{yr}"
+    if w in EXPORT_PERIODS:
+        days, label = EXPORT_PERIODS[w]
+    elif w.isdigit() and 1 <= int(w) <= 3650:
+        days, label = int(w) - 1, f"за {int(w)} дн."
+    else:
+        return None
+    start = (now - timedelta(days=days)).replace(hour=0, minute=0, second=0,
+                                                 microsecond=0)
+    return start, None, label
+
+
+async def to1c_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/to1c [период] [Склад | Клиент] — Excel для переноса в 1С (просьба
+    владельца 10.11.2026: накладные вносились в 1С вручную по PDF из чата).
+    Листы повторяют документы 1С. Только админ, только личка."""
+    actor = await _require_admin(update)
+    if actor is None:
+        return
+    if not await _require_private(update):
+        return
+    usage = ("Выгрузка для 1С:\n"
+             "/to1c — все склады за 30 дней\n"
+             "/to1c Бишкек неделя — склад за период\n"
+             "/to1c Кабылбеков Тыныбек все — один клиент\n"
+             "Период: день, неделя, месяц, все, число дней (90) "
+             "или месяц 09.2026")
+    args = list(context.args or [])
+    now = datetime.now(BISHKEK)
+    period = _onec_period("месяц", now)
+    for i in (len(args) - 1, 0):
+        if 0 <= i < len(args):
+            got = _onec_period(args[i], now)
+            if got:
+                period = got
+                args.pop(i)
+                break
+    start, end, label = period
+    name = " ".join(args).strip()
+    wh_ids, client, scope = None, None, "все склады"
+    if name and name.lower() not in ("all", "все"):
+        # Одно слово — сначала склад («Бишкек» есть и в именах клиентов);
+        # несколько слов — сначала точный клиент («Ден Каракол» похож на
+        # склад Каракол), потом склад («Кара Балта»).
+        wh = cwh = None
+        if len(args) == 1:
+            wh = db.warehouse_by_name(name)
+        else:
+            client, cwh = find_client_visible(actor, name)
+            if client is None and len(args) == 2:
+                wh = db.warehouse_by_name(name)
+        if wh is not None:
+            wh_ids, scope = [wh["id"]], f"склад {wh['name']}"
+        else:
+            if client is None:
+                client, cwh = find_client_visible(actor, name)
+            if client is None:
+                cands = {}
+                for w in db.visible_warehouses(actor):
+                    for x in db.fuzzy_clients(w["id"], name):
+                        cands[x["id"]] = (x, w)
+                if len(cands) == 1:
+                    client, cwh = next(iter(cands.values()))
+                else:
+                    msg = f"❌ «{esc(name)}» — не склад и не клиент."
+                    if cands:
+                        msg += "\nВозможно: " + ", ".join(
+                            esc(f"{x['name']} ({w['name']})")
+                            for x, w in list(cands.values())[:5])
+                    await update.message.reply_text(msg + "\n\n" + esc(usage),
+                                                    parse_mode="HTML")
+                    return
+            wh_ids, scope = [cwh["id"]], f"{client['name']} ({cwh['name']})"
+    await context.bot.send_chat_action(chat_id=update.effective_chat.id,
+                                       action="upload_document")
+    import export_xlsx
+    xlsx, n = export_xlsx.build_1c(
+        start.isoformat(timespec="seconds"),
+        end.isoformat(timespec="seconds") if end else None,
+        wh_ids=wh_ids, client_id=client["id"] if client else None,
+        skip_wh_ids=training_wh_ids())
+    if not (n["inv"] or n["pay"] or n["ret"] or n["wo"] or n["tr"]):
+        await update.message.reply_text(
+            f"За период ({label}) по «{scope}» документов нет.\n\n{usage}")
+        return
+    tag = safe_filename(client["name"] if client else scope)
+    filename = f"для_1С_{tag}_{now.strftime('%d%m%Y')}.xlsx"
+    lines = [f"📒 Для 1С — {esc(scope)}, {label}",
+             f"• расходных накладных: {n['inv']} на {money(n['inv_sum'])} сом",
+             f"• поступлений в кассу: {n['pay']} на {money(n['pay_sum'])} сом"]
+    if n["ret"]:
+        lines.append(f"• возвратов: {n['ret']} на {money(n['ret_sum'])} сом")
+    if n["wo"]:
+        lines.append(f"• списаний: {n['wo']}")
+    if n["tr"]:
+        lines.append(f"• перемещений и приходов: {n['tr']}")
+    lines.append("Лист «Сверка долгов»: впишите долг из 1С — разница "
+                 "посчитается сама.")
+    await update.message.reply_document(
+        document=InputFile(xlsx, filename=filename),
+        caption="\n".join(lines), parse_mode="HTML")
+
+
 async def history_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """/history — Excel: движение и продажи ВСЕХ товаров по дням и месяцам
     (просьба владельца 18.09.2026 — файл для разбора спроса и планирования
@@ -14934,6 +15051,7 @@ ADMIN_COMMANDS = STAFF_COMMANDS + [
     ("forecast", "Прогноз закупки"),
     ("export", "Excel-экспорт всего учёта"),
     ("history", "Excel: продажи по месяцам/дням, все движения товара"),
+    ("to1c", "Excel для переноса в 1С: /to1c Склад|Клиент период"),
     ("minstock", "Минимальные остатки"),
     ("pricelog", "История изменения цен"),
     ("users", "Команда и доступы"),
@@ -15150,6 +15268,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("cash", cash_cmd))
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
+    app.add_handler(CommandHandler(["to1c", "1c"], to1c_cmd))
     app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("margin", margin_cmd))
     app.add_handler(CommandHandler("stockcost", stockcost_cmd))
