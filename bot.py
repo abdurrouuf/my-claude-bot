@@ -1279,6 +1279,37 @@ def _product_by_text(product: dict, volume: str, src_text: str):
     text = (src_text or "").lower()
     if not text.strip() or product is None:
         return None
+    # Сначала — ПОСТРОЧНО (инцидент 18.11.2026: в перемещении из 14 строк
+    # была строка «Альтопен форте плюс 100 мл» и строка «Альтопен 1 л» —
+    # модель отдала АЛЬТОПЕН-ФОРТЕ 1 л, а слово «форте» нашлось в ЧУЖОЙ
+    # строке, и защита промолчала). Берём строки с этой фасовкой и хотя бы
+    # одним словом товара: подтверждает хоть одна — товар верный; ни одна —
+    # берём замену по первой такой строке. Таких строк нет (текст в одну
+    # строку, фасовка записана иначе) — проверка по всему тексту, как раньше.
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        vk = prices._vol_key(volume or product["volume"])
+        pwords = [w.lower() for w in prices._name_words(
+            prices._base_name(product["name"])) if len(w) >= 4]
+        cands = []
+        for ln in lines:
+            if not vk or not re.search(
+                    r"(?<![0-9])" + re.escape(vk), prices._vol_key(ln)):
+                continue
+            lw = re.findall(r"[a-zа-яё0-9]+", ln)
+            if any(tw == w or (tw[:4] == w[:4] and difflib.SequenceMatcher(
+                    None, tw, w).ratio() >= 0.8) for tw in lw for w in pwords):
+                cands.append(ln)
+        if cands:
+            alts = [_product_text_check(product, volume, ln) for ln in cands]
+            if any(ok for ok, _alt in alts):
+                return None
+            return next((alt for _ok, alt in alts if alt is not None), None)
+    return _product_text_check(product, volume, text)[1]
+
+
+def _product_text_check(product: dict, volume: str, text: str):
+    """(подтверждён ли товар текстом, замена | None) для куска текста."""
     text_words = re.findall(r"[a-zа-яё0-9]+", text)
     words = [w.lower() for w in prices._name_words(prices._base_name(product["name"]))]
     present, missing = [], []
@@ -1296,7 +1327,7 @@ def _product_by_text(product: dict, volume: str, src_text: str):
             for tw in text_words)
         (present if ok else missing).append(w)
     if not missing:
-        return None
+        return True, None
     if not any(len(w) >= 4 for w in present):
         # Ни одного слова товара в тексте нет («Альтопер 100 мл» → модель
         # отдала АЛЬТОПЕН-ФОРТЕ): ищем по словам текста, ПОХОЖИМ на слово
@@ -1308,11 +1339,11 @@ def _product_by_text(product: dict, volume: str, src_text: str):
                        difflib.SequenceMatcher(None, tw, w).ratio() >= 0.6
                        for w in missing)]
         if not present:
-            return None
+            return False, None
     alt = prices.match_product(" ".join(present), volume)
     if alt is None or alt["id"] == product["id"]:
-        return None
-    return alt
+        return False, None
+    return False, alt
 
 
 _PRODUCT_WORDS_CACHE = {}
