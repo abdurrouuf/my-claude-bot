@@ -5719,6 +5719,107 @@ def test_fix_expiry_batch():
     bot.PENDING.clear()
 
 
+def test_bridge():
+    # Мост «Джарвис ↔ бот» (21.11.2026): ключ, чтение, предложение с кнопкой
+    import asyncio
+    import json as _json
+    from types import SimpleNamespace
+    import bridge
+
+    def call(method, path, token=None, body=None):
+        h = {"authorization": f"Bearer {token}"} if token else {}
+        raw = _json.dumps(body).encode() if body is not None else b""
+        return asyncio.run(bridge.handle(method, path, h, raw))
+
+    orig_sleep = asyncio.sleep
+
+    async def no_sleep(*a, **k):
+        await orig_sleep(0)
+    bridge.asyncio.sleep = no_sleep
+    try:
+        bridge.disable()
+        # 1. ключ не выдан — закрыто для всех
+        assert call("GET", "/bridge/ping", "anything")[0] == 404
+        token = bridge.new_token()
+        assert len(token) >= 40 and bridge.enabled()
+        assert token not in (db.get_setting(bridge.TOKEN_SETTING) or "")
+        # 2. чужой ключ и без ключа — 404, свой — ок
+        assert call("GET", "/bridge/ping", "x" * 48)[0] == 404
+        assert call("GET", "/bridge/ping")[0] == 404
+        assert call("GET", "/bridge/ping", token)[0] == 200
+        # 3. чтение работает, запись — нет
+        st, _ct, out = call("POST", "/bridge/sql", token,
+                            {"sql": "SELECT COUNT(*) AS n FROM products"})
+        res = _json.loads(out)
+        assert st == 200 and res["columns"] == ["n"] and res["rows"][0][0] >= 104
+        before = db.connect().execute("SELECT COUNT(*) FROM clients").fetchone()[0]
+        for bad in ("DELETE FROM clients", "UPDATE clients SET debt=0",
+                    "SELECT 1; DELETE FROM clients",
+                    "INSERT INTO settings(key,value) VALUES('x','y')"):
+            assert call("POST", "/bridge/sql", token, {"sql": bad})[0] == 400, bad
+        assert before == db.connect().execute(
+            "SELECT COUNT(*) FROM clients").fetchone()[0]
+        # хеш ключа наружу не отдаётся
+        st, _ct, out = call("POST", "/bridge/sql", token,
+                            {"sql": "SELECT * FROM settings"})
+        assert st == 200 and db.get_setting(bridge.TOKEN_SETTING) not in out.decode()
+        # 4. копия базы
+        st, _ct, out = call("GET", "/bridge/backup", token)
+        assert st == 200 and out[:15] == b"SQLite format 3"
+        # 5. команды и мусор не принимаются
+        sent = []
+
+        class Bot:
+            async def send_message(self, chat_id, text, **kw):
+                sent.append((chat_id, text, kw.get("reply_markup")))
+        app = SimpleNamespace(bot=Bot())
+
+        async def propose(msgs, note):
+            return await bot.bridge_propose(app, msgs, note)
+        bridge._propose = propose
+        assert call("POST", "/bridge/propose", token, {"text": "/resetwh Бишкек"})[0] == 400
+        assert call("POST", "/bridge/propose", token, {"messages": []})[0] == 400
+        assert not sent
+        # 6. предложение -> карточка админу с кнопкой, в базе ничего не меняется
+        ops = db.connect().execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+        st, _ct, out = call("POST", "/bridge/propose", token, {
+            "messages": ["спеццена для Асан: Дексатоп 50 мл 170", "Асан\nДексатоп 50 мл 2 к"],
+            "note": "заказ Асана"})
+        res = _json.loads(out)
+        assert st == 200 and res["count"] == 2
+        assert sent and sent[0][0] == ADMIN and "Джарвис" in sent[0][1]
+        assert f"bg:{res['token']}" in str(sent[0][2])
+        assert ops == db.connect().execute("SELECT COUNT(*) FROM operations").fetchone()[0]
+        # 7. кнопку жмёт не админ — ничего
+        queue = []
+
+        class Q_:
+            async def put(self, u):
+                queue.append(u)
+        ctx = SimpleNamespace(bot=None, application=SimpleNamespace(update_queue=Q_()))
+        answers, edits = [], []
+        other = [u["id"] for u in db.list_users() if u["id"] != ADMIN][0]
+        asyncio.run(bot.on_callback(_cb_update(other, f"bg:{res['token']}", answers, edits), ctx))
+        assert not queue and res["token"] in bot.PENDING
+        # 8. админ жмёт «Выполнить» — два сообщения в очереди как от админа в личке
+        asyncio.run(bot.on_callback(_cb_update(ADMIN, f"bg:{res['token']}", answers, edits), ctx))
+        assert len(queue) == 2 and res["token"] not in bot.PENDING
+        u = queue[1]
+        assert u.message.text.startswith("Асан") and u.effective_user.id == ADMIN
+        assert u.effective_chat.type == "private" and u.effective_chat.id == ADMIN
+        # повторное касание не задваивает
+        asyncio.run(bot.on_callback(_cb_update(ADMIN, f"bg:{res['token']}", answers, edits), ctx))
+        assert len(queue) == 2
+        # 9. мост закрыт — старый ключ мёртв
+        bridge.disable()
+        assert call("GET", "/bridge/ping", token)[0] == 404
+    finally:
+        bridge.asyncio.sleep = orig_sleep
+        bridge._propose = None
+        bridge.disable()
+        bot.PENDING.clear()
+
+
 def main():
     tests = [(n, f) for n, f in sorted(globals().items())
              if n.startswith("test_") and callable(f)]
