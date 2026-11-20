@@ -6433,6 +6433,19 @@ async def bridge_propose(app, messages, note=""):
     return {"ok": True, "token": token, "count": len(messages)}
 
 
+def _bridge_done() -> list:
+    """Токены принятых предложений моста (в базе — общие для двух экземпляров
+    бота при перекрытии деплоев)."""
+    try:
+        return list(json.loads(db.get_setting("bridge_done") or "[]"))
+    except ValueError:
+        return []
+
+
+def _bridge_mark_done(token: str):
+    db.set_setting("bridge_done", json.dumps((_bridge_done() + [token])[-30:]))
+
+
 def _bridge_update(bot, message_id: int, text: str):
     """Сообщение «от админа в личке» для обычной очереди обработки."""
     return Update.de_json({"update_id": 0, "message": {
@@ -6502,6 +6515,12 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # второе перезаписывало результат на «устарела» — владелец решил бы,
         # что операция не прошла, и повторил бы её. Если кнопок у сообщения
         # уже нет — результат на месте, только всплывашка без правки текста.
+        if kind == "bg" and token in _bridge_done():
+            # Предложение моста уже принято (двойное касание или второй
+            # экземпляр бота при перекрытии деплоев, 21.11.2026) — текст
+            # «Принято от Джарвиса» не затираем на «устарела».
+            await q.answer("Уже принято — бот обрабатывает.", show_alert=True)
+            return
         msg = q.message
         markup = getattr(msg, "reply_markup", None) if msg is not None else None
         if msg is not None and (not markup or token not in str(markup)):
@@ -6530,6 +6549,7 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             await q.answer()
             return
         PENDING.pop(token, None)
+        _bridge_mark_done(token)
         await q.answer()
         msgs = [m for m in (p.get("messages") or []) if isinstance(m, str)]
         try:
