@@ -5807,9 +5807,11 @@ def test_bridge():
         u = queue[1]
         assert u.message.text.startswith("Асан") and u.effective_user.id == ADMIN
         assert u.effective_chat.type == "private" and u.effective_chat.id == ADMIN
-        # повторное касание не задваивает
+        # повторное касание не задваивает и не затирает текст на «устарела»
+        n_edits = len(edits)
         asyncio.run(bot.on_callback(_cb_update(ADMIN, f"bg:{res['token']}", answers, edits), ctx))
         assert len(queue) == 2
+        assert len(edits) == n_edits and "Уже принято" in (answers[-1] or "")
         # 9. мост закрыт — старый ключ мёртв
         bridge.disable()
         assert call("GET", "/bridge/ping", token)[0] == 404
