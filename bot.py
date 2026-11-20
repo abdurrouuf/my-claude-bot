@@ -17,6 +17,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, InputFile, Upda
 from telegram.ext import (ApplicationBuilder, CallbackQueryHandler, CommandHandler,
                           ContextTypes, MessageHandler, filters)
 
+import bridge
 import db
 import prices
 from db import BISHKEK
@@ -6405,6 +6406,82 @@ async def _finish_transfer(q, context, actor, p):
             pass
 
 
+# ---------- Мост «Джарвис ↔ бот» (21.11.2026) ----------
+# Ассистент владельца (чат Claude) через bridge.py читает базу и ПРЕДЛАГАЕТ
+# сообщения боту. Ничего не обрабатывается без кнопки «Выполнить» у админа;
+# дальше сообщение идёт обычным путём, как будто его написал сам админ
+# (карточка операции по-прежнему ждёт «Провести»).
+
+async def bridge_propose(app, messages, note=""):
+    token = new_pending({"kind": "bridge", "user_id": ADMIN_ID, "chat_id": ADMIN_ID,
+                         "messages": list(messages), "note": note})
+    parts = ["🤖 <b>Джарвис предлагает отправить боту</b>"]
+    if note:
+        parts.append(f"<i>{esc(note)}</i>")
+    for i, m in enumerate(messages, 1):
+        head = f"<b>{i} из {len(messages)}</b>\n" if len(messages) > 1 else ""
+        parts.append(f"{head}<code>{esc(m)}</code>")
+    parts.append("Нажмите «Выполнить» — бот обработает это как ваше сообщение. "
+                 "Операции после этого ещё ждут обычную кнопку «Провести».")
+    text = "\n\n".join(parts)
+    if len(text) > 4000:
+        text = text[:3900] + "…</code>\n\n(текст длинный — показано начало)"
+    kb = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Выполнить", callback_data=f"bg:{token}"),
+        InlineKeyboardButton("❌ Отмена", callback_data=f"no:{token}")]])
+    await app.bot.send_message(ADMIN_ID, text, parse_mode="HTML", reply_markup=kb)
+    return {"ok": True, "token": token, "count": len(messages)}
+
+
+def _bridge_update(bot, message_id: int, text: str):
+    """Сообщение «от админа в личке» для обычной очереди обработки."""
+    return Update.de_json({"update_id": 0, "message": {
+        "message_id": int(message_id or 0), "date": int(time.time()),
+        "chat": {"id": ADMIN_ID, "type": "private"},
+        "from": {"id": ADMIN_ID, "is_bot": False, "first_name": "Админ"},
+        "text": text}}, bot)
+
+
+async def bridge_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """/bridge — мост с Джарвисом: статус, новый ключ, выключить."""
+    actor = await _require_admin(update)
+    if actor is None or update.effective_user.id != ADMIN_ID:
+        return
+    if not await _require_private(update):
+        return
+    arg = " ".join(context.args or []).strip().lower()
+    if arg in ("выкл", "off", "стоп", "закрыть"):
+        bridge.disable()
+        await update.message.reply_text(
+            "🔒 Мост закрыт. Старый ключ больше не работает.")
+        return
+    if arg in ("ключ", "новый", "key", "new", "вкл", "on"):
+        token = bridge.new_token()
+        await update.message.reply_text(
+            "🔑 <b>Ключ моста</b> (показывается один раз):\n\n"
+            f"<code>{token}</code>\n\n"
+            "Вставьте его в форму, которую покажет Джарвис в чате Claude. "
+            "Никому другому не пересылайте. После вставки удалите это "
+            "сообщение. Прежний ключ, если был, больше не работает.\n\n"
+            "Закрыть мост: /bridge выкл", parse_mode="HTML")
+        return
+    st = bridge.stats()
+    if bridge.enabled():
+        last = "ещё не было"
+        if st.get("last"):
+            last = (datetime.fromtimestamp(st["last"], BISHKEK)
+                    .strftime("%d.%m.%Y %H:%M") + f" ({st.get('last_kind', '')})")
+        text = (f"🟢 Мост открыт.\nОбращений всего: {int(st.get('n', 0))}\n"
+                f"Последнее: {last}\n\n"
+                "Через мост Джарвис читает базу и предлагает сообщения — "
+                "без вашей кнопки ничего не выполняется.\n"
+                "Новый ключ: /bridge ключ · закрыть: /bridge выкл")
+    else:
+        text = ("🔒 Мост закрыт (ключ не выдан).\n"
+                "Открыть: /bridge ключ")
+    await update.message.reply_text(text)
+
+
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     actor = db.get_user(q.from_user.id)
@@ -6446,6 +6523,26 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     elif q.from_user.id != p["user_id"] and not is_admin(actor):
         await q.answer("Это не ваша операция", show_alert=True)
+        return
+
+    if kind == "bg":  # мост: админ разрешил обработать предложенные сообщения
+        if p.get("kind") != "bridge" or q.from_user.id != ADMIN_ID:
+            await q.answer()
+            return
+        PENDING.pop(token, None)
+        await q.answer()
+        msgs = [m for m in (p.get("messages") or []) if isinstance(m, str)]
+        try:
+            await q.edit_message_text(
+                "🤖 Принято от Джарвиса — обрабатываю:\n\n"
+                + "\n\n".join(f"<code>{esc(m)}</code>" for m in msgs)[:3900],
+                parse_mode="HTML")
+        except Exception:
+            pass
+        mid = getattr(q.message, "message_id", 0)
+        for m in msgs:
+            await context.application.update_queue.put(
+                _bridge_update(context.bot, mid, m))
         return
 
     if kind == "no":
@@ -15210,6 +15307,7 @@ async def _post_init(app):
                 f"сообщение Джарвису.")
         except Exception:
             log.exception("Не удалось отправить предупреждение о кэше промпта")
+    await bridge.start(lambda msgs, note: bridge_propose(app, msgs, note))
     app.create_task(evening_summary_loop(app))
     app.create_task(cash_alert_loop(app))
     app.create_task(weekly_debt_loop(app))
@@ -15300,6 +15398,7 @@ if __name__ == "__main__":
     app.add_handler(CommandHandler("export", export_cmd))
     app.add_handler(CommandHandler("history", history_cmd))
     app.add_handler(CommandHandler(["to1c", "1c"], to1c_cmd))
+    app.add_handler(CommandHandler("bridge", bridge_cmd))
     app.add_handler(CommandHandler("api", api_cmd))
     app.add_handler(CommandHandler("margin", margin_cmd))
     app.add_handler(CommandHandler("stockcost", stockcost_cmd))
